@@ -1,0 +1,111 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build/${presetName}"
+        },
+        {
+            "name": "debug",
+            "inherits": "base",
+            "displayName": "Debug (Ninja)",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "release",
+            "inherits": "base",
+            "displayName": "Release (Ninja)",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "asan",
+            "inherits": "base",
+            "displayName": "Debug + ASan/UBSan (Ninja)",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "F4_ENABLE_SANITIZERS": "ON"
+            }
+        },
+        {
+            "name": "msvc-base",
+            "hidden": true,
+            "inherits": "base",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+            "cacheVariables": {
+                "CMAKE_GENERATOR_INSTANCE": "C:/Program Files/Microsoft Visual Studio/2022/Community"
+            }
+        },
+        {
+            "name": "msvc-debug",
+            "inherits": "msvc-base",
+            "displayName": "Debug (MSVC)"
+        },
+        {
+            "name": "msvc-release",
+            "inherits": "msvc-base",
+            "displayName": "Release (MSVC)"
+        },
+        {
+            "name": "msvc-asan",
+            "inherits": "msvc-base",
+            "displayName": "Debug + ASan (MSVC)",
+            "cacheVariables": {
+                "F4_ENABLE_SANITIZERS": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "build-debug", "configurePreset": "debug" },
+        { "name": "build-release", "configurePreset": "release" },
+        { "name": "build-asan", "configurePreset": "asan" },
+        { "name": "build-msvc-debug", "configurePreset": "msvc-debug", "configuration": "Debug" },
+        { "name": "build-msvc-release", "configurePreset": "msvc-release", "configuration": "Release" },
+        { "name": "build-msvc-asan", "configurePreset": "msvc-asan", "configuration": "Debug" }
+    ],
+    "testPresets": [
+        {
+            "name": "test",
+            "configurePreset": "debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-release",
+            "configurePreset": "release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-asan",
+            "configurePreset": "asan",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-msvc-debug",
+            "configurePreset": "msvc-debug",
+            "configuration": "Debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-msvc-release",
+            "configurePreset": "msvc-release",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-msvc-asan",
+            "configurePreset": "msvc-asan",
+            "configuration": "Debug",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

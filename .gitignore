@@ -1,0 +1,13 @@
+# Build output
+build/
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/
+.cache/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db

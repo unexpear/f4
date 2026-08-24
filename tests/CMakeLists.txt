@@ -1,0 +1,41 @@
+include(FetchContent)
+
+FetchContent_Declare(doctest
+    SYSTEM
+    GIT_REPOSITORY https://github.com/doctest/doctest.git
+    GIT_TAG v2.4.12
+)
+FetchContent_MakeAvailable(doctest)
+
+add_executable(f4_tests
+    main.cpp
+    core/test_logger.cpp
+    core/test_assert_enabled.cpp
+)
+target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(f4_tests PRIVATE f4_core doctest::doctest)
+f4_set_warnings(f4_tests)
+f4_enable_sanitizers(f4_tests)
+
+add_executable(f4_tests_stripped
+    main.cpp
+    core/test_min_log_level.cpp
+    core/test_assert_disabled.cpp
+)
+target_compile_definitions(f4_tests_stripped PRIVATE
+    F4_MIN_LOG_LEVEL=2
+    F4_ENABLE_ASSERTS=0
+)
+target_include_directories(f4_tests_stripped PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(f4_tests_stripped PRIVATE f4_core doctest::doctest)
+f4_set_warnings(f4_tests_stripped)
+f4_enable_sanitizers(f4_tests_stripped)
+
+add_test(NAME core COMMAND f4_tests)
+add_test(NAME core_stripped COMMAND f4_tests_stripped)
+
+if(F4_ENABLE_SANITIZERS AND MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+    get_filename_component(F4_ASAN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set_tests_properties(core core_stripped PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${F4_ASAN_BIN_DIR}")
+endif()
