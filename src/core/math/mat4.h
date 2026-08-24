@@ -196,4 +196,12 @@ inline auto Mat4::inverse() const -> Mat4 {
     return result;
 }
 
+// Extracts the rotation of an orthonormal upper-left 3x3 block (e.g. the
+// output of composeTRS with unit scale). Translation and the fourth row/column
+// are ignored; see toQuat(const Mat3&) for drift and sign semantics.
+[[nodiscard]] inline auto toQuat(const Mat4& m) -> Quat {
+    const Mat3 rotation{m.col[0].xyz(), m.col[1].xyz(), m.col[2].xyz()};
+    return toQuat(rotation);
+}
+
 } // namespace f4::math

@@ -64,21 +64,27 @@ struct Mat3 {
     }
 };
 
+// Shepperd's method, branch selected by the largest rotation diagonal so
+// every branch keeps its sqrt argument away from zero for exact rotations.
+// Precondition: approximately orthonormal (a rotation matrix). Mildly drifted
+// inputs are tolerated: sqrt arguments are clamped at zero and the result is
+// unit-length up to the input's drift. The returned sign is unspecified
+// (q and -q encode the same rotation; compare rotations, never components).
 [[nodiscard]] inline auto toQuat(const Mat3& m) -> Quat {
     const float trace = m(0, 0) + m(1, 1) + m(2, 2);
     if (trace > 0.0f) {
-        const float s = std::sqrt(trace + 1.0f) * 2.0f;
+        const float s = std::sqrt(max(0.0f, trace + 1.0f)) * 2.0f;
         return Quat{0.25f * s, (m(2, 1) - m(1, 2)) / s, (m(0, 2) - m(2, 0)) / s, (m(1, 0) - m(0, 1)) / s};
     }
     if (m(0, 0) > m(1, 1) && m(0, 0) > m(2, 2)) {
-        const float s = std::sqrt(1.0f + m(0, 0) - m(1, 1) - m(2, 2)) * 2.0f;
+        const float s = std::sqrt(max(0.0f, 1.0f + m(0, 0) - m(1, 1) - m(2, 2))) * 2.0f;
         return Quat{(m(2, 1) - m(1, 2)) / s, 0.25f * s, (m(0, 1) + m(1, 0)) / s, (m(0, 2) + m(2, 0)) / s};
     }
     if (m(1, 1) > m(2, 2)) {
-        const float s = std::sqrt(1.0f + m(1, 1) - m(0, 0) - m(2, 2)) * 2.0f;
+        const float s = std::sqrt(max(0.0f, 1.0f + m(1, 1) - m(0, 0) - m(2, 2))) * 2.0f;
         return Quat{(m(0, 2) - m(2, 0)) / s, (m(0, 1) + m(1, 0)) / s, 0.25f * s, (m(1, 2) + m(2, 1)) / s};
     }
-    const float s = std::sqrt(1.0f + m(2, 2) - m(0, 0) - m(1, 1)) * 2.0f;
+    const float s = std::sqrt(max(0.0f, 1.0f + m(2, 2) - m(0, 0) - m(1, 1))) * 2.0f;
     return Quat{(m(1, 0) - m(0, 1)) / s, (m(0, 2) + m(2, 0)) / s, (m(1, 2) + m(2, 1)) / s, 0.25f * s};
 }
 

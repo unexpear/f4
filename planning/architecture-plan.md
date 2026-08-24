@@ -148,6 +148,32 @@ Chosen trade-off: effects are maintained twice (GLSL + HLSL). Mitigations baked 
 - Conventions doc (§6)
 - **Every operation unit-tested**
 
+### Milestone 1.5 — Quaternion Certification (DONE)
+- `toQuat(Mat3)` hardened (Shepperd branches, sqrt args clamped for drifted
+  inputs, sign contract documented) + `toQuat(Mat4)` overload (orthonormal
+  upper-left block; translation ignored)
+- `slerp` general branch now renormalizes output (endpoints land on a/b's
+  rotation regardless of arc length; matches the nlerp fallback's behavior)
+- Deterministic fixture generator (`tests/random.hpp`): seeded mt19937,
+  canonical `u32>>8 / 2^24` float mapping - NO `uniform_real_distribution`
+  (not portable across stdlibs). This generator is THE source of M8 parity
+  fixtures: same seeds must feed CPU and GPU sides.
+- Property battery (`test_quat_properties.cpp`, 15 cases / ~4600 assertions):
+  composition homomorphism, norm preservation, normalization idempotence,
+  inverse==conj (unit), slerp endpoints/constant angular velocity/shortest-path
+  sign-fix, double cover, mat->quat->mat authoritative roundtrip,
+  yaw*pitch*roll order pin, zero axis, gimbal +-90 deg stability, drift
+  tolerance. Rotation-semantic assertions wherever double cover applies -
+  NEVER componentwise quat equality across a possible sign flip.
+
+### M8 carry-forwards (from M1/M1.5 lessons)
+- kTightTolerance sits at the residue floor of exact-angle trig constants;
+  chained rotations floor at kDefaultTolerance, never tighter
+- Before any GPU-parity fixtures: reversed-Z decision, deep-hierarchy drift
+  study, frustum adversarial tests, orthographic projection,
+  plane/frustum reconstruction roundtrips
+- kParityTolerance{1e-5,1e-4} reserved name; calibrate from measured deltas x4
+
 ### Milestone 2 — Core
 - Generational IDs, handles
 - Containers (dynamic array, string, hash map wrappers)

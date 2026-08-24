@@ -86,6 +86,9 @@ struct Quat {
             end = -b;
             d = -d;
         }
+        // Both paths renormalize: endpoints must land on a/b (up to their own
+        // unit-length drift) regardless of arc length, keeping the contract
+        // symmetric across the lerp fallback and the trigonometric branch.
         if (d > 0.9995f) {
             return (a + (end - a) * t).normalized();
         }
@@ -95,7 +98,7 @@ struct Quat {
         const float sinTheta = std::sin(theta);
         const float s0 = std::cos(theta) - d * sinTheta / sinTheta0;
         const float s1 = sinTheta / sinTheta0;
-        return a * s0 + end * s1;
+        return (a * s0 + end * s1).normalized();
     }
 };
 

@@ -14,6 +14,7 @@ add_executable(f4_tests
     core/test_numerics.cpp
     core/test_vec.cpp
     core/test_quat.cpp
+    core/test_quat_properties.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp
