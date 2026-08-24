@@ -1,0 +1,15 @@
+#pragma once
+
+#include "core/math/aabb.h"
+#include "core/math/comparison.h"
+#include "core/math/frustum.h"
+#include "core/math/mat3.h"
+#include "core/math/mat4.h"
+#include "core/math/numerics.h"
+#include "core/math/plane.h"
+#include "core/math/quat.h"
+#include "core/math/sphere.h"
+#include "core/math/transform.h"
+#include "core/math/vec2.h"
+#include "core/math/vec3.h"
+#include "core/math/vec4.h"

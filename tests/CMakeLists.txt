@@ -11,6 +11,13 @@ add_executable(f4_tests
     main.cpp
     core/test_logger.cpp
     core/test_assert_enabled.cpp
+    core/test_numerics.cpp
+    core/test_vec.cpp
+    core/test_quat.cpp
+    core/test_mat4.cpp
+    core/test_transform.cpp
+    core/test_shapes.cpp
+    core/test_frustum.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core doctest::doctest)
