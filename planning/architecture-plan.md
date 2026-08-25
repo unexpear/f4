@@ -377,19 +377,18 @@ The renderer track stays exactly as written above.
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
 ## 10. Immediate Next Step
 
-Milestone 3 (ECS) is complete and verified (147 cases / 9,090 assertions,
-all six presets green). The product goal is now locked in §1: procedurally
-generated 3D worlds (voxel / streamed open-world / hex-cell games).
+Milestone 4 (Transform) is complete and verified (155 cases / 30,781
+assertions, all six presets green): LocalTransform/Parent/WorldMatrix
+components on the M3 ECS, dirty-tag propagation with inherited-dirty DFS,
+world-jumping trySetParent with cycle rejection, dead-parent pruning on the
+next pass (orphans become roots), and an 8000-step mirror-verified churn
+stress test.
 
-**Pending target-game decision: RESOLVED — all three cell styles (voxel,
-heightfield+biomes, hex) are designed in from day one** (see M14/M15).
-Chunk-level CellPolicy templates keep hot loops monomorphic; a shared
-MeshData record keeps the RHI policy-agnostic.
-
-Renderer track continues regardless: next milestone is M4 (Transform) -
-LocalTransform + parent links as components, world-matrix recomputation,
-dirty propagation, reparent/orphan/cycle tests - with M13 (noise library)
-slotted right behind it per the recommended interleave.
+Next: Milestone 13 (Deterministic Noise) under §11.6's float-parity rules,
+in the hardened order - land -ffp-contract=off // /fp:precise FIRST, rebuild
+all six presets green, and only then generate/freeze bit-exact golden
+vectors for value/perlin (2D+3D), fbm, domain warp, simplex2D. No simplex3D.
+After M13: M5 (Resources) on the renderer track.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

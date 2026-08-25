@@ -57,6 +57,14 @@ public:
         return reference;
     }
 
+    // Read-only access; asserts when no such storage exists yet.
+    template <typename T>
+    [[nodiscard]] auto storage() const -> const ComponentStorage<T>& {
+        const ComponentStorage<T>* found = constFindStorage<T>();
+        F4_ASSERT(found != nullptr, "no component storage registered for this type");
+        return *found;
+    }
+
     template <typename T>
     [[nodiscard]] auto hasStorage() const -> bool {
         return constFindStorage<T>() != nullptr;
