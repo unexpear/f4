@@ -1,6 +1,8 @@
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
+    core/memory/memory.cpp
+    core/memory/serialization.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

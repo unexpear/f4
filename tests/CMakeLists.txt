@@ -15,6 +15,12 @@ add_executable(f4_tests
     core/test_vec.cpp
     core/test_quat.cpp
     core/test_quat_properties.cpp
+    core/test_memory.cpp
+    core/test_array.cpp
+    core/test_ids.cpp
+    core/test_string.cpp
+    core/test_hashmap.cpp
+    core/test_serialization.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp

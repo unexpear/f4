@@ -174,12 +174,56 @@ Chosen trade-off: effects are maintained twice (GLSL + HLSL). Mitigations baked 
   plane/frustum reconstruction roundtrips
 - kParityTolerance{1e-5,1e-4} reserved name; calibrate from measured deltas x4
 
-### Milestone 2 — Core
-- Generational IDs, handles
-- Containers (dynamic array, string, hash map wrappers)
-- Allocators (arena, pool)
-- Resource handle types
+### Milestone 2 — Memory & Containers
+- Generational IDs, handles (`src/core/ids/`)
+- Containers: dynamic array, string, hash map wrappers (`src/core/containers/`)
+- Allocators: arena (linear), pool (fixed-chunk) (`src/core/memory/`)
+- Resource handle types (tag-typed `Handle<Tag>`, concrete tags arrive M5/M6)
 - POD/chunk serialization helpers only
+
+Design decisions locked at M2 start:
+- **Heap backing via one seam**: all dynamic memory flows through
+  `f4::memory::heapAllocate/heapFree`, implemented with aligned
+  `::operator new/delete` (portable GCC/MSVC/Clang). Future custom backing
+  swaps exactly one place.
+- **Containers are NOT allocator-templated yet.** Documented trade-off:
+  allocator polymorphism deferred until a proven need (M12 job system /
+  frame arenas); the single heap seam keeps that retrofit cheap.
+- **Arena contract**: bump allocation, `reset()` between frames, NEVER runs
+  destructors (placement-new'd types must be lifetime-trivial or externally
+  torn down). Exhaustion returns nullptr - caller decides; sizing bugs are
+  caught in tests, not hidden.
+- **Pool contract**: fixed stride >= sizeof(void*) so the free list is
+  intrusive; LIFO reuse; double-free is UB like operator delete (ASan
+  presets are the net). TypedPool<T> adds ctor/dtor discipline on top.
+- **Generational handles**: {u32 index, u32 generation}, null = index
+  0xFFFFFFFF. GenerationalArena<T> proves stale-handle detection (ABA-safe)
+  before M3 builds entity registries and ComponentStorage on it.
+- **Serialization trimmed** (per §3 amendment): MemoryWriter/MemoryReader +
+  chunk framing (magic/version/payload) over byte buffers; FILE IO plumbing
+  defers to M5 resources.
+- **String/StringView contracts**: StringView is strictly non-owning and
+  read-only; caller guarantees the backing outlives it. Null view
+  (data==nullptr) is distinct from empty view (size 0). String owns a heap
+  buffer, always null-terminated for C interop; copy = deep copy, move =
+  steal (source left valid-empty). NO small-string optimization - documented
+  trade-off, revisit at M12 if profiling demands. Equal contents hash equal
+  across String and StringView (shared FNV-1a).
+- **HashMap contract**: thin engine API over std::unordered_map (per plan:
+  "wrappers"). insert() never overwrites; set() upserts; find() returns
+  pointer-or-null (matches GenerationalArena::get convention). Iteration
+  order is UNSPECIFIED - any logic needing determinism must sort keys
+  explicitly. Reference/pointer stability of values under rehash holds
+  (node-based backing) and is tested. Handle<Tag> keys work via the
+  std::hash specialization in handle.h.
+- **Serialization contract**: byte image = raw in-memory representation
+  copied verbatim (memcpy; NO alignment requirements on the stream). POD
+  paths enforce std::is_trivially_copyable at compile time. Endian policy is
+  EXPLICIT little-endian: streams begin with an endian marker that readers
+  verify against std::endian::native - mismatched streams are rejected, not
+  silently swapped. Chunk framing: {u32 id, u32 version, u32 payloadSize}
+  header per chunk; reader validates declared size against remaining bytes
+  and caller-provided capacity before copying.
 
 ### Milestone 3 — ECS
 - Entity create/destroy with generational validation
@@ -245,7 +289,13 @@ Chosen trade-off: effects are maintained twice (GLSL + HLSL). Mitigations baked 
 | Optimization | Fast Hierarchical Culling (Cesium); Frostbite compute pipeline; Agner's optimization resources |
 | Physics (later) | Introduction to Networked Physics (Gaffer on Games); Unified Particle Physics preprint |
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
-
 ## 10. Immediate Next Step
 
-Execute Milestone 0: git init, CMake presets, warnings config, doctest wiring, logging/assert macros, folder skeleton.
+Milestone 2 is complete and verified (139 cases / 5,405 assertions, all six
+presets green): memory seam (heapAllocate/heapFree), Arena/Pool allocators,
+Array<T>, generational handles + GenerationalArena, String/StringView with
+shared FNV-1a hashing, HashMap wrapper, POD/chunk serialization with explicit
+little-endian policy.
+
+Next: Milestone 3 (Application Layer) - platform/window abstraction,
+input events, and the main loop skeleton that the renderer will plug into.
