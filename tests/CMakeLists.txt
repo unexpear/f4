@@ -9,6 +9,7 @@ FetchContent_MakeAvailable(doctest)
 
 add_executable(f4_tests
     main.cpp
+    stb_image_write_impl.cpp
     core/test_logger.cpp
     core/test_assert_enabled.cpp
     core/test_numerics.cpp
@@ -24,6 +25,8 @@ add_executable(f4_tests
     core/test_ecs.cpp
     core/test_ecs_transform.cpp
     core/test_noise.cpp
+    core/test_resources.cpp
+    core/test_image_loaders.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp

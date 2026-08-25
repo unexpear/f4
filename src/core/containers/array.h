@@ -98,9 +98,16 @@ public:
     void resize(std::size_t newSize) {
         if (newSize > size_) {
             reserve(newSize);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
             for (std::size_t i = size_; i < newSize; ++i) {
                 new (data_ + i) T();
             }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         } else {
             for (std::size_t i = newSize; i < size_; ++i) {
                 data_[i].~T();

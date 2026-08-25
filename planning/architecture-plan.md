@@ -433,12 +433,14 @@ The renderer track stays exactly as written above.
 | Full toolset scope | [stevinz/awesome-game-engine-dev](https://github.com/stevinz/awesome-game-engine-dev) — scene editors, asset pipelines (editor era) |
 ## 10. Immediate Next Step
 
-M5 expanded per product call (2026-08-25): full-spectrum asset IO before any
-renderer work. Order: M5.0 core layer (cache/handles/path lookup/file IO/
-.f4asset/Mesh+Texture+Shader records/descs) → §12 ladder M5.1→M5.9 in
-dependency order. Each step gated by all six presets. Renderer track (M6+)
-resumes after the ladder completes; M14 world data model then follows the
-original interleave plan.
+M5.0 core layer shipped (resource cache, mesh/texture/shader records, handles,
+file IO, .f4asset container). M5.1 BMP+TGA hand-written decoders shipped with
+`Result<Texture, LoadError>` loader seam, `load_error.h` shared error codes,
+and `std::span<const std::byte>` entry points. M5.2 stb_image vendor dep
+shipped — PNG/JPG/HDR/BMP/TGA/PSD/GIF/PIC via `stbi_load_from_memory` +
+`stbi_loadf_from_memory` wrappers, FETCHCONTENT pinned to commit
+`2c980bb`, SYSTEM includes, no engine warnings. 193 tests / 84,263 assertions
+across all six presets. Next: M5.3 (glTF loader via cgltf vendor dep).
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -590,8 +592,8 @@ update in the table below.
 
 | Rung | Formats | Strategy | Status |
 |------|---------|----------|--------|
-| M5.1 | BMP, TGA | Hand-written decoders (~150 lines) — proves the loader seam zero-dep | ⬜ |
-| M5.2 | PNG, JPG, HDR | Vendor stb_image (public domain) | ⬜ |
+| M5.1 | BMP, TGA | Hand-written decoders (~150 lines) — proves the loader seam zero-dep | ✅ |
+| M5.2 | PNG, JPG, HDR | Vendor stb_image (public domain) | ✅ |
 | M5.3 | glTF / GLB | Vendor cgltf (MIT): meshes, submeshes, materials into our records; skins/animations deferred | ⬜ |
 | M5.4 | OpenEXR | Minimal scanline half-float subset by hand; vendor full OpenEXR only if tiled/deep needed | ⬜ |
 | M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ⬜ |
