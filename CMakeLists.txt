@@ -12,6 +12,7 @@ option(F4_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(F4_ENABLE_SANITIZERS "Enable address/UB sanitizers" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompilerWarnings.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FloatPrecision.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Sanitizers.cmake)
 
 add_subdirectory(src)

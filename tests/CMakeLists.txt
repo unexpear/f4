@@ -23,6 +23,7 @@ add_executable(f4_tests
     core/test_serialization.cpp
     core/test_ecs.cpp
     core/test_ecs_transform.cpp
+    core/test_noise.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp
@@ -31,6 +32,7 @@ add_executable(f4_tests
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core doctest::doctest)
 f4_set_warnings(f4_tests)
+f4_set_float_precision(f4_tests)
 f4_enable_sanitizers(f4_tests)
 
 add_executable(f4_tests_stripped
@@ -45,6 +47,7 @@ target_compile_definitions(f4_tests_stripped PRIVATE
 target_include_directories(f4_tests_stripped PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests_stripped PRIVATE f4_core doctest::doctest)
 f4_set_warnings(f4_tests_stripped)
+f4_set_float_precision(f4_tests_stripped)
 f4_enable_sanitizers(f4_tests_stripped)
 
 add_test(NAME core COMMAND f4_tests)

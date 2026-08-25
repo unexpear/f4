@@ -377,18 +377,23 @@ The renderer track stays exactly as written above.
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
 ## 10. Immediate Next Step
 
-Milestone 4 (Transform) is complete and verified (155 cases / 30,781
-assertions, all six presets green): LocalTransform/Parent/WorldMatrix
-components on the M3 ECS, dirty-tag propagation with inherited-dirty DFS,
-world-jumping trySetParent with cycle rejection, dead-parent pruning on the
-next pass (orphans become roots), and an 8000-step mirror-verified churn
-stress test.
+Milestone 13 (Deterministic Noise) is complete and verified, in the hardened
+order: `cmake/FloatPrecision.cmake` landed first (`/fp:precise` on MSVC,
+`-ffp-contract=off` elsewhere), all six presets were verified green under the
+locked FP regime BEFORE any golden was generated. Goldens (bit-exact hex
+values + generation recipe comment) were frozen from a GCC build under the
+exact contract flags; the three MSVC configurations then reproduced every
+value bit-for-bit — the §11.6 cross-toolchain parity proof. Library surface
+(`f4::noise`): value2D/3D, perlin2D/3D (unit gradient tables, integer-hash
+selection), simplex2D (frozen literal skew constants), fbm2D/3D with a
+PUBLIC octave schedule (`seed ^ i * 0x9E3779B97F4A7C15`) that tests
+replicate bit-exactly outside the library, warp2D. Tests cover goldens,
+range bounds, Lipschitz continuity, exact Perlin lattice zeros, 10k-sample
+seed replay/sensitivity, and FBM normalization.
 
-Next: Milestone 13 (Deterministic Noise) under §11.6's float-parity rules,
-in the hardened order - land -ffp-contract=off // /fp:precise FIRST, rebuild
-all six presets green, and only then generate/freeze bit-exact golden
-vectors for value/perlin (2D+3D), fbm, domain warp, simplex2D. No simplex3D.
-After M13: M5 (Resources) on the renderer track.
+Next: M5 (Resources) on the renderer track. After M5: M14 world data model
+(§11), then M6/M7 continue the renderer track with M15 slotting in once M7
+draws its first mesh.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
