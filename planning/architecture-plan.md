@@ -32,6 +32,8 @@ Single source of truth for engine design decisions. Reference material: [awesome
 | Component storage | `ComponentStorage<T>` sparse-set default | Interface swappable; semantics over layout |
 | Render graph | Declarations-only version at M8 | Before Vulkan |
 | Math | Fully custom | Vec/Mat/Quat written by hand, every op tested |
+| Asset formats | **Full-spectrum ladder (§12)** | BMP/TGA/OBJ hand-written seed codecs, then every major format: stb_image, glTF/GLB, OpenEXR, DDS+BCn, KTX2+BasisU, ASTC, FBX, USD, Alembic — renderer track paused until complete |
+| Third-party deps | Pinned FetchContent | SYSTEM includes (warning-isolated from -Werror), license recorded next to each pin, six-preset gate still applies |
 
 ## 3. Architectural Corrections (adopted)
 
@@ -84,24 +86,21 @@ Renderer ↔ backends relationship (RHI):
 
 ```text
 src/
-├── core/                  # M0–M2: math, containers, memory, ids, logging
+├── core/                  # M0–M2, M13: math, containers, memory, ids, logging, noise
 │   ├── math/
 │   ├── containers/
 │   ├── memory/
 │   ├── ids/
-│   └── logging/
-├── ecs/                   # M3–M4
-│   ├── entity/
-│   ├── component/
-│   ├── storage/
-│   ├── query/
-│   ├── world/
-│   └── systems/
+│   ├── logging/
+│   ├── noise/
+│   └── resources/         # M5+: resource cache, asset records, format codecs (headless)
+├── ecs/                   # (empty scaffold — ECS actually lives in src/core/ecs,
+│                          #  per M3 precedent that headless layers ship under core/)
 ├── engine/                # M4–M5, M8
 │   ├── scene/
 │   ├── transform/
-│   ├── resources/
-│   ├── assets/
+│   ├── assets/            # high-level asset pipeline sits here once it exists;
+│                          # low-level cache/codecs are core/resources
 │   ├── cameras/
 │   ├── lighting/
 │   └── rendering/
@@ -271,9 +270,44 @@ Design decisions locked at M3 start:
 - World-matrix recomputation pass, dirty propagation
 - Reparent/orphan/cycle tests
 
-### Milestone 5 — Resources
-- Unified model: Mesh, Texture, Shader, Material, Pipeline, Buffer
-- Central registry; opaque handles only; reflection-based serialization starts here if needed
+### Milestone 5 — Resources & Asset IO (expanded 2026-08-25)
+
+Core layer first, then the full format ladder (§12) as sub-milestones
+M5.1–M5.9. **Renderer track (M6+) pauses until the ladder completes** —
+explicit product call: no rush to rendering.
+
+M5.0 core (ships before any codec):
+- `src/core/resources/` — headless, six-preset testable like core/ecs, core/noise
+- Unified model: Mesh, Texture, Shader, Buffer, Pipeline (Material defers to M8)
+- Typed handles (`Handle<MeshTag>` …) over per-type `GenerationalArena<T>`
+  inside one type-erased `ResourceCache` — stale-handle safety inherited from
+  M2, mirroring how M3's Registry reuses it
+- Path lookup via StringHash; `find(path)` pointer-or-null + `get_or_load`
+- File↔buffer binary IO (the M2 deferral lands here); `.f4asset` container
+  reusing M2 chunk framing {id, version, payloadSize}
+- Mesh record: flexible vertex-layout streams, u16/u32 index type, submeshes,
+  AABB bounds computed at load
+- Texture record: format enum incl. block-compressed (BCn/ASTC), mip chain,
+  decoded-RGBA vs GPU-native payload distinction ("support" ≠ "decode")
+- Buffer/Pipeline: desc structs only — device owns instances from M6
+- Lifetime v1: explicit destroy(handle); refcount/streaming contract deferred
+  to M16 (documented)
+- Reflection-based serialization NOT started here — M14 saves keep using
+  explicit chunk writes; reflection waits for editor era
+
+Sub-milestones M5.1–M5.9: see §12 ladder table with per-rung strategy.
+
+Design decisions locked at M5 start:
+- **Loader seam**: every format is a free function
+  `(Span<const u8> bytes) → Result<Record, Error>`; the cache dispatches by
+  extension-hash table and stays user-extensible. No virtual loader interface.
+- **Error model**: error codes; corrupt input = log + reject, never exceptions.
+- **Third-party discipline**: pinned-tag FetchContent, SYSTEM includes so
+  -Werror never fires inside vendored code, license noted beside each pin.
+- **Tests per codec**: known-answer decodes for hand-written parsers;
+  synthetic malformed inputs rejected (bad magic, truncation, out-of-range
+  dims); library-backed formats validated against scenes authored in-test via
+  the library's own writer APIs where available (no binary fixtures in repo).
 
 ### Milestone 6 — Graphics Abstraction (RHI)
 - Device, Buffer, Texture, Sampler, Shader, PipelineState, CommandBuffer, Swapchain, Framebuffer
@@ -362,38 +396,49 @@ Recommended interleave: M13 right after M4 (no renderer required), M14 after
 M5 (resources), M15 as soon as M7 draws its first mesh, M16 alongside M12.
 The renderer track stays exactly as written above.
 
-## 9. Key References (from awesome3dengine)
+## 9. Key References
 
+### Architecture
 | Topic | Resource |
 |-------|----------|
 | Overall architecture | *Game Engine Architecture* — Jason Gregory (Ch. 3–6, 8) |
+| Engine math paradigms | *Foundations of Game Engine Development Vol. 1* — Eric Lengyel |
+| Modern rendering theory | *FGED Vol. 2: Rendering* — Lengyel (companion to our M6–M12) |
+| Scene-graph/realtime structure | *3D Game Engine Architecture/Design* — David H. Eberly |
+| Subsystem coupling analysis | **SyDRA** (2024): dependency study of 10 open-source engines — validates §4 layering and informs where resources sit between ECS and RHI |
+| Data-driven rendering | Gabriel Sassone's data-driven rendering writings: render passes/shaders dictated by data files, not hardcoded — target model for M8 render graph v2+ |
+
+### Rendering
+| Topic | Resource |
+|-------|----------|
 | Renderer design | "Designing a Modern Rendering Engine" thesis; Data Driven Renderer PDF; Modern Renderer Design thread |
 | Data-oriented rendering | "ECS and Rendering" (Our Machinery); Data Driven Rendering (Sassone) |
 | PBR | Allegorithmic PBR Guide; UE4 PBR docs; Moving Frostbite to PBR |
-| Lighting/pipelines | Forward+ paper; Forward vs Deferred vs Forward+ (3DGEP); 2048 point lights @60fps |
+| Light transport foundations | *Physically Based Rendering: From Theory to Implementation* — Pharr/Jakob/Humphreys (offline but the physics our real-time approximations approximate) |
+| Lighting pipelines | Forward vs Deferred vs Forward+ comparisons (3DGEP); Forward+ paper; 2048 point lights @60fps — **mandatory reading before M6 device design / M8 pipeline choice** |
 | Vulkan | Writing an Efficient Vulkan Renderer (zeux.io); BansheeEngine Vulkan blog/code |
 | Optimization | Fast Hierarchical Culling (Cesium); Frostbite compute pipeline; Agner's optimization resources |
 | Physics (later) | Introduction to Networked Physics (Gaffer on Games); Unified Particle Physics preprint |
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
+
+### Procedural generation
+| Topic | Resource |
+|-------|----------|
+| Papers catalog | [hzxie/Awesome-3D-Scene-Generation](https://github.com/hzxie/Awesome-3D-Scene-Generation) — terrain simulation, rule-based city generation, neural techniques; feeding M13–M16 |
+
+### Hubs
+| Topic | Resource |
+|-------|----------|
+| Curated rendering/GI/PBR | [jcoder58/awesome3dengine](https://github.com/jcoder58/awesome3dengine) |
+| Full toolset scope | [stevinz/awesome-game-engine-dev](https://github.com/stevinz/awesome-game-engine-dev) — scene editors, asset pipelines (editor era) |
 ## 10. Immediate Next Step
 
-Milestone 13 (Deterministic Noise) is complete and verified, in the hardened
-order: `cmake/FloatPrecision.cmake` landed first (`/fp:precise` on MSVC,
-`-ffp-contract=off` elsewhere), all six presets were verified green under the
-locked FP regime BEFORE any golden was generated. Goldens (bit-exact hex
-values + generation recipe comment) were frozen from a GCC build under the
-exact contract flags; the three MSVC configurations then reproduced every
-value bit-for-bit — the §11.6 cross-toolchain parity proof. Library surface
-(`f4::noise`): value2D/3D, perlin2D/3D (unit gradient tables, integer-hash
-selection), simplex2D (frozen literal skew constants), fbm2D/3D with a
-PUBLIC octave schedule (`seed ^ i * 0x9E3779B97F4A7C15`) that tests
-replicate bit-exactly outside the library, warp2D. Tests cover goldens,
-range bounds, Lipschitz continuity, exact Perlin lattice zeros, 10k-sample
-seed replay/sensitivity, and FBM normalization.
-
-Next: M5 (Resources) on the renderer track. After M5: M14 world data model
-(§11), then M6/M7 continue the renderer track with M15 slotting in once M7
-draws its first mesh.
+M5 expanded per product call (2026-08-25): full-spectrum asset IO before any
+renderer work. Order: M5.0 core layer (cache/handles/path lookup/file IO/
+.f4asset/Mesh+Texture+Shader records/descs) → §12 ladder M5.1→M5.9 in
+dependency order. Each step gated by all six presets. Renderer track (M6+)
+resumes after the ladder completes; M14 world data model then follows the
+original interleave plan.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -536,3 +581,28 @@ Two rules make that achievable:
 5. HeightPolicy tiles + shared-edge normals
 
 (Order starts with the most demanding future consumer of M15 meshing.)
+
+## 12. Asset IO Ladder (M5.1–M5.9)
+
+Full-spectrum format support, dependency-ordered, one rung per sub-milestone.
+Every rung: pinned deps per §2 discipline, six-preset gate, plan-doc status
+update in the table below.
+
+| Rung | Formats | Strategy | Status |
+|------|---------|----------|--------|
+| M5.1 | BMP, TGA | Hand-written decoders (~150 lines) — proves the loader seam zero-dep | ⬜ |
+| M5.2 | PNG, JPG, HDR | Vendor stb_image (public domain) | ⬜ |
+| M5.3 | glTF / GLB | Vendor cgltf (MIT): meshes, submeshes, materials into our records; skins/animations deferred | ⬜ |
+| M5.4 | OpenEXR | Minimal scanline half-float subset by hand; vendor full OpenEXR only if tiled/deep needed | ⬜ |
+| M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ⬜ |
+| M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder; supercompressed payloads → RGBA or GPU-native | ⬜ |
+| M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ⬜ |
+| M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ⬜ |
+| M5.9 | USD, Alembic | Vendor OpenUSD and Alembic(+Imath/HDF5); fixtures authored in-test via their writer APIs. Heaviest rung by an order of magnitude — deliberately last so nothing blocks behind it | ⬜ |
+
+Cross-rung notes:
+- Compressed textures ride GPU-native through M9+ backends wherever hardware
+  accepts them; software decode exists for CPU sampling regardless of backend.
+- Every decoder feeds the SAME Texture/Mesh records from M5.0 — no format ever
+  leaks above the loader seam.
+- Renderer track (M6+) resumes only after this table is fully ✓.
