@@ -28,6 +28,7 @@ add_executable(f4_tests
     core/test_resources.cpp
     core/test_image_loaders.cpp
     core/test_gltf_loader.cpp
+    core/test_exr_loader.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp

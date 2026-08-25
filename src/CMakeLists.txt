@@ -14,6 +14,12 @@ FetchContent_Declare(cgltf
 )
 FetchContent_MakeAvailable(cgltf)
 
+FetchContent_Declare(zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG v1.3.1
+)
+FetchContent_MakeAvailable(zlib)
+
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
@@ -28,11 +34,15 @@ add_library(f4_core STATIC
     core/resources/stb_image_loader.cpp
     core/resources/cgltf_impl.cpp
     core/resources/gltf_loader.cpp
+    core/resources/exr_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${stb_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${cgltf_SOURCE_DIR})
+
+target_link_libraries(f4_core PUBLIC zlibstatic)
+target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 
 f4_set_warnings(f4_core)
 f4_set_float_precision(f4_core)
