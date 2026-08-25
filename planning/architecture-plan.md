@@ -9,6 +9,16 @@ Single source of truth for engine design decisions. Reference material: [awesome
 - Graphics backends: **OpenGL, Vulkan, DirectX 12** — all three, behind one abstraction.
 - No deadline. Slow, correct foundation over fast results.
 - The goal is **not** "make three APIs work." The goal is to build an **API-independent rendering model that happens to have three implementations.**
+- **PRODUCT GOAL (primary):** this engine exists to ship real 3D games with
+  **procedurally generated worlds** — Minecraft-style voxel terrain,
+  Ark/Valheim-style streamed open worlds with biomes, and hex/grid-cell
+  worlds. Every feature is judged by whether it serves building such games;
+  the procgen track (M13+) is a peer of the rendering track, not an
+  afterthought. Existing foundations already serve it directly: the
+  deterministic RNG contract gives identical seeded worlds on every machine,
+  chunk serialization gives world save/edit persistence, generational
+  handles give stable chunk/entity ids, and the ECS carries world-scale
+  entity counts.
 
 ## 2. Locked Decisions
 
@@ -231,6 +241,31 @@ Design decisions locked at M2 start:
 - add/remove/get; queries/views; system execution runner
 - Entity lifetime stress tests
 
+Design decisions locked at M3 start:
+- **Entities are Handle<EntityTag>**: reuse the proven M2 handle type
+  ({u32 index, u32 generation}, null = 0xFFFFFFFF). Registry owns allocation
+  through a GenerationalArena of tiny slot records, so stale-entity rejection
+  (ABA-safety), recycling and clear() semantics are inherited from tested
+  code rather than reimplemented.
+- **ComponentStorage<T> is a sparse set**: dense arrays (components +
+  owning entities) plus a sparse index→dense-slot map keyed by entity INDEX.
+  Swap-and-pop removal: component ORDER in dense storage changes on erase
+  (documented; sort explicitly if order matters) and pointers/references into
+  dense storage are invalidated by any removal. Lookup validates the FULL
+  entity handle (index + generation match against the dense entities array),
+  so a stale recycled id can never fetch a newer entity's component.
+- **Registry type-erases storages** in a HashMap<std::type_index, Box<IStorage>>;
+  storage<T>() creates on first use. destroy(entity) removes that entity from
+  every registered storage before releasing the handle - components never
+  outlive their entity.
+- **View<Ts...> iterates the smallest storage** among the requested types and
+  probes the others with O(1) contains checks. Iteration order follows the
+  smallest storage's dense order (unspecified after removals).
+- **SystemRunner is an ordered list** of named {name, fn(Registry&)} stages,
+  executed in insertion order - deterministic by construction. No scheduling
+  magic until M12 proves it necessary.
+- All logic is platform-free and headless-testable across all six presets.
+
 ### Milestone 4 — Transform
 - `LocalTransform` + parent links as components
 - World-matrix recomputation pass, dirty propagation
@@ -276,6 +311,57 @@ Design decisions locked at M2 start:
 - SIMD math paths
 - Render graph scheduling, async compute
 
+### Milestone 13 — Deterministic Noise Library (procgen track)
+- Value/Perlin/Simplex noise, FBM, domain warping — every function takes an
+  explicit seed; no hidden global state
+- Extends the M1.5 RNG contract: identical seed → identical world bytes on
+  every toolchain and backend (CPU reference vs GPU-sampled noise parity is
+  an M11+ test under the §7 rules)
+- Pure CPU + headless-testable; can execute immediately after M4
+
+### Milestone 14 — World Data Model (procgen track)
+- **All three cell styles are first-class by design decision** (voxel blocks,
+  height tiles, hex cells) — none is a retrofit
+- Full technical specification: **§11** (chunk frame, storage layouts,
+  coordinate math, concurrency, float-parity rules)
+- Chunked world storage keyed by Handle<Tag> chunk ids. The chunk is the
+  uniform unit (id, seed-derived generation, edit deltas, dirty flags,
+  streaming state); the CELL LAYOUT is a chunk-level policy, not a virtual
+  per-cell interface: one compile-time CellPolicy per world kind keeps hot
+  loops monomorphic, honoring the §3 "semantics over layout, no per-object
+  inheritance" rule at world scale
+  - VoxelPolicy: dense block-id array (u16 palette) per chunk
+  - HeightPolicy: heightfield samples + biome/material layers per tile
+  - HexPolicy: axial-coordinate cells with explicit neighbor topology
+- Generation pipeline: seed → chunk cells via M13 noise; player edits stored
+  as sparse deltas over the generated base
+- Save/load of edits through the M2 chunk serialization format (endian
+  marker + versioned chunks already proven)
+
+### Milestone 15 — Terrain Meshing (procgen track)
+- One mesher per cell policy, all emitting the SAME MeshData
+  {vertices, indices} record consumed uniformly by the RHI:
+  - Voxel: culled + greedy mesher, per-face texturing, baked ambient
+    occlusion, DDA-ready geometry
+  - Height: skirt-stitched tessellated tiles with biome splatting
+  - Hex: prism meshes from cell topology, per-face coloring
+- Border stitching between neighboring chunks within a policy; remesh on
+  edit with dirty flags from M14
+- Executes as soon as M7 proves window→device→draw; headless mesher tests
+  run earlier against golden vertex dumps
+
+### Milestone 16 — World Streaming (procgen track)
+- Ring load/unload of chunks around the camera on worker threads — pulls the
+  job system forward from M12 into first-class status
+- Priority queues by distance, per-frame time budget so spikes never stall
+  the frame, generation staged: layout → cells → meshes
+- Collision hooks for terrain (voxel DDA raycast for the Minecraft case,
+  heightfield sampling for the Ark/Valheim case)
+
+Recommended interleave: M13 right after M4 (no renderer required), M14 after
+M5 (resources), M15 as soon as M7 draws its first mesh, M16 alongside M12.
+The renderer track stays exactly as written above.
+
 ## 9. Key References (from awesome3dengine)
 
 | Topic | Resource |
@@ -291,11 +377,158 @@ Design decisions locked at M2 start:
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
 ## 10. Immediate Next Step
 
-Milestone 2 is complete and verified (139 cases / 5,405 assertions, all six
-presets green): memory seam (heapAllocate/heapFree), Arena/Pool allocators,
-Array<T>, generational handles + GenerationalArena, String/StringView with
-shared FNV-1a hashing, HashMap wrapper, POD/chunk serialization with explicit
-little-endian policy.
+Milestone 3 (ECS) is complete and verified (147 cases / 9,090 assertions,
+all six presets green). The product goal is now locked in §1: procedurally
+generated 3D worlds (voxel / streamed open-world / hex-cell games).
 
-Next: Milestone 3 (Application Layer) - platform/window abstraction,
-input events, and the main loop skeleton that the renderer will plug into.
+**Pending target-game decision: RESOLVED — all three cell styles (voxel,
+heightfield+biomes, hex) are designed in from day one** (see M14/M15).
+Chunk-level CellPolicy templates keep hot loops monomorphic; a shared
+MeshData record keeps the RHI policy-agnostic.
+
+Renderer track continues regardless: next milestone is M4 (Transform) -
+LocalTransform + parent links as components, world-matrix recomputation,
+dirty propagation, reparent/orphan/cycle tests - with M13 (noise library)
+slotted right behind it per the recommended interleave.
+
+## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
+
+Locked technical specification behind M14/M15. Numbers are initial values —
+chosen simple and safe; each carries a documented upgrade path.
+
+### 11.1 Common chunk frame (all policies)
+
+- **Identity**: every chunk is a `Handle<ChunkTag>` (M2 machinery) plus a
+  small POD `ChunkCoord{int32 x, y, z}` hashed into the resident-chunk map
+  (`std::hash` specialization ships with it so M2's HashMap accepts it).
+  world-space origin = coord * chunkExtent(policy-specific).
+- **Lifecycle** (state byte written only by the main thread):
+  `Invalid → Queued → LayoutDone → CellsReady → Meshed`, plus dirty bits
+  (`cellsDirty`, `meshDirty`, `bordersDirty`). Workers advance stages; they
+  never mutate shared buffers in place (see 11.5).
+- **Purity rule**: layout AND cells are pure functions of
+  `(worldSeed, coord, policyParams)`. Player edits live ONLY in a sparse
+  delta overlay:
+  `HashMap<u32 cellIndex, CellValue> deltas;`
+  Regeneration + delta replay reproduces the chunk bit-exactly. Saves
+  persist just the deltas through M2 chunk framing (id + version) — an
+  untouched chunk costs zero save bytes.
+- **Policy selection is regional**: a RegionMap divides the world into large
+  tiles (default 512 m) each naming ONE active policy. A Valheim-style world
+  becomes "heightfield everywhere except these cave regions which are
+  voxel" with no special-casing downstream — everything consumes the
+  policy-neutral chunk interface (`cells()`, `markDirty()`, `buildMesh()`).
+
+### 11.2 VoxelPolicy
+
+- **Geometry**: 32×32×32 cells (locked). Linearization locked as
+  `index = x | (z << 5) | (y << 10)` — horizontal slices contiguous, so XZ
+  scans and greedy-mesher sweeps stay cache-friendly; vertical runs stride
+  1024.
+- **Storage v1**: flat `Array<u16>` = 64 KiB/chunk. Air = 0 (memset-able;
+  "trivially empty" check = scan first words for all-zero).
+- **Storage v2 (upgrade path, M16)**: per-chunk palette + bit-packed
+  indices — ≤256 distinct blocks pack to 8-bit indices (32 KiB), typical
+  terrain palettes ≤16 blocks pack to 4-bit (16 KiB). Palette lives in the
+  chunk header; serialization versioning already allows both layouts.
+- **Block registry**: u16 id → `{solid, opaque, textureLayer, hardness}`.
+  ids 0..255 engine-reserved (0 air, 1 bedrock, …); games own ≥256.
+- **Meshing input**: padded fetch window of 34³ built once per remesh from
+  the chunk plus the 6 face neighbors' 1-cell edge slabs. Face adjacency is
+  sufficient for face culling; corners become relevant only when baked AO
+  arrives (noted for M15 — window grows to neighbor corners then).
+- **Raycast**: Amanatides–Woo DDA over the cell grid; returns
+  `{cell, enteringFaceNormal, t}`. The world-level raycast walks chunk
+  boundaries transparently.
+- **Remesh granularity v1**: whole chunk. Upgrade path: eight 16³ sections
+  with per-section dirty bits (documented now, built when profiling asks).
+- **Memory envelope**: at radius-8 view distance (~2200 resident chunks)
+  v1 storage ≈ 140 MB worst-case full chunks, far less with emptiness
+  checks; the palette path halves or quarters that. Radius-16 is what makes
+  v2 mandatory rather than optional.
+
+### 11.3 HeightPolicy
+
+- **Tile**: 65×65 samples (64 m quads at 1 m spacing) — the extra shared
+  edge row/col overlaps neighbors so stitching never interpolates across a
+  gap. Heights are f32 meters in v1.
+- **Layers per sample**: height f32 + biomeId u16 (index into a global
+  BiomeTable) + 4× u8 material weights normalized to Σ=255 (splat map).
+- **Normals**: central differences; edge samples read NEIGHBOR TILES' rows
+  so lighting never reveals tile seams.
+- **Sampling contract**: `worldXZ → bilinear height/biome`. Gameplay
+  (collision, spawning) uses the SAME sampler as rendering — one source of
+  truth, divergence impossible.
+- **LOD**: fixed 2-triangle quads v1, CDLOD-style skirts to hide level
+  cracks (M15); no dynamic tessellation.
+- **Overhangs/caves**: impossible inside a height tile BY DESIGN — such
+  features are voxel-policy regions via the RegionMap (11.1). At a
+  height↔voxel region border a skirt wall drops to a constant skirt floor.
+- **Edits**: sparse deltas `{sampleIndex → newHeight/newWeights}`;
+  flatten/smooth/ramp tools go through the same mechanism as gameplay
+  edits.
+
+### 11.4 HexPolicy
+
+- **Topology**: pointy-top AXIAL coordinates (q, r). Locked neighbor table:
+  `(+1,0) (+1,-1) (0,-1) (-1,0) (-1,+1) (0,+1)`;
+  `distance(a,b) = (|dq| + |dr| + |dq+dr|) / 2`.
+- **Storage**: rectangular dense backing, `w = mapWidthInHexes`:
+  ```
+  col  = q + floorDiv(r, 2)
+  row  = r
+  index = row * w + col        // floordiv, NOT trunc: C++ `/` truncates
+                               // toward zero and breaks negative rows;
+                               // M14 ships one shared floorDiv/mod pair
+  ```
+  Cells outside the hex-shaped region hold `kInvalidCell`. Irregular island
+  maps may instead back onto `HashMap<AxialCoord, Cell>` behind the same
+  interface.
+- **Elevation is stored PER CORNER, not per cell**: a corner lattice where
+  every hex shares its six corners with its neighbors guarantees watertight
+  prisms — no T-junction cracks, ever. Corner heights come from M13 noise
+  sampled at corner world positions; a cell's center height derives from
+  its corners.
+- **Content per cell**: terrainType u8 + owner slot (strategy-game state:
+  entity Handle or faction id) + implicit corner references via lattice
+  position.
+- **Queries shipped with M14**: ring/spiral iteration (walk the direction
+  table), hex line-draw (lerp + axial round); obstacle-aware range comes
+  later with gameplay.
+
+### 11.5 Concurrency model (all policies)
+
+- Cell buffers are IMMUTABLE once published (`CellsReady`). Edits append to
+  the delta overlay under a per-chunk lock and bump a version counter;
+  remesh workers snapshot `(base, deltas@version)` so a running mesher never
+  observes torn state. The main thread swaps in finished meshes.
+- Until M16's job system exists, the same state machine runs synchronously
+  on the main thread — swapping workers in later touches scheduling only,
+  not the data model.
+
+### 11.6 Determinism & float parity
+
+M13 noise must produce BIT-IDENTICAL output across GCC/MSVC/Clang and
+eventually GPU samplers (extends the M1.5 contract from fixtures to worlds).
+Two rules make that achievable:
+
+1. **Compile discipline**: `-ffp-contract=off` (GCC/Clang) and `/fp:precise`
+   (MSVC) on ALL presets — FMA contraction differences are the #1 silent
+   cross-toolchain divergence. Added to CompilerWarnings.cmake when M13
+   lands.
+2. **Kernel discipline**: hot-path noise avoids transcendental functions;
+   gradient/permutation tables come from integer hashes, not sin/cos. Where
+   exactness vs GPU sampling is impossible, comparison tolerance is
+   calibrated exactly like M8: measured delta × 4, recorded in the test.
+
+### 11.7 M14 delivery order
+
+1. `floorDiv/floorMod` helpers, `ChunkCoord`, hashing
+2. Chunk frame: lifecycle state machine + delta overlay + purity-based
+   regeneration
+3. VoxelPolicy end-to-end: placeholder-noise gen → edits → serialize →
+   reload-equality test
+4. HexPolicy topology + corner lattice
+5. HeightPolicy tiles + shared-edge normals
+
+(Order starts with the most demanding future consumer of M15 meshing.)
