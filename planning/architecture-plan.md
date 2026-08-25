@@ -439,8 +439,11 @@ file IO, .f4asset container). M5.1 BMP+TGA hand-written decoders shipped with
 and `std::span<const std::byte>` entry points. M5.2 stb_image vendor dep
 shipped — PNG/JPG/HDR/BMP/TGA/PSD/GIF/PIC via `stbi_load_from_memory` +
 `stbi_loadf_from_memory` wrappers, FETCHCONTENT pinned to commit
-`2c980bb`, SYSTEM includes, no engine warnings. 193 tests / 84,263 assertions
-across all six presets. Next: M5.3 (glTF loader via cgltf vendor dep).
+`2c980bb`, SYSTEM includes, no engine warnings. M5.3 cgltf vendor dep
+shipped — glTF 2.0 / GLB parsing into Mesh records with position, normal,
+texcoord, tangent, color attributes; indices; auto-computed bounds.
+FETCHCONTENT pinned to commit `85cd623`, SYSTEM includes. 200 tests /
+84,301 assertions across all six presets. Next: M5.4 (OpenEXR).
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -594,7 +597,7 @@ update in the table below.
 |------|---------|----------|--------|
 | M5.1 | BMP, TGA | Hand-written decoders (~150 lines) — proves the loader seam zero-dep | ✅ |
 | M5.2 | PNG, JPG, HDR | Vendor stb_image (public domain) | ✅ |
-| M5.3 | glTF / GLB | Vendor cgltf (MIT): meshes, submeshes, materials into our records; skins/animations deferred | ⬜ |
+| M5.3 | glTF / GLB | Vendor cgltf (MIT): meshes, submeshes, materials into our records; skins/animations deferred | ✅ |
 | M5.4 | OpenEXR | Minimal scanline half-float subset by hand; vendor full OpenEXR only if tiled/deep needed | ⬜ |
 | M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ⬜ |
 | M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder; supercompressed payloads → RGBA or GPU-native | ⬜ |

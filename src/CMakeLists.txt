@@ -7,6 +7,13 @@ FetchContent_Declare(stb
 )
 FetchContent_MakeAvailable(stb)
 
+FetchContent_Declare(cgltf
+    SYSTEM
+    GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+    GIT_TAG 85cd62382dfea638278962690cf515023f33ed00
+)
+FetchContent_MakeAvailable(cgltf)
+
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
@@ -19,10 +26,13 @@ add_library(f4_core STATIC
     core/resources/tga_loader.cpp
     core/resources/stb_image_impl.cpp
     core/resources/stb_image_loader.cpp
+    core/resources/cgltf_impl.cpp
+    core/resources/gltf_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${stb_SOURCE_DIR})
+target_include_directories(f4_core SYSTEM PUBLIC ${cgltf_SOURCE_DIR})
 
 f4_set_warnings(f4_core)
 f4_set_float_precision(f4_core)
