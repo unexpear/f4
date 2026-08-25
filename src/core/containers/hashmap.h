@@ -38,6 +38,9 @@ public:
 
     void set(const K& key, const V& value) { map_[key] = value; }
 
+    // Move-only value support (e.g. Box<IStorage>).
+    void set(const K& key, V&& value) { map_[key] = static_cast<V&&>(value); }
+
     [[nodiscard]] auto find(const K& key) -> V* {
         const auto it = map_.find(key);
         return it != map_.end() ? &it->second : nullptr;
