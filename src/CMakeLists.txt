@@ -30,6 +30,13 @@ set(BASISU_ZSTD OFF CACHE BOOL "" FORCE)
 set(BASISU_DISABLE_ANDROID_ASTC_DECOMP ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(basis_universal)
 
+FetchContent_Declare(ufbx
+    SYSTEM
+    GIT_REPOSITORY https://github.com/ufbx/ufbx.git
+    GIT_TAG v0.23.0
+)
+FetchContent_MakeAvailable(ufbx)
+
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
@@ -51,12 +58,16 @@ add_library(f4_core STATIC
     core/resources/basisu_transcoder_impl.cpp
     core/resources/ktx2_loader.cpp
     core/resources/astc_loader.cpp
+    core/resources/obj_loader.cpp
+    core/resources/ufbx_impl.cpp
+    core/resources/fbx_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${stb_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${cgltf_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${basis_universal_SOURCE_DIR}/transcoder)
+target_include_directories(f4_core SYSTEM PUBLIC ${ufbx_SOURCE_DIR})
 
 target_link_libraries(f4_core PUBLIC zlibstatic)
 target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})

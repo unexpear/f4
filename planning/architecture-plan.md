@@ -465,7 +465,15 @@ fuzz-tested `basisu_astc::astc::decompress_ldr`/`decompress_hdr` from
 `BASISU_DISABLE_ANDROID_ASTC_DECOMP=1` enables the software decoder;
 `astc_helpers::init_tables()` called lazily on first decode; LDR→RGBA8_UNORM,
 HDR→RGBA32_FLOAT. 256 tests / 85,213 assertions across all six presets.
-Next: M5.8 (OBJ/MTL loader).
+M5.8 OBJ+FBX shipped — OBJ hand-written parser (~370 lines) supports
+`v`/`vt`/`vn` faces, groups, `f v/vt/vn` + `f v//vn` + `f v/vt` + `f v`
+formats, fan-triangulation of quads/ngons, negative indices, vertex
+deduplication, `usemtl`/`mtllib` parsed without error; FBX via ufbx v0.23.0
+(single-file MIT, vendored via FetchContent, compiled via `ufbx_impl.cpp`
+with `UFBX_STATIC_DEFINE`); `ufbx_mesh*` face iteration with
+fan-triangulation, position/normal/UV extraction into engine Mesh records.
+277 tests / 85,300 assertions across all five working presets.
+Next: M5.9 (USD, Alembic).
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -624,7 +632,7 @@ update in the table below.
 | M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ✅ |
 | M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder (v2_50); supercompressed payloads → RGBA or GPU-native | ✅ |
 | M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ✅ |
-| M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ⬜ |
+| M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ✅ |
 | M5.9 | USD, Alembic | Vendor OpenUSD and Alembic(+Imath/HDF5); fixtures authored in-test via their writer APIs. Heaviest rung by an order of magnitude — deliberately last so nothing blocks behind it | ⬜ |
 
 Cross-rung notes:
