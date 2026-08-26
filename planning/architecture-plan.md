@@ -445,8 +445,14 @@ texcoord, tangent, color attributes; indices; auto-computed bounds.
 FETCHCONTENT pinned to commit `85cd623`, SYSTEM includes. M5.4 minimal
 OpenEXR scanline loader hand-written — header/attribute parse, HALF+FLOAT
 channels, uncompressed + ZIP (zlib v1.3.1 via FetchContent, cross-platform),
-output RGBA32_FLOAT; tiled/deep rejected. 205 tests / 84,325 assertions
-across all six presets. Next: M5.5 (DDS container + BC1–BC7 decode).
+output RGBA32_FLOAT; tiled/deep rejected. M5.5 DDS container + BC1–BC7
+software decode hand-written — BC1–BC5 decoders from published specs, BC6H
+and BC7 bit-accurate decoders with partition/fixup/weight tables generated
+from the MIT-licensed DirectXTex reference (bc67_tables.inc); DDS loader
+parses legacy fourcc (DXT1/3/5, BC4U/BC5U, ATI1/ATI2) and DX10 headers
+(DXGI BC1–BC7 incl. BC6H UF16/SF16), decodes full mip chains; output
+RGBA8/R8/RG8 unorm for LDR, RGBA32_FLOAT for HDR per §12. 226 tests /
+84,978 assertions across all six presets. Next: M5.6 (KTX2 + BasisU).
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -602,7 +608,7 @@ update in the table below.
 | M5.2 | PNG, JPG, HDR | Vendor stb_image (public domain) | ✅ |
 | M5.3 | glTF / GLB | Vendor cgltf (MIT): meshes, submeshes, materials into our records; skins/animations deferred | ✅ |
 | M5.4 | OpenEXR | Minimal scanline half-float subset by hand; vendor full OpenEXR only if tiled/deep needed | ✅ |
-| M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ⬜ |
+| M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ✅ |
 | M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder; supercompressed payloads → RGBA or GPU-native | ⬜ |
 | M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ⬜ |
 | M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ⬜ |

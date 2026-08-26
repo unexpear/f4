@@ -35,6 +35,9 @@ add_library(f4_core STATIC
     core/resources/cgltf_impl.cpp
     core/resources/gltf_loader.cpp
     core/resources/exr_loader.cpp
+    core/resources/bc_decode.cpp
+    core/resources/bc67_decode.cpp
+    core/resources/dds_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
