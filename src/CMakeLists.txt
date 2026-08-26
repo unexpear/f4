@@ -27,6 +27,7 @@ FetchContent_Declare(basis_universal
 )
 set(BASISU_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BASISU_ZSTD OFF CACHE BOOL "" FORCE)
+set(BASISU_DISABLE_ANDROID_ASTC_DECOMP ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(basis_universal)
 
 add_library(f4_core STATIC
@@ -49,6 +50,7 @@ add_library(f4_core STATIC
     core/resources/dds_loader.cpp
     core/resources/basisu_transcoder_impl.cpp
     core/resources/ktx2_loader.cpp
+    core/resources/astc_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -59,6 +61,7 @@ target_include_directories(f4_core SYSTEM PUBLIC ${basis_universal_SOURCE_DIR}/t
 target_link_libraries(f4_core PUBLIC zlibstatic)
 target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 
+target_compile_definitions(f4_core PUBLIC BASISU_DISABLE_ANDROID_ASTC_DECOMP=1)
 f4_set_warnings(f4_core)
 f4_set_float_precision(f4_core)
 f4_enable_sanitizers(f4_core)

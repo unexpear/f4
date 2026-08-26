@@ -457,8 +457,15 @@ container + BasisU vendor dep shipped — hand-written KTX2 container parser
 vendored via FetchContent; raw KTX2 path decodes
 R8/RG8/RGBA8/BGRA8/R16F/RGBA16F/RGBA32F direct; Basis path delegates
 ETC1S and UASTC payloads to ktx2_transcoder for RGBA8 or RGBA16F output;
-zstd supercompression deferred. 238 tests / 85,046 assertions across all
-six presets. Next: M5.7 (OBJ/MTL loader).
+zstd supercompression deferred. M5.7 ASTC decode shipped — all 14 standard
+2D block sizes (4×4 through 12×12) in both LDR and HDR profiles;
+16-byte `.astc` header parser + block→raster assembly via basisu's
+fuzz-tested `basisu_astc::astc::decompress_ldr`/`decompress_hdr` from
+`basisu_astc_helpers.h` (reuses existing basis_universal v2_50 vendor dep);
+`BASISU_DISABLE_ANDROID_ASTC_DECOMP=1` enables the software decoder;
+`astc_helpers::init_tables()` called lazily on first decode; LDR→RGBA8_UNORM,
+HDR→RGBA32_FLOAT. 256 tests / 85,213 assertions across all six presets.
+Next: M5.8 (OBJ/MTL loader).
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -616,7 +623,7 @@ update in the table below.
 | M5.4 | OpenEXR | Minimal scanline half-float subset by hand; vendor full OpenEXR only if tiled/deep needed | ✅ |
 | M5.5 | DDS container + BC1–BC7 decode | Container by hand; block decoders by hand from published specs; decoded output = RGBA16F/32F where HDR | ✅ |
 | M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder (v2_50); supercompressed payloads → RGBA or GPU-native | ✅ |
-| M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ⬜ |
+| M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ✅ |
 | M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ⬜ |
 | M5.9 | USD, Alembic | Vendor OpenUSD and Alembic(+Imath/HDF5); fixtures authored in-test via their writer APIs. Heaviest rung by an order of magnitude — deliberately last so nothing blocks behind it | ⬜ |
 
