@@ -20,6 +20,15 @@ FetchContent_Declare(zlib
 )
 FetchContent_MakeAvailable(zlib)
 
+FetchContent_Declare(basis_universal
+    SYSTEM
+    GIT_REPOSITORY https://github.com/BinomialLLC/basis_universal.git
+    GIT_TAG v2_50
+)
+set(BASISU_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BASISU_ZSTD OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(basis_universal)
+
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
@@ -38,11 +47,14 @@ add_library(f4_core STATIC
     core/resources/bc_decode.cpp
     core/resources/bc67_decode.cpp
     core/resources/dds_loader.cpp
+    core/resources/basisu_transcoder_impl.cpp
+    core/resources/ktx2_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${stb_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${cgltf_SOURCE_DIR})
+target_include_directories(f4_core SYSTEM PUBLIC ${basis_universal_SOURCE_DIR}/transcoder)
 
 target_link_libraries(f4_core PUBLIC zlibstatic)
 target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
