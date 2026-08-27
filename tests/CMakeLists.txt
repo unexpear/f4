@@ -34,6 +34,8 @@ add_executable(f4_tests
     core/test_astc_loader.cpp
     core/test_obj_loader.cpp
     core/test_fbx_loader.cpp
+    core/test_alembic_loader.cpp
+    core/test_usd_loader.cpp
     core/test_mat4.cpp
     core/test_transform.cpp
     core/test_shapes.cpp

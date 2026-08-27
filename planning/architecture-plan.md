@@ -472,8 +472,35 @@ deduplication, `usemtl`/`mtllib` parsed without error; FBX via ufbx v0.23.0
 (single-file MIT, vendored via FetchContent, compiled via `ufbx_impl.cpp`
 with `UFBX_STATIC_DEFINE`); `ufbx_mesh*` face iteration with
 fan-triangulation, position/normal/UV extraction into engine Mesh records.
-277 tests / 85,300 assertions across all five working presets.
-Next: M5.9 (USD, Alembic).
+ 277 tests / 85,300 assertions across all five working presets.
+M5.9 USD+Alembic shipped — Alembic via official tree (Ogawa-only, no HDF5,
+v1.8.12) + Imath v3.2.0; USD via tinyusdz v0.9.1 (zero-dep single-file reader).
+Both integrated through the pinned FetchContent discipline. FetchContent
+issues upgraded: Alembic's unconditional `install()`/`export()` overridden with
+a local `macro(export)` no-op + `CMAKE_SKIP_INSTALL_RULES (no source patch
+needed); tinyusdz GCC 16/MSYS2 patched (`cmake/patch_tinyusdz.cmake`): removed
+clang-only `-Wa,-mbig-obj`, added `-Wno-unused-function
+-Wno-unused-but-set-variable`, `#include <cstdint>` (GCC 16 dropped transitive
+includes), and `auto fn = &TypeTraits<T>::type_id` pattern for dependent-name
+lookup. Loaders wrap third-party exceptions into `Result<_, LoadError>` codes
+(no exceptions leak past the seam). `loadAlembic(Span)->Result<AlembicScene>`
+reads via `IFactory::getArchive` over an in-memory seekable streambuf, walks
+`IPolyMesh` schema, fan-triangulates quads/ngons, extracts pos/normal/UV;
+`loadUsd(Span)->Result<UsdScene>` via `LoadUSDFromMemory`, recurses the prim
+tree, detects `GeomMesh`, fan-triangulates. Tests: Alembic cube authored
+in-test via `OPolyMesh` writer API (round-trip through our memory loader); USD
+cubes from tinyusdz's own `cube-indexed-primvar.usda` + `cube.usdc` fixtures.
+285 tests / 85,352 assertions (+8 tests / +52 assertions, 4 Alembic + 4 USD)
+across all five working presets (debug, release, asan, msvc-debug, msvc-release). The sixth
+preset, msvc-asan, remains the known blocked case it has been since M5.0:
+MSVC's `VS_GLOBAL_EnableASAN` injects STL-annotation defines
+(`_ENABLE_STL_ANNOTATION`) into f4_core/f4_tests objects but not into the
+FetchContent vendor static libs (tinyusdz, Alembic, Imath, basis, zlib),
+producing LNK2038 `annotate_string`/`annotate_vector` mismatches at link
+time. Same pre-existing constraint M5.0-M5.8 recorded as "five working
+presets". Resolving it would need sanitizing flags threaded into every vendor
+target — deferred.
+Next: M6 renderer.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -633,7 +660,7 @@ update in the table below.
 | M5.6 | KTX2 container + BasisU transcode | Container by hand; vendor basis_transcoder (v2_50); supercompressed payloads → RGBA or GPU-native | ✅ |
 | M5.7 | ASTC decode | Vendor reference decoder; note Vulkan can consume ASTC natively — decode path exists for CPU sampling | ✅ |
 | M5.8 | OBJ (fuller subset), FBX | OBJ by hand (mtl-lite); FBX via ufbx (single-file MIT — no proprietary SDK) | ✅ |
-| M5.9 | USD, Alembic | Vendor OpenUSD and Alembic(+Imath/HDF5); fixtures authored in-test via their writer APIs. Heaviest rung by an order of magnitude — deliberately last so nothing blocks behind it | ⬜ |
+| M5.9 | USD, Alembic | Alembic (Ogawa-only, official tree)+Imath; USD via tinyusdz (zero-dep single-file reader — full OpenUSD rejected: TBB+OpenSubdiv+Boost). Fixtures authored in-test via writer APIs / dep-tree fixtures. Heaviest rung by an order of magnitude — deliberately last so nothing blocks behind it | ✅ |
 
 Cross-rung notes:
 - Compressed textures ride GPU-native through M9+ backends wherever hardware

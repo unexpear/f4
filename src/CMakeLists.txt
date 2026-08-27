@@ -37,6 +37,49 @@ FetchContent_Declare(ufbx
 )
 FetchContent_MakeAvailable(ufbx)
 
+FetchContent_Declare(Imath
+    GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/Imath.git
+    GIT_TAG v3.2.0
+)
+set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
+set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(Imath)
+
+set(USE_HDF5 OFF CACHE BOOL "" FORCE)
+set(USE_PYALEMBIC OFF CACHE BOOL "" FORCE)
+set(USE_MAYA OFF CACHE BOOL "" FORCE)
+set(ALEMBIC_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(ALEMBIC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(Alembic
+    GIT_REPOSITORY https://github.com/alembic/alembic.git
+    GIT_TAG 1.8.12
+    EXCLUDE_FROM_ALL
+)
+# Alembic has unconditional export()/install() calls that fail when Imath
+# is not in the same export set.  Override export() as a no-op during
+# FetchContent configure — we never export Alembic targets.
+macro(export)
+endmacro()
+set(CMAKE_SKIP_INSTALL_RULES ON)
+FetchContent_MakeAvailable(Alembic)
+set(CMAKE_SKIP_INSTALL_RULES OFF)
+
+# Alembic expects #include <Imath/half.h> but Imath's build-tree INTERFACE include
+# dir points at src/Imath/ (inside the headers).  Add the parent so the path resolves.
+if(TARGET Imath)
+    target_include_directories(Imath INTERFACE
+        $<BUILD_INTERFACE:${imath_SOURCE_DIR}/src>)
+endif()
+
+FetchContent_Declare(tinyusdz
+    SYSTEM
+    GIT_REPOSITORY https://github.com/lighttransport/tinyusdz.git
+    GIT_TAG v0.9.1
+    PATCH_COMMAND ${CMAKE_COMMAND} -Dtinyusdz_SOURCE_DIR=${CMAKE_BINARY_DIR}/_deps/tinyusdz-src -P ${CMAKE_SOURCE_DIR}/cmake/patch_tinyusdz.cmake
+)
+FetchContent_MakeAvailable(tinyusdz)
+
 add_library(f4_core STATIC
     core/logging/logger.cpp
     core/math/math.cpp
@@ -61,6 +104,8 @@ add_library(f4_core STATIC
     core/resources/obj_loader.cpp
     core/resources/ufbx_impl.cpp
     core/resources/fbx_loader.cpp
+    core/resources/alembic_loader.cpp
+    core/resources/usd_loader.cpp
 )
 
 target_include_directories(f4_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -68,8 +113,9 @@ target_include_directories(f4_core SYSTEM PUBLIC ${stb_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${cgltf_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${basis_universal_SOURCE_DIR}/transcoder)
 target_include_directories(f4_core SYSTEM PUBLIC ${ufbx_SOURCE_DIR})
+target_include_directories(f4_core SYSTEM PUBLIC ${tinyusdz_SOURCE_DIR}/src)
 
-target_link_libraries(f4_core PUBLIC zlibstatic)
+target_link_libraries(f4_core PUBLIC zlibstatic Alembic::Alembic tinyusdz::tinyusdz_static)
 target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 
 target_compile_definitions(f4_core PUBLIC BASISU_DISABLE_ANDROID_ASTC_DECOMP=1)
