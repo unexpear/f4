@@ -310,3 +310,246 @@ TEST_CASE("RHI: submit failure leaves clear state counters") {
     cb.end();
     CHECK(d->submit(cb) == GfxError::BadDescriptor);
 }
+
+TEST_CASE("CommandBuffer: bindResource with 0 resources draws successfully") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+    BufferHandle vb = makeBuffer(d, 12, BufferUsage::Vertex);
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindPipeline(pipe.value());
+    cb.bindVertexBuffer(0, vb, 12);
+    cb.draw(3, 1);
+    cb.endRenderPass();
+    cb.end();
+    CHECK(cb.commandCount() == 5);
+    CHECK(d->submit(cb) == GfxError::None);
+}
+
+TEST_CASE("CommandBuffer: bindResource with 1 resource records correctly") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+    BufferHandle vb = makeBuffer(d, 12, BufferUsage::Vertex);
+    BufferHandle ubo = makeBuffer(d, 64, BufferUsage::Uniform);
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindPipeline(pipe.value());
+    cb.bindVertexBuffer(0, vb, 12);
+    cb.bindResource(0, ubo.index, ubo.generation);
+    cb.draw(3, 1);
+    cb.endRenderPass();
+    cb.end();
+    // beginRB, bindPipeline, bindVB, bindResource(1), draw, endRB = 6 commands
+    // (bindResource coalesces to 1 command)
+    CHECK(cb.commandCount() == 6);
+    CHECK(d->submit(cb) == GfxError::None);
+}
+
+TEST_CASE("CommandBuffer: 4 bindResource calls coalesce into 1 command") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+    BufferHandle ubo0 = makeBuffer(d, 64, BufferUsage::Uniform);
+    BufferHandle ubo1 = makeBuffer(d, 64, BufferUsage::Uniform);
+    BufferHandle ubo2 = makeBuffer(d, 64, BufferUsage::Uniform);
+    BufferHandle ubo3 = makeBuffer(d, 64, BufferUsage::Uniform);
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindResource(0, ubo0.index, ubo0.generation);
+    cb.bindResource(1, ubo1.index, ubo1.generation);
+    cb.bindResource(2, ubo2.index, ubo2.generation);
+    cb.bindResource(3, ubo3.index, ubo3.generation);
+    cb.endRenderPass();
+    cb.end();
+    // beginRB, bindResource(4 coalesced), endRB = 3 commands
+    CHECK(cb.commandCount() == 3);
+    const auto& cmds = cb.commands();
+    CHECK(cmds[1].kind == CommandKind::BindResources);
+    CHECK(cmds[1].resourceCount == 4);
+}
+
+TEST_CASE("CommandBuffer: bindResource separated by draw creates 2 commands") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+    BufferHandle ubo0 = makeBuffer(d, 64, BufferUsage::Uniform);
+    BufferHandle ubo1 = makeBuffer(d, 64, BufferUsage::Uniform);
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindPipeline(pipe.value());
+    cb.bindResource(0, ubo0.index, ubo0.generation);
+    cb.draw(3, 1);
+    cb.bindResource(0, ubo1.index, ubo1.generation);
+    cb.draw(3, 1);
+    cb.endRenderPass();
+    cb.end();
+    // beginRB, bindPipeline, bindResource(1), draw, bindResource(1), draw, endRB = 7
+    CHECK(cb.commandCount() == 7);
+    const auto& cmds = cb.commands();
+    CHECK(cmds[2].kind == CommandKind::BindResources);
+    CHECK(cmds[2].resourceCount == 1);
+    CHECK(cmds[4].kind == CommandKind::BindResources);
+    CHECK(cmds[4].resourceCount == 1);
+}
+
+TEST_CASE("CommandBuffer: 9 bindResource calls produce 2 commands (8+1)") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+    BufferHandle ubos[9];
+    for (int i = 0; i < 9; ++i) {
+        ubos[i] = makeBuffer(d, 64, BufferUsage::Uniform);
+    }
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    for (int i = 0; i < 9; ++i) {
+        cb.bindResource(static_cast<std::uint32_t>(i), ubos[i].index, ubos[i].generation);
+    }
+    cb.endRenderPass();
+    cb.end();
+    // beginRB, bindResource(8), bindResource(1), endRB = 4 commands
+    CHECK(cb.commandCount() == 4);
+    const auto& cmds = cb.commands();
+    CHECK(cmds[1].kind == CommandKind::BindResources);
+    CHECK(cmds[1].resourceCount == 8);
+    CHECK(cmds[2].kind == CommandKind::BindResources);
+    CHECK(cmds[2].resourceCount == 1);
+}
+
+TEST_CASE("CommandBuffer: move semantics preserve command content") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+    BufferHandle vb = makeBuffer(d, 12, BufferUsage::Vertex);
+    BufferHandle ib = makeBuffer(d, 24, BufferUsage::Index);
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindPipeline(pipe.value());
+    cb.bindVertexBuffer(0, vb, 12);
+    cb.bindIndexBuffer(ib, IndexFormat::U16);
+    cb.drawIndexed(6, 1);
+    cb.endRenderPass();
+    cb.end();
+
+    // Verify commands survived the move into the array.
+    CHECK(cb.commandCount() == 6);
+    CHECK(cb.commands()[0].kind == CommandKind::BeginRenderPass);
+    CHECK(cb.commands()[1].kind == CommandKind::BindPipeline);
+    CHECK(cb.commands()[2].kind == CommandKind::BindVertexBuffer);
+    CHECK(cb.commands()[3].kind == CommandKind::BindIndexBuffer);
+    CHECK(cb.commands()[4].kind == CommandKind::DrawIndexed);
+    CHECK(cb.commands()[5].kind == CommandKind::EndRenderPass);
+    CHECK(cb.commands()[4].indexCount == 6);
+
+    CHECK(d->submit(cb) == GfxError::None);
+}
+
+TEST_CASE("CommandBuffer: pipeline+resources+draw full sequence") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+    BufferHandle vb = makeBuffer(d, 12, BufferUsage::Vertex);
+    BufferHandle ib = makeBuffer(d, 24, BufferUsage::Index);
+    BufferHandle ubo0 = makeBuffer(d, 64, BufferUsage::Uniform);
+    BufferHandle ubo1 = makeBuffer(d, 64, BufferUsage::Uniform);
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(fb.value());
+    cb.bindPipeline(pipe.value());
+    cb.bindVertexBuffer(0, vb, 12);
+    cb.bindIndexBuffer(ib, IndexFormat::U16);
+    cb.bindResource(0, ubo0.index, ubo0.generation);
+    cb.bindResource(1, ubo1.index, ubo1.generation);
+    cb.drawIndexed(6, 2);
+    cb.endRenderPass();
+    cb.end();
+    // beginRB, bindPipeline, bindVB, bindIB, bindResource(2 coalesced), drawIndexed, endRB = 7
+    CHECK(cb.commandCount() == 7);
+    CHECK(d->submit(cb) == GfxError::None);
+}

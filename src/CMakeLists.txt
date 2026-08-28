@@ -142,3 +142,38 @@ target_link_libraries(f4_graphics PUBLIC f4_core)
 f4_set_warnings(f4_graphics)
 f4_set_float_precision(f4_graphics)
 f4_enable_sanitizers(f4_graphics)
+
+# --- OpenGL backend (M7) ---------------------------------------------------
+# Requires SDL2 + libepoxy, which are present on the MSYS2 ucrt64 (GCC)
+# toolchain. On toolchains without them (e.g. the MSVC presets) the graphics
+# library stays headless (NullDevice) and F4_GRAPHICS_HAS_OPENGL is OFF, so
+# f4_platform, the GL device, the windowed demo, and the GL-conformance tests
+# are all skipped. The 5-preset headless gate is therefore unchanged.
+find_package(SDL2 CONFIG QUIET)
+
+set(F4_GRAPHICS_HAS_OPENGL OFF)
+if(TARGET SDL2::SDL2)
+    set(F4_GRAPHICS_HAS_OPENGL ON)
+    add_library(f4_platform STATIC
+        platform/window.cpp
+        platform/gl_context.cpp
+    )
+    target_include_directories(f4_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(f4_platform PRIVATE f4_core SDL2::SDL2 epoxy)
+    f4_set_warnings(f4_platform)
+    f4_set_float_precision(f4_platform)
+    f4_enable_sanitizers(f4_platform)
+
+    target_sources(f4_graphics PRIVATE backends/opengl/opengl_device.cpp)
+    target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_OPENGL=1)
+    target_link_libraries(f4_graphics PRIVATE f4_platform)
+
+    # Windowed demo (manual smoke test, not part of the headless gate).
+    add_executable(f4_app app/f4_app.cpp)
+    target_include_directories(f4_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(f4_app PRIVATE f4_graphics f4_platform f4_core SDL2::SDL2)
+    f4_set_warnings(f4_app)
+    f4_set_float_precision(f4_app)
+    f4_enable_sanitizers(f4_app)
+endif()
+set(F4_GRAPHICS_HAS_OPENGL ${F4_GRAPHICS_HAS_OPENGL} PARENT_SCOPE)

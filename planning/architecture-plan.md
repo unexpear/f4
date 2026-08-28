@@ -321,10 +321,75 @@ Design decisions locked at M5 start:
 - **M6.5 headless tests**: `tests/graphics/test_rhi.cpp` — create/destroy cycles for every kind, stale-handle rejection, zero-size buffer, writeBuffer bounds, pipeline-with-dangling-shader rejection, scripted command-record→submit success, and each submit-failure path.
 - **Rationale (NullDevice)**: OpenGL/Vulkan need a window/context that the headless presets lack; the software backend exercises the whole `IDevice` contract (handles, validation, command conformance) deterministically in CI before any real GPU backend lands in M7/M9.
 
-### Milestone 7 — OpenGL Backend
-- Minimum to prove abstraction: window → device → shader → vertex/index buffers → pipeline → draw
-- Triangle → cube → hierarchy of cubes
-- SDL2 window/context integration
+### Milestone 7 — OpenGL Backend ✅
+
+- **M7.0 tooling + platform layer**: SDL2 (v2.32.10), Mesa (v26.1.8, llvmpipe
+  software GL), and libepoxy (v1.5.10) installed via MSYS2 pacman (ucrt64);
+  CA bundle fixed (188,900-byte `cacert.pem` downloaded from curl.se). `src/platform/`
+  added: `Window` (SDL2 wrapper, visible/hidden), `GlContext` (libepoxy init,
+  version parsed from `glGetString(GL_VERSION)` — `epoxy_gl_version()` unreliable
+  on some drivers). GL 4.3 core context for vertex-attrib-binding API.
+- **M7.0 CMake plumbing**: `find_package(SDL2 CONFIG QUIET)` — `F4_GRAPHICS_HAS_OPENGL`
+  defined PUBLIC on `f4_graphics` only when SDL2::SDL2 target exists; MSVC presets
+  stay NullDevice (298 tests). `f4_platform` library (window + gl_context,
+  links f4_core + SDL2::SDL2 + epoxy). `f4_app` executable (windowed demo).
+  GL test gated behind `F4_GRAPHICS_HAS_OPENGL AND TARGET SDL2::SDL2`.
+- **M7.0 OpenGL backend**: `OpenGLDevice : IDevice` — per-family `ObjectStore`
+  records (`GlBuffer/GlTexture/GlSampler/GlShader/GlPipeline/GlSwapchain/
+  GlFramebuffer`) with GL object ids; mapping helpers (`glTextureInternal`,
+  `glTopology`, `glIndexType`, `glCompare`, `glCull`, `glVertexFormat*`,
+  `compileShader`, `bufferTarget`); full create/destroy/submit surface;
+  `submit()` replays the command log with real GL calls (VAO setup via 4.3
+  `glBindVertexBuffer`/`glVertexAttribFormat`, UBO binding via
+  `glBindBufferBase`, indexed draw via `glDrawElements`).
+- **M7.1 triangle**: windowed demo draws a rotating triangle; headless
+  conformance test (`test_gl_device.cpp`) renders via hidden window
+  (llvmpipe or real GPU driver) and verifies pixel output via
+  `glReadPixels`. `initGl` hardened: parses `GL_VERSION` string directly
+  instead of relying on `epoxy_gl_version()` which may return 0 on some
+  drivers.
+- **M7.2 indexed cube**: 24 vertices (4 per face, per-face colors), 36
+  indices, depth buffer (`AttachmentType::Depth`), MVP uniform buffer via
+  `writeBuffer` + `bindResource`, back-face culling, perspective projection
+  (60° FOV), rotation around Y/X axes. `BindResources` wired in GL backend
+  to resolve buffer handles and call `glBindBufferBase`.
+- **Visual verification**: triangle and cube rendered to PPM/screenshot and
+  visually confirmed correct (shape, color, depth, perspective).
+
+#### Performance optimizations (M7.2+)
+
+Six fixes landed before scaling to complex scenes:
+
+- **Fix #1 (SBO resources)**: `Array<BoundResource>` replaced with inline
+  `BoundResource resources[8]` + `resourceCount` in `Command` — zero heap
+  allocations for ≤8 resources per draw. `bindResource()` coalesces adjacent
+  calls into a single Command.
+- **Fix #2 (move semantics)**: `pushCommand(Command&&)` overload added; all
+  recording methods use `std::move`. Eliminates deep copies of command
+  payloads.
+- **Fix #3 (writeBuffer)**: Removed unnecessary `glBindBuffer(target, 0)`
+  unbind. Uniform buffers use orphaning (`glBufferData(nullptr)` +
+  `glBufferSubData`) to avoid GPU pipeline stalls; vertex/index buffers
+  keep plain `glBufferSubData`.
+- **Fix #4 (FBO correctness)**: `GlFramebuffer` now has a real `GLuint fbo`.
+  `createFramebuffer` creates GL FBOs for offscreen rendering; default
+  framebuffer correctly uses FBO 0. `destroyFramebuffer` cleans up FBOs;
+  destructor cleans up via `forEach`.
+- **Fix #5 (conditional clears)**: `BeginRenderPass` builds
+  `GLbitfield clearBits` from actual `clearOnLoad` flags; `glClear` only
+  called when needed, color and depth cleared independently.
+- **Fix #6 (GL state cache)**: Caches `glProgram_`, `glVao_`,
+  `glDepthTest_`, `glCullFace_`, `glDepthFunc_`, `glDepthMask_`.
+  Same-pipeline re-binds skip all state changes; individual values compared
+  before issuing GL calls. Rule: engine-owned GL state only modified through
+  `submit()`.
+
+Tests: 314 test cases / 85,622 assertions across all five working presets
+(debug, release, asan, msvc-debug, msvc-release). 13 new tests (+165
+assertions) for resource binding coalescing (0/1/4/8/9 resources, separated
+by draw), move semantics, offscreen FBO, conditional clears, buffer upload
+correctness, and GL state cache deduplication. msvc-asan remains the
+documented sixth-preset blocker (pre-existing LNK2038).
 
 ### Milestone 8 — Renderer + Render Graph v1
 - Camera, Light, MeshRenderer components; Material concept
@@ -531,7 +596,23 @@ draw-outside-renderpass). 298 tests / 85,418 assertions (+13 tests / +66
 assertions) across all five working presets (debug, release, asan,
 msvc-debug, msvc-release). msvc-asan remains the documented sixth-preset
 blocker (pre-existing LNK2038, unchanged).
-Next: M7 OpenGL backend.
+
+M7 OpenGL backend shipped — SDL2 windowing (v2.32.10), Mesa llvmpipe (v26.1.8),
+and libepoxy (v1.5.10) installed via pacman (ucrt64). `OpenGLDevice : IDevice`
+with full create/destroy/submit; real GL 4.3 core context via libepoxy; triangle
+verified (hidden-window conformance + screenshot); indexed cube with per-face
+colors, depth buffer, MVP uniform buffer, perspective projection, back-face
+culling — all visually confirmed. Six performance optimizations before scaling:
+(1) SBO inline resources (≤8 resources/command, zero heap alloc), (2) move
+semantics on pushCommand, (3) writeBuffer orphaning for Uniform buffers, (4)
+real GL FBOs for offscreen framebuffers, (5) conditional clears from
+clearOnLoad flags, (6) GL state cache (same-pipeline re-binds deduplicated).
+314 tests / 85,622 assertions across five working presets. 13 new tests
+(+165 assertions) covering resource coalescing, move semantics, FBO, clears,
+buffer upload, and state cache. msvc-asan remains the documented sixth-preset
+blocker. Next: M8 render graph.
+
+Next: M8 render graph + renderer.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

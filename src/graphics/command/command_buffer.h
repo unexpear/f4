@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 #include "core/containers/array.h"
 #include "core/ids/handle.h"
@@ -35,9 +36,6 @@ enum class CommandKind : std::uint8_t {
 // One resource bound at (bindPoint, slot) within BindResources.
 struct BoundResource {
     std::uint32_t slot = 0;
-    // Exactly one handle is meaningful depending on BindingType; encoded as a
-    // union-ish via the generic handle key plus a type tag carried by the
-    // caller (PipelineLayout describes types; we just store the value).
     std::uint32_t handleIndex = 0;
     std::uint32_t handleGeneration = 0;
 };
@@ -58,7 +56,10 @@ struct Command {
     std::uint32_t indexCount = 0;
     std::uint32_t firstIndex = 0;
 
-    Array<BoundResource> resources;
+    // Inline resource storage — zero heap allocation for ≤8 resources.
+    static constexpr std::uint8_t kInlineCapacity = 8;
+    std::uint8_t resourceCount = 0;
+    BoundResource resources[kInlineCapacity];
 };
 
 class CommandBuffer {
@@ -88,6 +89,7 @@ public:
 
 private:
     void pushCommand(const Command& cmd);
+    void pushCommand(Command&& cmd);
 
     bool recording_ = false;
     Array<Command> commands_;

@@ -48,6 +48,17 @@ f4_set_warnings(f4_tests)
 f4_set_float_precision(f4_tests)
 f4_enable_sanitizers(f4_tests)
 
+# Headless OpenGL conformance: only on toolchains where the GL backend exists
+# (MSYS2 ucrt64 / GCC). F4_GRAPHICS_HAS_OPENGL is set by src/CMakeLists.txt and
+# propagates up to this scope. The MSVC presets stay headless (NullDevice only).
+# SDL2::SDL2 is an ALIAS target that is directory-scoped, so re-locate it here.
+find_package(SDL2 CONFIG QUIET)
+if(F4_GRAPHICS_HAS_OPENGL AND TARGET SDL2::SDL2)
+    target_sources(f4_tests PRIVATE graphics/test_gl_device.cpp)
+    target_link_libraries(f4_tests PRIVATE epoxy SDL2::SDL2)
+    target_compile_definitions(f4_tests PRIVATE F4_GRAPHICS_HAS_OPENGL=1)
+endif()
+
 add_executable(f4_tests_stripped
     main.cpp
     core/test_min_log_level.cpp

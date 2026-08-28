@@ -8,6 +8,9 @@ auto createDevice() -> IDevice* {
 #if defined(F4_GRAPHICS_BACKEND_null)
     extern auto createNullDevice() -> IDevice*;
     return createNullDevice();
+#elif defined(F4_GRAPHICS_BACKEND_opengl)
+    extern auto createOpenGLDevice() -> IDevice*;
+    return createOpenGLDevice();
 #else
     // No backend selected in this build; nothing to instantiate.
     F4_VERIFY(false, "F4_GRAPHICS_BACKEND does not resolve to a compiled backend");

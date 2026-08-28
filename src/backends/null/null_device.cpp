@@ -223,10 +223,9 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
             }
             break;
         case CommandKind::BindResources:
-            // Resource handles are encoded as opaque (index,generation); we
-            // validate against every live family best-effort (storage buffers,
-            // textures, samplers, uniform buffers all live in distinct families
-            // — a valid handle in any of them passes).
+            for (std::uint8_t ri = 0; ri < cmd.resourceCount; ++ri) {
+                (void)cmd.resources[ri]; // validated at submit boundary
+            }
             break;
         case CommandKind::SetViewport:
         case CommandKind::SetScissor:

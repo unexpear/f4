@@ -36,6 +36,13 @@ public:
     [[nodiscard]] auto contains(ids::Handle<Tag> id) const -> bool { return arena_.contains(id); }
     [[nodiscard]] auto liveCount() const -> std::size_t { return arena_.liveCount(); }
 
+    // Visit every live record (used by backends to release GPU objects on
+    // device teardown).
+    template <typename Fn>
+    void forEach(Fn&& fn) {
+        arena_.forEach(static_cast<Fn&&>(fn));
+    }
+
 private:
     ids::GenerationalArena<Record, Tag> arena_{kCapacity};
 };
