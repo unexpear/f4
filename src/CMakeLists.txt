@@ -1,5 +1,11 @@
 include(FetchContent)
 
+# Backend compiled into this build. 'null' is a software RHI device with no
+# window/GPU dependency (the M6 headless workhorse and conformance reference);
+# opengl/vulkan/dx12 activate in M7/M9/M10.
+set(F4_GRAPHICS_BACKEND "null" CACHE STRING "RHI backend: null|opengl|vulkan|dx12")
+set_property(CACHE F4_GRAPHICS_BACKEND PROPERTY STRINGS null opengl vulkan dx12)
+
 FetchContent_Declare(stb
     SYSTEM
     GIT_REPOSITORY https://github.com/nothings/stb.git
@@ -122,3 +128,17 @@ target_compile_definitions(f4_core PUBLIC BASISU_DISABLE_ANDROID_ASTC_DECOMP=1)
 f4_set_warnings(f4_core)
 f4_set_float_precision(f4_core)
 f4_enable_sanitizers(f4_core)
+
+add_library(f4_graphics STATIC
+    graphics/device/device.cpp
+    graphics/command/command_buffer.cpp
+    graphics/handle.cpp
+    backends/null/null_device.cpp
+)
+
+target_include_directories(f4_graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_BACKEND_${F4_GRAPHICS_BACKEND}=1)
+target_link_libraries(f4_graphics PUBLIC f4_core)
+f4_set_warnings(f4_graphics)
+f4_set_float_precision(f4_graphics)
+f4_enable_sanitizers(f4_graphics)

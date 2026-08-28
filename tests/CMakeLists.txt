@@ -40,9 +40,10 @@ add_executable(f4_tests
     core/test_transform.cpp
     core/test_shapes.cpp
     core/test_frustum.cpp
+    graphics/test_rhi.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(f4_tests PRIVATE f4_core doctest::doctest)
+target_link_libraries(f4_tests PRIVATE f4_core f4_graphics doctest::doctest)
 f4_set_warnings(f4_tests)
 f4_set_float_precision(f4_tests)
 f4_enable_sanitizers(f4_tests)

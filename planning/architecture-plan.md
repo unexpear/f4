@@ -309,10 +309,17 @@ Design decisions locked at M5 start:
   dims); library-backed formats validated against scenes authored in-test via
   the library's own writer APIs where available (no binary fixtures in repo).
 
-### Milestone 6 — Graphics Abstraction (RHI)
+### Milestone 6 — Graphics Abstraction (RHI) ✅
 - Device, Buffer, Texture, Sampler, Shader, PipelineState, CommandBuffer, Swapchain, Framebuffer
 - Command-recording-first API (see §3 amendment)
 - Zero OpenGL/Vulkan/DX12-specific types above this line
+- **M6.0 core layer**: `f4_graphics` library (links `f4_core`); tags `Gpu{Buffer,Texture,Sampler,Shader,Pipeline,Swapchain,Framebuffer}Tag` with generational handles via `ObjectStore`; `GfxError` enum (no exceptions); `Backend`-tagged device types.
+- **M6.1 binding model + pipeline state**: `PipelineLayoutDesc` (BindGroup → BindingSlot → BindingType), `VertexInputLayout` with a local `VertexFormat` resolved to bindings/locations, `DepthStencilState`, `RasterState`, `ColorAttachmentState`, `PipelineStateDesc`.
+- **M6.2 record-only command buffer**: `CommandKind` (BeginRenderPass … DrawIndexed), typed `Command` list; engine records, backend executes at submit.
+- **M6.3 `IDevice` abstract surface**: create*/destroy*/writeBuffer/submit/waitIdle, all `Result<*,GfxError>` or `GfxError`; `createDevice()` factory + `deleteDevice()`.
+- **M6.4 NullDevice software backend**: `F4_GRAPHICS_BACKEND` build selector (`null|opengl|vulkan|dx12`, default `null`); generational `ObjectStore` per family (staleness/invalid → error, never crash); writeBuffer bounds checks; `submit()` replays the command log with a state machine (renderpass-active / pipeline-bound / index-bound → `GfxError::BadDescriptor` on violation). Headless-testable on the five-preset gate.
+- **M6.5 headless tests**: `tests/graphics/test_rhi.cpp` — create/destroy cycles for every kind, stale-handle rejection, zero-size buffer, writeBuffer bounds, pipeline-with-dangling-shader rejection, scripted command-record→submit success, and each submit-failure path.
+- **Rationale (NullDevice)**: OpenGL/Vulkan need a window/context that the headless presets lack; the software backend exercises the whole `IDevice` contract (handles, validation, command conformance) deterministically in CI before any real GPU backend lands in M7/M9.
 
 ### Milestone 7 — OpenGL Backend
 - Minimum to prove abstraction: window → device → shader → vertex/index buffers → pipeline → draw
@@ -501,6 +508,30 @@ time. Same pre-existing constraint M5.0-M5.8 recorded as "five working
 presets". Resolving it would need sanitizing flags threaded into every vendor
 target — deferred.
 Next: M6 renderer.
+
+M6 Graphics Abstraction (RHI) shipped — new `f4_graphics` library (links
+`f4_core`) introduces the full device-object surface behind generational
+handles (`Gpu{Buffer,Texture,Sampler,Shader,Pipeline,Swapchain,Framebuffer}Tag`),
+`GfxError` codes (no exceptions), and the record-only command model. Backend
+is selected at build time via `F4_GRAPHICS_BACKEND` (`null|opengl|vulkan|dx12`,
+default `null`); `src/backends/null/null_device.cpp` is the first concrete
+backend — a software NullDevice that keeps a fake buffer/swapchain, validates
+every create/destroy against a per-family `ObjectStore` (stale/invalid → error,
+never crash), bounds-checks `writeBuffer`, and replays the submitted command
+log through a state machine (render-pass-active / pipeline-bound /
+index-bound), returning `GfxError::BadDescriptor` on a scripted violation.
+Rationale: OpenGL/Vulkan need a window/context the headless gate lacks, so the
+software backend exercises the whole `IDevice` contract deterministically in CI
+before any real GPU backend lands (M7 OpenGL, M9 Vulkan). Tests
+`tests/graphics/test_rhi.cpp` cover create/destroy cycles for every kind,
+stale-handle rejection, zero-size buffer, writeBuffer bounds, pipeline-with-
+dangling-shader rejection, scripted command-record→submit success, and each
+submit-failure path (draw-without-pipeline, drawIndexed-without-ibuffer,
+draw-outside-renderpass). 298 tests / 85,418 assertions (+13 tests / +66
+assertions) across all five working presets (debug, release, asan,
+msvc-debug, msvc-release). msvc-asan remains the documented sixth-preset
+blocker (pre-existing LNK2038, unchanged).
+Next: M7 OpenGL backend.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
