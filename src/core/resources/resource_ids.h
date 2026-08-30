@@ -9,18 +9,20 @@
 namespace f4::resources {
 
 // Handle families. One tag per resource kind; tags are mutually incompatible
-// at compile time (see ids/handle.h). MaterialTag arrives with M8 (plan M5).
+// at compile time (see ids/handle.h).
 struct MeshTag;
 struct TextureTag;
 struct ShaderTag;
 struct BufferTag;
 struct PipelineTag;
+struct MaterialTag; // M8
 
 using MeshHandle = ids::Handle<MeshTag>;
 using TextureHandle = ids::Handle<TextureTag>;
 using ShaderHandle = ids::Handle<ShaderTag>;
 using BufferHandle = ids::Handle<BufferTag>;
 using PipelineHandle = ids::Handle<PipelineTag>; // descriptor arrives with M6
+using MaterialHandle = ids::Handle<MaterialTag>;
 
 // Record type bound to each tag - lets ResourceCache::create<Tag>() deduce
 // its payload instead of asking callers to repeat it.
@@ -41,7 +43,7 @@ struct ResourceTrait<ShaderTag> {
 };
 template <>
 struct ResourceTrait<BufferTag> {
-    using type = BufferDesc;
+     using type = BufferDesc;
 };
 
 } // namespace f4::resources

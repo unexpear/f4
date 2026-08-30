@@ -138,6 +138,7 @@ add_library(f4_graphics STATIC
     graphics/handle.cpp
     graphics/hud/hud_font.cpp
     graphics/hud/hud_overlay.cpp
+    graphics/render_graph/render_graph.cpp
     backends/null/null_device.cpp
 )
 
@@ -147,6 +148,19 @@ target_link_libraries(f4_graphics PUBLIC f4_core)
 f4_set_warnings(f4_graphics)
 f4_set_float_precision(f4_graphics)
 f4_enable_sanitizers(f4_graphics)
+
+add_library(f4_engine STATIC
+    engine/rendering/material.cpp
+    engine/rendering/gpu_mesh.cpp
+    engine/rendering/render_queue.cpp
+    engine/rendering/renderer.cpp
+)
+
+target_include_directories(f4_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(f4_engine PUBLIC f4_core f4_graphics)
+f4_set_warnings(f4_engine)
+f4_set_float_precision(f4_engine)
+f4_enable_sanitizers(f4_engine)
 
 # --- OpenGL backend (M7) ---------------------------------------------------
 # Requires SDL2 + libepoxy, which are present on the MSYS2 ucrt64 (GCC)

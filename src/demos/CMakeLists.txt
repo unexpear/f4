@@ -10,10 +10,10 @@ if(TARGET SDL2::SDL2 AND NOT MSVC)
     f4_enable_sanitizers(demo_support)
 
     foreach(demo IN ITEMS demo_triangle demo_instancing demo_resize demo_collision
-                         demo_assets demo_hud)
+                         demo_assets demo_hud demo_ecs)
         add_executable(${demo} ${demo}.cpp)
         target_include_directories(${demo} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
-        target_link_libraries(${demo} PRIVATE demo_support f4_graphics f4_platform f4_core
+        target_link_libraries(${demo} PRIVATE demo_support f4_graphics f4_platform f4_core f4_engine
                                             SDL2::SDL2)
         f4_set_warnings(${demo})
         f4_set_float_precision(${demo})
