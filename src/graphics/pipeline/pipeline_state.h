@@ -75,6 +75,10 @@ struct VertexInputLayout {
     struct VertexBinding {
         std::uint32_t binding = 0; // vertex buffer slot
         std::uint32_t strideBytes = 0;
+        // Instance step rate: 0 = per-vertex (default), 1 = advance once per
+        // instance. Bindings with divisor >= 1 carry per-instance data for
+        // hardware instancing (glVertexBindingDivisor / equivalent).
+        std::uint32_t divisor = 0;
     };
     struct VertexAttribute {
         std::uint32_t binding = 0; // which VertexBinding

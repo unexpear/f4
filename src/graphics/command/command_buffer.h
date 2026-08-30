@@ -33,9 +33,12 @@ enum class CommandKind : std::uint8_t {
     EndRenderPass,
 };
 
-// One resource bound at (bindPoint, slot) within BindResources.
+// One resource bound at (bindPoint, slot) within BindResources. `type` tells the
+// backend which handle namespace to resolve (a buffer for Uniform/Storage, a
+// texture/sampler otherwise) and how to bind it on the device.
 struct BoundResource {
     std::uint32_t slot = 0;
+    BindingType type = BindingType::UniformBuffer;
     std::uint32_t handleIndex = 0;
     std::uint32_t handleGeneration = 0;
 };
@@ -75,6 +78,11 @@ public:
     void bindPipeline(PipelineHandle pipeline);
     void bindVertexBuffer(std::uint32_t slot, BufferHandle buffer, std::uint32_t strideBytes);
     void bindIndexBuffer(BufferHandle buffer, IndexFormat format);
+    // Bind a typed resource at a slot. Extra resource kinds (textures/samplers)
+    // must use the typed overload; the plain three-argument form treats the
+    // handle as a uniform buffer (existing callers keep compiling untyped).
+    void bindResource(std::uint32_t slot, BindingType type, std::uint32_t handleIndex,
+                      std::uint32_t handleGeneration);
     void bindResource(std::uint32_t slot, std::uint32_t handleIndex, std::uint32_t handleGeneration);
     void setViewport(Extent viewport);
     void setScissor(Extent scissor);

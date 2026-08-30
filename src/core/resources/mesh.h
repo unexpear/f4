@@ -102,4 +102,29 @@ struct Mesh {
 // mesh carries no positions.
 [[nodiscard]] auto computeBounds(const Mesh& mesh) -> math::AABB;
 
+// CPU-side backing-store bytes held by a mesh: every vertex stream plus the
+// index buffer. (Topology/attribute metadata overhead is not counted.)
+[[nodiscard]] inline auto meshBytes(const Mesh& mesh) -> std::uint64_t {
+    std::uint64_t total = 0;
+    for (const VertexStream& s : mesh.streams) {
+        total += static_cast<std::uint64_t>(s.data.size());
+    }
+    total += static_cast<std::uint64_t>(mesh.indices.size());
+    return total;
+}
+
+// Number of vertices actually addressed by the index buffer (vertex range used
+// by geometry), distinct from the raw stream capacity.
+[[nodiscard]] inline auto meshVertexBytes(const Mesh& mesh) -> std::uint64_t {
+    std::uint64_t total = 0;
+    for (const VertexStream& s : mesh.streams) {
+        total += static_cast<std::uint64_t>(s.data.size());
+    }
+    return total;
+}
+
+[[nodiscard]] inline auto meshIndexBytes(const Mesh& mesh) -> std::uint64_t {
+    return static_cast<std::uint64_t>(mesh.indices.size());
+}
+
 } // namespace f4::resources

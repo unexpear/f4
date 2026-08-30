@@ -189,6 +189,34 @@ TEST_CASE("texture records describe formats and mip chains") {
     CHECK(resources::isBlockCompressed(TextureFormat::ASTC_4X4_UNORM));
 }
 
+TEST_CASE("mesh byte accounting sums streams and indices") {
+    const Mesh mesh = quadMesh();
+    // streams: positions 4*12=48 + uvs 4*8=32; indices: 6*2=12 (U16).
+    CHECK(resources::meshVertexBytes(mesh) == 48u + 32u);
+    CHECK(resources::meshIndexBytes(mesh) == 12u);
+    CHECK(resources::meshBytes(mesh) == 48u + 32u + 12u);
+}
+
+TEST_CASE("texture byte accounting and slice-size estimates") {
+    auto makeMip = [](std::size_t bytes) -> containers::Array<std::byte> {
+        containers::Array<std::byte> a;
+        a.resize(bytes);
+        return a;
+    };
+    Texture texture;
+    texture.format = TextureFormat::RGBA8_UNORM;
+    texture.mips.push(resources::TextureMip{4u, 4u, makeMip(64u)});
+    texture.mips.push(resources::TextureMip{2u, 2u, makeMip(16u)});
+    texture.mips.push(resources::TextureMip{1u, 1u, makeMip(4u)});
+    CHECK(resources::textureBytes(texture) == 64u + 16u + 4u);
+
+    CHECK(resources::textureSliceBytes(4u, 4u, TextureFormat::RGBA8_UNORM) == 64u);
+    // BC7: 8x8 texels = 2x2 blocks of 4x4, 16 bytes each.
+    CHECK(resources::textureSliceBytes(8u, 8u, TextureFormat::BC7_UNORM) == 4u * 16u);
+    CHECK(resources::textureSliceBytes(2u, 2u, TextureFormat::RGBA32_FLOAT) ==
+          4u * 16u);
+}
+
 TEST_CASE("buffer descriptors compose usage bit flags") {
     using resources::BufferUsage;
     const resources::BufferDesc desc{512u, BufferUsage::Vertex | BufferUsage::TransferDst};

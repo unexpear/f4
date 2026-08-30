@@ -187,3 +187,41 @@ TEST_CASE("typed pool constructs and destroys") {
     CHECK(pool.contains(w1));
     CHECK(pool.contains(w5));
 }
+
+TEST_CASE("heap tracker reports per-frame allocation accounting") {
+    HeapTracker& t = heapTracker();
+    enableHeapTracking(true);
+    t.beginFrame();
+
+    void* a = heapAllocate(100);
+    void* b = heapAllocate(64);
+    void* c = heapAllocate(16);
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    heapFree(b);
+
+    t.endFrame();
+    HeapFrameStats s = t.frame();
+    CHECK(s.allocations == 3);
+    CHECK(s.frees == 1);
+    CHECK(s.bytesAllocated == 100u + 64u + 16u);
+    CHECK(s.bytesFreed == 64u);
+    CHECK(s.liveGroups == 2); // a and c still live
+    CHECK(s.peakLiveBytes >= 100u + 64u);
+
+    CHECK(t.liveBytes() == 100u + 16u);
+    CHECK(t.liveGroups() == 2);
+
+    heapFree(a);
+    heapFree(c);
+    t.endFrame();
+    s = t.frame();
+    CHECK(s.allocations == 0);
+    CHECK(s.frees == 2);
+    CHECK(s.bytesFreed == 100u + 16u);
+    CHECK(t.liveBytes() == 0);
+    CHECK(t.liveGroups() == 0);
+
+    enableHeapTracking(false);
+}

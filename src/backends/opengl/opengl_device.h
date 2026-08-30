@@ -43,6 +43,8 @@ public:
 
     auto writeBuffer(BufferHandle, std::uint64_t offset, std::span<const std::byte> data)
         -> GfxError override;
+    auto writeTexture(TextureHandle, std::uint32_t mipLevel, std::span<const std::byte> data)
+        -> GfxError override;
     auto submit(CommandBuffer&) -> GfxError override;
     auto waitIdle() -> void override;
 
@@ -55,6 +57,9 @@ public:
 
     // Expose the GL enum name of the active context extension set for logging.
     [[nodiscard]] auto renderer() const -> const char* { return renderer_; }
+
+    [[nodiscard]] auto stats() const -> DeviceStats override;
+    auto resetFrameStats() -> void override;
 
 private:
     struct Impl;

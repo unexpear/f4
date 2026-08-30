@@ -505,4 +505,342 @@ TEST_CASE("OpenGL backend: different pipeline cull mode changes rendering") {
     delete window;
 }
 
+// Build a pipeline with two vertex buffers: binding 0 carries per-vertex
+// positions (divisor 0), binding 1 carries a per-instance vec4 (divisor 1)
+// used to offset and tint each instance.
+constexpr auto kInstPosVertex = R"glsl(
+#version 430 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aInst;
+out vec4 vColor;
+void main() {
+    gl_Position = vec4(aPos.x + aInst.x, aPos.y, aPos.z, 1.0);
+    vColor = vec4(aInst.yzw, 1.0);
+}
+)glsl";
+
+constexpr auto kInstColorFragment = R"glsl(
+#version 430 core
+in vec4 vColor;
+out vec4 fragColor;
+void main() { fragColor = vColor; }
+)glsl";
+
+TEST_CASE("OpenGL backend: indexed instancing with divisor-1 attributes renders each instance") {
+    auto w = platform::Window::create({"instance test", 256, 256, false});
+    REQUIRE(w.hasValue());
+    platform::Window* window = w.value();
+    REQUIRE(window->makeCurrent());
+    auto glInfo = platform::initGl(4, 3);
+    REQUIRE(glInfo.hasValue());
+    IDevice* dev = createOpenGLDevice();
+    REQUIRE(dev != nullptr);
+
+    // Two instanced quads. Binding 1 steps per instance (divisor 1).
+    PipelineStateDesc pd;
+    pd.topology = PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = CullMode::None;
+
+    {
+        VertexInputLayout::VertexBinding posBinding;
+        posBinding.binding = 0;
+        posBinding.strideBytes = sizeof(float) * 3;
+        posBinding.divisor = 0;
+        pd.vertexInput.bindings.push(posBinding);
+
+        VertexInputLayout::VertexBinding instBinding;
+        instBinding.binding = 1;
+        instBinding.strideBytes = sizeof(float) * 4;
+        instBinding.divisor = 1;
+        pd.vertexInput.bindings.push(instBinding);
+
+        VertexInputLayout::VertexAttribute posAttr;
+        posAttr.binding = 0;
+        posAttr.location = 0;
+        posAttr.format = VertexFormat::Float32x3;
+        posAttr.offsetBytes = 0;
+        pd.vertexInput.attributes.push(posAttr);
+
+        VertexInputLayout::VertexAttribute instAttr;
+        instAttr.binding = 1;
+        instAttr.location = 1;
+        instAttr.format = VertexFormat::Float32x4;
+        instAttr.offsetBytes = 0;
+        pd.vertexInput.attributes.push(instAttr);
+    }
+
+    auto vs = dev->createShader([&] {
+        ShaderDesc d;
+        d.stage = ShaderStage::Vertex;
+        fillBlob(d.blob, kInstPosVertex);
+        return d;
+    }());
+    REQUIRE(vs.hasValue());
+    auto fs = dev->createShader([&] {
+        ShaderDesc d;
+        d.stage = ShaderStage::Fragment;
+        fillBlob(d.blob, kInstColorFragment);
+        return d;
+    }());
+    REQUIRE(fs.hasValue());
+    pd.vertexShader = vs.value();
+    pd.fragmentShader = fs.value();
+    auto pipeline = dev->createPipeline(pd);
+    REQUIRE(pipeline.hasValue());
+
+    // Unit quad centered on origin; instances translate it left/right.
+    struct Pos { float x, y, z; };
+    constexpr std::array<Pos, 4> quads = {{
+        {-0.2f, -0.2f, 0.0f},
+        { 0.2f, -0.2f, 0.0f},
+        { 0.2f,  0.2f, 0.0f},
+        {-0.2f,  0.2f, 0.0f},
+    }};
+    auto* posBytes = reinterpret_cast<const std::byte*>(quads.data());
+    BufferDesc vbd;
+    vbd.sizeBytes = quads.size() * sizeof(Pos);
+    vbd.usage = BufferUsage::Vertex;
+    auto vb = dev->createBuffer(vbd, std::span(posBytes, vbd.sizeBytes));
+    REQUIRE(vb.hasValue());
+
+    constexpr std::array<std::uint16_t, 6> indices = {{0, 1, 2, 0, 2, 3}};
+    BufferDesc ibd;
+    ibd.sizeBytes = indices.size() * sizeof(std::uint16_t);
+    ibd.usage = BufferUsage::Index;
+    auto ib = dev->createBuffer(
+        ibd, std::span(reinterpret_cast<const std::byte*>(indices.data()), ibd.sizeBytes));
+    REQUIRE(ib.hasValue());
+
+    // Per-instance data: {xOffset, r, g, b}. Instance 0 = red on the left,
+    // instance 1 = green on the right.
+    struct Instance { float x, r, g, b; };
+    constexpr std::array<Instance, 2> instances = {{
+        {-0.35f, 1.0f, 0.0f, 0.0f},
+        { 0.35f, 0.0f, 1.0f, 0.0f},
+    }};
+    BufferDesc instDesc;
+    instDesc.sizeBytes = instances.size() * sizeof(Instance);
+    instDesc.usage = BufferUsage::Vertex;
+    auto instBuf = dev->createBuffer(
+        instDesc, std::span(reinterpret_cast<const std::byte*>(instances.data()),
+                            instDesc.sizeBytes));
+    REQUIRE(instBuf.hasValue());
+
+    FramebufferDesc fbd;
+    fbd.extent = {256, 256};
+    AttachmentDesc clear;
+    clear.type = AttachmentType::Color;
+    clear.clearOnLoad = true;
+    clear.clear.color[0] = 0.0f;
+    clear.clear.color[1] = 0.0f;
+    clear.clear.color[2] = 0.0f;
+    fbd.attachments.push(clear);
+    auto fb = dev->createFramebuffer(fbd);
+    REQUIRE(fb.hasValue());
+
+    // Draw both instances in a single indexed draw.
+    {
+        CommandBuffer cb;
+        cb.begin();
+        cb.beginRenderPass(fb.value());
+        cb.bindPipeline(pipeline.value());
+        cb.bindVertexBuffer(0, vb.value(), sizeof(Pos));
+        cb.bindVertexBuffer(1, instBuf.value(), sizeof(Instance));
+        cb.bindIndexBuffer(ib.value(), IndexFormat::U16);
+        cb.drawIndexed(6, 2);
+        cb.endRenderPass();
+        cb.end();
+        CHECK(dev->submit(cb) == GfxError::None);
+        glFinish();
+        CHECK(glGetError() == GL_NO_ERROR);
+    }
+
+    // Left quad center (NDC x ~ -0.35) should be red; right (~ +0.35) green.
+    std::array<float, 3> left{};
+    glReadPixels(83, 128, 1, 1, GL_RGB, GL_FLOAT, left.data());
+    std::array<float, 3> right{};
+    glReadPixels(172, 128, 1, 1, GL_RGB, GL_FLOAT, right.data());
+    std::array<float, 3> gap{};
+    glReadPixels(128, 128, 1, 1, GL_RGB, GL_FLOAT, gap.data());
+
+    // Instance 0 (red): strong R, negligible G.
+    CHECK(left[0] > 0.7f);
+    CHECK(left[1] < 0.3f);
+    // Instance 1 (green): strong G, negligible R.
+    CHECK(right[1] > 0.7f);
+    CHECK(right[0] < 0.3f);
+    // Between the two quads should be the clear color (black).
+    CHECK(gap[0] < 0.3f);
+    CHECK(gap[1] < 0.3f);
+
+    dev->waitIdle();
+    deleteDevice(dev);
+    delete window;
+}
+
+TEST_CASE("OpenGL backend: setViewport restricts rendering to the viewport region") {
+    TriangleHarness h;
+
+    // Viewport covering only the left half of the framebuffer.
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.setViewport({TriangleHarness::kWidth / 2, TriangleHarness::kHeight});
+    cb.bindPipeline(h.pipeline);
+    cb.bindVertexBuffer(0, h.vb, sizeof(float) * 3);
+    cb.draw(3);
+    cb.endRenderPass();
+    cb.end();
+    CHECK(h.dev->submit(cb) == GfxError::None);
+    glFinish();
+
+    // The viewport is only the left half (width/2), so NDC x=0 maps to the
+    // midpoint of that region (width/4). Sample there for the triangle center.
+    std::array<float, 3> center{};
+    glReadPixels(TriangleHarness::kWidth / 4, TriangleHarness::kHeight / 2, 1, 1, GL_RGB,
+                 GL_FLOAT, center.data());
+    CHECK(center[0] > 0.7f);
+
+    // Far right half is outside the viewport: must retain the clear color.
+    std::array<float, 3> farRight{};
+    glReadPixels(TriangleHarness::kWidth - 8, TriangleHarness::kHeight / 2, 1, 1, GL_RGB,
+                 GL_FLOAT, farRight.data());
+    CHECK(farRight[0] < 0.3f);
+}
+
+TEST_CASE("OpenGL backend: stats accumulate draw/instance/primitive counts") {
+    TriangleHarness h;
+    h.dev->resetFrameStats();
+    h.render(); // one draw(3) on a TriangleList pipeline
+    DeviceStats s = h.dev->stats();
+    CHECK(s.drawCalls == 1);
+    CHECK(s.batches == 1);
+    CHECK(s.primitives == 1); // 3 vertices / 3
+    CHECK(s.instances == 1);
+    CHECK(s.vertices == 3);
+    h.dev->resetFrameStats();
+    s = h.dev->stats();
+    CHECK(s.drawCalls == 0);
+}
+
+TEST_CASE("OpenGL backend: shader failure and success are counted") {
+    auto w = platform::Window::create({"shader diag", 64, 64, false});
+    REQUIRE(w.hasValue());
+    platform::Window* window = w.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    IDevice* dev = createOpenGLDevice();
+    REQUIRE(dev != nullptr);
+    dev->resetFrameStats();
+
+    // A valid vertex shader compiles.
+    ShaderDesc good;
+    good.stage = ShaderStage::Vertex;
+    const char* validSrc = R"glsl(#version 430 core
+layout(location = 0) in vec3 aPos;
+void main() { gl_Position = vec4(aPos, 1.0); }
+)glsl";
+    fillBlob(good.blob, validSrc);
+    auto h = dev->createShader(good);
+    REQUIRE(h.hasValue());
+    DeviceStats s = dev->stats();
+    CHECK(s.shaderCompiled == 1);
+    CHECK(s.shaderFailed == 0);
+    CHECK(s.shaderCount == 1);
+
+    // A broken shader fails and is counted, even after the good one.
+    ShaderDesc bad;
+    bad.stage = ShaderStage::Vertex;
+    const char* badSrc = R"glsl(#version 430 core
+void main() { this is not valid glsl; }
+)glsl";
+    fillBlob(bad.blob, badSrc);
+    auto b = dev->createShader(bad);
+    CHECK(b.hasError());
+    CHECK(b.error() == GfxError::BadDescriptor);
+    s = dev->stats();
+    CHECK(s.shaderCompiled == 1);
+    CHECK(s.shaderFailed == 1);
+
+    dev->waitIdle();
+    deleteDevice(dev);
+    delete window;
+}
+
+TEST_CASE("OpenGL backend: resource byte accounting via stats") {
+    auto w = platform::Window::create({"res diag", 64, 64, false});
+    REQUIRE(w.hasValue());
+    platform::Window* window = w.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    IDevice* dev = createOpenGLDevice();
+    REQUIRE(dev != nullptr);
+
+    BufferDesc bd;
+    bd.sizeBytes = 2048;
+    bd.usage = BufferUsage::Vertex;
+    auto buf = dev->createBuffer(bd, {});
+    REQUIRE(buf.hasValue());
+
+    TextureDesc td;
+    td.width = 32;
+    td.height = 32;
+    td.format = TextureFormat::RGBA8_UNORM;
+    auto tex = dev->createTexture(td);
+    REQUIRE(tex.hasValue());
+
+    DeviceStats s = dev->stats();
+    CHECK(s.bufferCount == 1);
+    CHECK(s.bufferBytes == 2048);
+    CHECK(s.textureCount == 1);
+    CHECK(s.textureBytes == 32u * 32u * 4u);
+
+    REQUIRE(dev->destroyBuffer(buf.value()) == GfxError::None);
+    s = dev->stats();
+    CHECK(s.bufferCount == 0);
+    CHECK(s.bufferBytes == 0);
+
+    dev->waitIdle();
+    deleteDevice(dev);
+    delete window;
+}
+
+TEST_CASE("OpenGL backend: writeTexture uploads with footprint validation") {
+    auto w = platform::Window::create({"tex upload", 64, 64, false});
+    REQUIRE(w.hasValue());
+    platform::Window* window = w.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    IDevice* dev = createOpenGLDevice();
+    REQUIRE(dev != nullptr);
+
+    TextureDesc td;
+    td.width = 4;
+    td.height = 4;
+    td.format = TextureFormat::RGBA8_UNORM; // mipLevels defaults to 1
+    auto tex = dev->createTexture(td);
+    REQUIRE(tex.hasValue());
+
+    // Correct 4x4 RGBA8 footprint uploads cleanly.
+    std::array<std::byte, 4u * 4u * 4u> full{};
+    CHECK(dev->writeTexture(tex.value(), 0, std::span(full)) == GfxError::None);
+
+    // Mismatched byte count is rejected.
+    std::array<std::byte, 16u> short_upload{};
+    CHECK(dev->writeTexture(tex.value(), 0, std::span(short_upload)) == GfxError::BadDescriptor);
+
+    // Out-of-range mip level is rejected.
+    std::array<std::byte, 4u * 4u * 4u> again{};
+    CHECK(dev->writeTexture(tex.value(), 1, std::span(again)) == GfxError::BadDescriptor);
+
+    // A stale texture handle is rejected.
+    TextureHandle stale = tex.value();
+    stale.generation = stale.generation + 1;
+    CHECK(dev->writeTexture(stale, 0, std::span(full)) == GfxError::StaleHandle);
+
+    dev->waitIdle();
+    deleteDevice(dev);
+    delete window;
+}
+
 #endif // F4_GRAPHICS_HAS_OPENGL

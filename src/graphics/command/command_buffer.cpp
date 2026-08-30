@@ -45,11 +45,12 @@ void CommandBuffer::bindIndexBuffer(BufferHandle buffer, IndexFormat format) {
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::bindResource(std::uint32_t slot, std::uint32_t handleIndex,
+void CommandBuffer::bindResource(std::uint32_t slot, BindingType type, std::uint32_t handleIndex,
                                  std::uint32_t handleGeneration) {
     F4_ASSERT(recording_, "bindResource while not recording");
     BoundResource res;
     res.slot = slot;
+    res.type = type;
     res.handleIndex = handleIndex;
     res.handleGeneration = handleGeneration;
 
@@ -68,6 +69,11 @@ void CommandBuffer::bindResource(std::uint32_t slot, std::uint32_t handleIndex,
     cmd.resourceCount = 1;
     cmd.resources[0] = res;
     pushCommand(std::move(cmd));
+}
+
+void CommandBuffer::bindResource(std::uint32_t slot, std::uint32_t handleIndex,
+                                 std::uint32_t handleGeneration) {
+    bindResource(slot, BindingType::UniformBuffer, handleIndex, handleGeneration);
 }
 
 void CommandBuffer::setViewport(Extent viewport) {

@@ -7,6 +7,7 @@
 
 #include "graphics/buffer/buffer_desc.h"
 #include "graphics/command/command_buffer.h"
+#include "graphics/device/device_stats.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
 #include "graphics/framebuffer/swapchain_desc.h"
 #include "graphics/gfx_error.h"
@@ -50,10 +51,25 @@ public:
     virtual auto writeBuffer(BufferHandle, std::uint64_t offset, std::span<const std::byte> data)
         -> GfxError = 0;
 
+    // Upload CPU texel data to an existing texture's mip level. The data size
+    // must exactly match the level's footprint (bounds-checked by the backend);
+    // this is how CPU bitmaps (e.g. a glyph atlas) reach the GPU.
+    virtual auto writeTexture(TextureHandle, std::uint32_t mipLevel,
+                              std::span<const std::byte> data) -> GfxError = 0;
+
     // Submit recorded commands for execution.
     virtual auto submit(CommandBuffer&) -> GfxError = 0;
 
     virtual auto waitIdle() -> void = 0;
+
+    // Diagnostics: snapshot of per-frame render counters plus live GPU resource
+    // accounting. Always current; the per-frame counters accumulate across
+    // submits and are cleared by resetFrameStats() (call once per frame).
+    [[nodiscard]] virtual auto stats() const -> DeviceStats = 0;
+
+    // Clears the per-frame render counters (draw/instance/primitive/vertex/
+    // batch). Resource accounting is unaffected.
+    virtual auto resetFrameStats() -> void = 0;
 };
 
 // Factory. The compiled-in backend (F4_GRAPHICS_BACKEND) decides the concrete

@@ -39,13 +39,18 @@ public:
 
     auto writeBuffer(BufferHandle, std::uint64_t offset, std::span<const std::byte> data)
         -> GfxError override;
+    auto writeTexture(TextureHandle, std::uint32_t mipLevel, std::span<const std::byte> data)
+        -> GfxError override;
     auto submit(CommandBuffer&) -> GfxError override;
     auto waitIdle() -> void override;
 
+    [[nodiscard]] auto stats() const -> DeviceStats override;
+    auto resetFrameStats() -> void override;
+
     // --- Test surface -------------------------------------------------------
     [[nodiscard]] auto lastSubmissionError() const -> GfxError { return lastError_; }
-    [[nodiscard]] auto drawCount() const -> std::uint64_t { return drawCount_; }
-    [[nodiscard]] auto drawIndexedCount() const -> std::uint64_t { return drawIndexedCount_; }
+    [[nodiscard]] auto drawCount() const -> std::uint64_t { return stats_.drawCalls; }
+    [[nodiscard]] auto drawIndexedCount() const -> std::uint64_t { return stats_.drawIndexedCalls; }
     [[nodiscard]] auto bufferBytes() const -> std::uint64_t { return bufferBytes_; }
     [[nodiscard]] auto liveBuffers() const -> std::size_t;
 
@@ -53,8 +58,7 @@ private:
     struct Impl;
     Impl* impl_;
     GfxError lastError_ = GfxError::None;
-    std::uint64_t drawCount_ = 0;
-    std::uint64_t drawIndexedCount_ = 0;
+    DeviceStats stats_;
     std::uint64_t bufferBytes_ = 0;
 };
 

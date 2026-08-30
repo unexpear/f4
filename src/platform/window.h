@@ -57,14 +57,22 @@ public:
     // Presents the back buffer (swap). No-op for hidden/offscreen windows.
     void swap();
 
+    // Live framebuffer (drawable) size in pixels — suitable for viewport /
+    // projection / framebuffer extent. Recomputed on every call so the window
+    // can be resized without rebuilding this object (DPI / OS-reported size).
     [[nodiscard]] auto width() const -> std::uint32_t;
     [[nodiscard]] auto height() const -> std::uint32_t;
+    // Live window (logical) size — pixel coordinates delivered by input events
+    // (SDL mouse events) are in this space, which may differ from the drawable
+    // size on HiDPI displays.
+    [[nodiscard]] auto logicalWidth() const -> std::uint32_t;
+    [[nodiscard]] auto logicalHeight() const -> std::uint32_t;
     [[nodiscard]] auto glContext() const -> void*;
 
 private:
     void* window_ = nullptr;   // SDL_Window*
     void* glContext_ = nullptr; // SDL_GLContext
-    std::uint32_t width_ = 0;
+    std::uint32_t width_ = 0;  // cached drawable size (per GL context)
     std::uint32_t height_ = 0;
 };
 

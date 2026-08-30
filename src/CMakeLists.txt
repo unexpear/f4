@@ -92,6 +92,9 @@ add_library(f4_core STATIC
     core/memory/memory.cpp
     core/memory/serialization.cpp
     core/noise/noise.cpp
+    core/diagnostics/metric_registry.cpp
+    core/diagnostics/cpu_profiler.cpp
+    core/diagnostics/diagnostics.cpp
     core/resources/mesh.cpp
     core/resources/file_io.cpp
     core/resources/bmp_loader.cpp
@@ -133,6 +136,8 @@ add_library(f4_graphics STATIC
     graphics/device/device.cpp
     graphics/command/command_buffer.cpp
     graphics/handle.cpp
+    graphics/hud/hud_font.cpp
+    graphics/hud/hud_overlay.cpp
     backends/null/null_device.cpp
 )
 
@@ -152,7 +157,10 @@ f4_enable_sanitizers(f4_graphics)
 find_package(SDL2 CONFIG QUIET)
 
 set(F4_GRAPHICS_HAS_OPENGL OFF)
-if(TARGET SDL2::SDL2)
+# The SDL2 config installed by MSYS2 describes MinGW libraries and headers; it
+# may still be discoverable from an MSVC configure, but it is not ABI/toolchain
+# compatible with cl.exe. Keep MSVC on the documented headless path.
+if(TARGET SDL2::SDL2 AND NOT MSVC)
     set(F4_GRAPHICS_HAS_OPENGL ON)
     add_library(f4_platform STATIC
         platform/window.cpp
@@ -175,5 +183,8 @@ if(TARGET SDL2::SDL2)
     f4_set_warnings(f4_app)
     f4_set_float_precision(f4_app)
     f4_enable_sanitizers(f4_app)
+
+    # Focused one-capability demos.
+    add_subdirectory(demos)
 endif()
 set(F4_GRAPHICS_HAS_OPENGL ${F4_GRAPHICS_HAS_OPENGL} PARENT_SCOPE)

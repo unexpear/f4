@@ -22,6 +22,7 @@ add_executable(f4_tests
     core/test_string.cpp
     core/test_hashmap.cpp
     core/test_serialization.cpp
+    core/test_diagnostics.cpp
     core/test_ecs.cpp
     core/test_ecs_transform.cpp
     core/test_noise.cpp

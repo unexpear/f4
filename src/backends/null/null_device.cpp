@@ -19,6 +19,18 @@ struct NullDevice::Impl {
     ObjectStore<GpuFramebuffer, GpuFramebufferTag> framebuffers;
 };
 
+// Primitives produced by `count` indices/vertices for the given topology.
+[[nodiscard]] auto countPrimitives(PrimitiveTopology topology, std::uint64_t count)
+    -> std::uint64_t {
+    switch (topology) {
+    case PrimitiveTopology::PointList: return count;
+    case PrimitiveTopology::LineList: return count / 2;
+    case PrimitiveTopology::TriangleList: return count / 3;
+    case PrimitiveTopology::TriangleStrip: return count > 2 ? count - 2 : 0;
+    }
+    return 0;
+}
+
 NullDevice::NullDevice() : impl_(new Impl()) {
     F4_ASSERT(impl_ != nullptr, "NullDevice impl allocation failed");
 }
@@ -73,6 +85,7 @@ auto NullDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, Gf
     GpuShader record;
     record.stage = desc.stage;
     lastError_ = GfxError::None;
+    ++stats_.shaderCompiled;
     return impl_->shaders.create(record);
 }
 
@@ -182,14 +195,39 @@ auto NullDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
     return GfxError::None;
 }
 
+auto NullDevice::writeTexture(TextureHandle h, std::uint32_t mipLevel,
+                              std::span<const std::byte> data) -> GfxError {
+    GpuTexture* tex = impl_->textures.get(h);
+    if (tex == nullptr) {
+        return GfxError::StaleHandle;
+    }
+    if (mipLevel >= tex->mipLevels) {
+        return GfxError::BadDescriptor;
+    }
+    std::uint32_t w = tex->width >> mipLevel;
+    std::uint32_t hh = tex->height >> mipLevel;
+    if (w == 0) {
+        w = 1;
+    }
+    if (hh == 0) {
+        hh = 1;
+    }
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(hh) *
+        textureFormatBytes(tex->format);
+    if (data.size() != expected) {
+        return GfxError::BadDescriptor; // footprint mismatch
+    }
+    return GfxError::None;
+}
+
 auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
-    drawCount_ = 0;
-    drawIndexedCount_ = 0;
     GfxError err = GfxError::None;
 
     bool renderPassActive = false;
     bool pipelineBound = false;
     bool indexBound = false;
+    PrimitiveTopology topology = PrimitiveTopology::TriangleList;
 
     for (const Command& cmd : cb.commands()) {
         switch (cmd.kind) {
@@ -208,6 +246,10 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
                 err = GfxError::InvalidHandle;
             } else {
                 pipelineBound = true;
+                GpuPipeline* p = impl_->pipelines.get(cmd.pipeline);
+                if (p != nullptr) {
+                    topology = p->desc.topology;
+                }
             }
             break;
         case CommandKind::BindVertexBuffer:
@@ -224,22 +266,52 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         case CommandKind::BindResources:
             for (std::uint8_t ri = 0; ri < cmd.resourceCount; ++ri) {
-                (void)cmd.resources[ri]; // validated at submit boundary
+                const BoundResource& res = cmd.resources[ri];
+                if (res.type == BindingType::Texture) {
+                    TextureHandle th;
+                    th.index = res.handleIndex;
+                    th.generation = res.handleGeneration;
+                    if (!impl_->textures.contains(th)) {
+                        err = GfxError::InvalidHandle;
+                    }
+                } else if (res.type == BindingType::Sampler) {
+                    SamplerHandle sh;
+                    sh.index = res.handleIndex;
+                    sh.generation = res.handleGeneration;
+                    if (!impl_->samplers.contains(sh)) {
+                        err = GfxError::InvalidHandle;
+                    }
+                } else {
+                    BufferHandle bh;
+                    bh.index = res.handleIndex;
+                    bh.generation = res.handleGeneration;
+                    if (!impl_->buffers.contains(bh)) {
+                        err = GfxError::InvalidHandle;
+                    }
+                }
+                if (err != GfxError::None) {
+                    break;
+                }
             }
             break;
         case CommandKind::SetViewport:
         case CommandKind::SetScissor:
             break;
-        case CommandKind::Draw:
+        case CommandKind::Draw: {
             if (!renderPassActive) {
                 err = GfxError::BadDescriptor; // draw outside a render pass
             } else if (!pipelineBound) {
                 err = GfxError::BadDescriptor; // no pipeline bound
             } else {
-                ++drawCount_;
+                ++stats_.drawCalls;
+                ++stats_.batches;
+                stats_.instances += cmd.instanceCount;
+                stats_.vertices += static_cast<std::uint64_t>(cmd.vertexCount) * cmd.instanceCount;
+                stats_.primitives += countPrimitives(topology, cmd.vertexCount) * cmd.instanceCount;
             }
             break;
-        case CommandKind::DrawIndexed:
+        }
+        case CommandKind::DrawIndexed: {
             if (!renderPassActive) {
                 err = GfxError::BadDescriptor;
             } else if (!pipelineBound) {
@@ -247,9 +319,14 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
             } else if (!indexBound) {
                 err = GfxError::BadDescriptor;
             } else {
-                ++drawIndexedCount_;
+                ++stats_.drawIndexedCalls;
+                ++stats_.batches;
+                stats_.instances += cmd.instanceCount;
+                stats_.vertices += static_cast<std::uint64_t>(cmd.indexCount) * cmd.instanceCount;
+                stats_.primitives += countPrimitives(topology, cmd.indexCount) * cmd.instanceCount;
             }
             break;
+        }
         }
         if (err != GfxError::None) {
             break;
@@ -259,6 +336,24 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
     lastError_ = err;
     return err;
 }
+
+auto NullDevice::stats() const -> DeviceStats {
+    DeviceStats s = stats_;
+    s.bufferCount = impl_->buffers.liveCount();
+    s.bufferBytes = 0;
+    impl_->buffers.forEach([&](const GpuBuffer* b) { s.bufferBytes += b->sizeBytes; });
+    s.textureCount = impl_->textures.liveCount();
+    s.textureBytes = 0;
+    impl_->textures.forEach([&](const GpuTexture* t) { s.textureBytes += textureBytes(*t); });
+    s.samplerCount = impl_->samplers.liveCount();
+    s.shaderCount = impl_->shaders.liveCount();
+    s.pipelineCount = impl_->pipelines.liveCount();
+    s.framebufferCount = impl_->framebuffers.liveCount();
+    s.swapchainCount = impl_->swapchains.liveCount();
+    return s;
+}
+
+auto NullDevice::resetFrameStats() -> void { stats_ = DeviceStats{}; }
 
 auto NullDevice::waitIdle() -> void {
     // Nothing to wait on — the null device is synchronous.

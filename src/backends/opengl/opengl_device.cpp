@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/assert.h"
+#include "core/logging/logger.h"
 #include "graphics/device/object_store.h"
 
 namespace f4::gfx {
@@ -80,6 +81,67 @@ struct GlFramebuffer {
     return format == IndexFormat::U16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
 }
 
+// External pixel format (the base/format and type pair used for uploads and
+// readbacks). Every TextureFormat must map to a legal (format, type) for
+// glTexSubImage2D/glReadPixels.
+[[nodiscard]] auto glPixelFormat(TextureFormat format) -> GLenum {
+    switch (format) {
+    case TextureFormat::RGBA8_UNORM:
+    case TextureFormat::BGRA8_UNORM:
+    case TextureFormat::RGBA16_FLOAT:
+    case TextureFormat::RGBA32_FLOAT: return GL_RGBA;
+    case TextureFormat::R8_UNORM:
+    case TextureFormat::R16_FLOAT: return GL_RED;
+    case TextureFormat::RG8_UNORM:
+    case TextureFormat::RG16_FLOAT: return GL_RG;
+    case TextureFormat::Depth32F: return GL_DEPTH_COMPONENT;
+    case TextureFormat::Depth24Stencil8: return GL_DEPTH_STENCIL;
+    }
+    return GL_RGBA;
+}
+
+[[nodiscard]] auto glPixelType(TextureFormat format) -> GLenum {
+    switch (format) {
+    case TextureFormat::R16_FLOAT:
+    case TextureFormat::RG16_FLOAT:
+    case TextureFormat::RGBA16_FLOAT: return GL_HALF_FLOAT;
+    case TextureFormat::RGBA32_FLOAT:
+    case TextureFormat::Depth32F: return GL_FLOAT;
+    default: return GL_UNSIGNED_BYTE;
+    }
+}
+
+[[nodiscard]] auto glBlendFactor(BlendFactor factor) -> GLenum {
+    switch (factor) {
+    case BlendFactor::Zero: return GL_ZERO;
+    case BlendFactor::One: return GL_ONE;
+    case BlendFactor::SrcAlpha: return GL_SRC_ALPHA;
+    case BlendFactor::OneMinusSrcAlpha: return GL_ONE_MINUS_SRC_ALPHA;
+    case BlendFactor::SrcColor: return GL_SRC_COLOR;
+    case BlendFactor::OneMinusSrcColor: return GL_ONE_MINUS_SRC_COLOR;
+    }
+    return GL_ONE;
+}
+
+// Bytes one mip level of the given format occupies at `width` x `height`.
+[[nodiscard]] auto glMipBytes(const GpuTexture& t, std::uint32_t width, std::uint32_t height)
+    -> std::uint64_t {
+    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * height;
+    switch (t.format) {
+    case TextureFormat::R8_UNORM: return 1ull * pixels;
+    case TextureFormat::RG8_UNORM:
+    case TextureFormat::R16_FLOAT: return 2ull * pixels;
+    case TextureFormat::RGBA8_UNORM:
+    case TextureFormat::BGRA8_UNORM:
+    case TextureFormat::RG16_FLOAT:
+    case TextureFormat::Depth32F: return 4ull * pixels;
+    case TextureFormat::RGBA16_FLOAT: return 8ull * pixels;
+    case TextureFormat::RGBA32_FLOAT: return 16ull * pixels;
+    case TextureFormat::Depth24Stencil8: return 4ull * pixels;
+    }
+    return 0;
+}
+
 [[nodiscard]] auto glCompare(CompareOp op) -> GLenum {
     switch (op) {
     case CompareOp::Never: return GL_NEVER;
@@ -127,8 +189,21 @@ struct GlFramebuffer {
     return format == VertexFormat::UNorm8x4 ? GL_TRUE : GL_FALSE;
 }
 
-// Compile one shader stage; returns the GL shader object id (0 on failure) and
-// fills out + msg with the info log.
+// Primitives produced by `count` indices/vertices for the given topology.
+[[nodiscard]] auto countPrimitives(PrimitiveTopology topology, std::uint64_t count)
+    -> std::uint64_t {
+    switch (topology) {
+    case PrimitiveTopology::PointList: return count;
+    case PrimitiveTopology::LineList: return count / 2;
+    case PrimitiveTopology::TriangleList: return count / 3;
+    case PrimitiveTopology::TriangleStrip: return count > 2 ? count - 2 : 0;
+    }
+    return 0;
+}
+
+// Compile one shader stage; returns the GL shader object id (0 on failure).
+// `log` is always filled with the driver's info log (errors on failure,
+// warnings on success) so callers can surface diagnostics through stats/logging.
 [[nodiscard]] auto compileShader(GLenum type, const std::string& source, std::string& log) -> GLuint {
     const GLuint shader = glCreateShader(type);
     const char* src = source.c_str();
@@ -137,13 +212,19 @@ struct GlFramebuffer {
 
     GLint ok = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (ok != GL_TRUE) {
-        GLint length = 0;
-        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
-        if (length > 0) {
-            log.resize(static_cast<std::size_t>(length));
-            glGetShaderInfoLog(shader, length, nullptr, log.data());
+
+    GLint length = 0;
+    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
+    if (length > 0) {
+        log.resize(static_cast<std::size_t>(length));
+        glGetShaderInfoLog(shader, length, nullptr, log.data());
+        // Trim trailing NUL(s) GL may append.
+        while (!log.empty() && log.back() == '\0') {
+            log.pop_back();
         }
+    }
+
+    if (ok != GL_TRUE) {
         glDeleteShader(shader);
         return 0;
     }
@@ -178,9 +259,13 @@ struct OpenGLDevice::Impl {
 
     GfxError lastSubmitError_ = GfxError::None;
 
+    // Per-frame render diagnostics, accumulated across submits.
+    DeviceStats stats_;
+
     // Per-submit state machine (mirrors NullDevice validation, real GL).
     bool renderPassActive_ = false;
     GlPipeline* boundPipeline_ = nullptr;
+    PrimitiveTopology boundTopology_ = PrimitiveTopology::TriangleList;
     GLuint boundIndexBuffer_ = 0;
     IndexFormat boundIndexFormat_ = IndexFormat::U16;
     GlFramebuffer* boundFramebuffer_ = nullptr;
@@ -190,8 +275,11 @@ struct OpenGLDevice::Impl {
     GlPipeline* lastPipeline_ = nullptr;
     bool glDepthTest_ = false;
     bool glCullFace_ = false;
+    bool glBlend_ = false;
     GLenum glDepthFunc_ = GL_LESS;
     GLboolean glDepthMask_ = GL_TRUE;
+    GLenum glBlendSrc_ = GL_ONE;
+    GLenum glBlendDst_ = GL_ZERO;
     GLuint glProgram_ = 0;
     GLuint glVao_ = 0;
 };
@@ -287,11 +375,19 @@ auto OpenGLDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, 
         return GfxError::BadDescriptor;
     }
     const GLenum type = desc.stage == ShaderStage::Vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
+    const char* stageName = desc.stage == ShaderStage::Vertex ? "vertex" : "fragment";
     std::string source(reinterpret_cast<const char*>(desc.blob.data()), desc.blob.size());
     std::string log;
     const GLuint shader = compileShader(type, source, log);
     if (shader == 0) {
+        ++impl_->stats_.shaderFailed;
+        F4_LOG_ERROR() << "GL " << stageName << " shader failed to compile:\n" << log;
         return GfxError::BadDescriptor;
+    }
+    ++impl_->stats_.shaderCompiled;
+    if (!log.empty()) {
+        ++impl_->stats_.shaderWarnings;
+        F4_LOG_WARNING() << "GL " << stageName << " shader compiled with warnings:\n" << log;
     }
     GlShader s;
     s.rec.stage = desc.stage;
@@ -329,7 +425,7 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
     glBindVertexArray(vao);
     for (const auto& binding : desc.vertexInput.bindings) {
         glBindVertexBuffer(binding.binding, 0, 0, static_cast<GLsizei>(binding.strideBytes));
-        glVertexBindingDivisor(binding.binding, 0);
+        glVertexBindingDivisor(binding.binding, static_cast<GLuint>(binding.divisor));
     }
     for (const auto& attribute : desc.vertexInput.attributes) {
         const GLboolean normalized = glVertexFormatNormalized(attribute.format);
@@ -514,6 +610,35 @@ auto OpenGLDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
     return GfxError::None;
 }
 
+auto OpenGLDevice::writeTexture(TextureHandle h, std::uint32_t mipLevel,
+                                std::span<const std::byte> data) -> GfxError {
+    GlTexture* t = impl_->textures.get(h);
+    if (t == nullptr) {
+        return GfxError::StaleHandle;
+    }
+    if (mipLevel >= t->rec.mipLevels) {
+        return GfxError::BadDescriptor;
+    }
+    std::uint32_t w = t->rec.width >> mipLevel;
+    std::uint32_t hh = t->rec.height >> mipLevel;
+    if (w == 0) {
+        w = 1;
+    }
+    if (hh == 0) {
+        hh = 1;
+    }
+    const std::uint64_t expected = glMipBytes(t->rec, w, hh);
+    if (data.size() != expected) {
+        return GfxError::BadDescriptor;
+    }
+    glBindTexture(GL_TEXTURE_2D, t->id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(mipLevel), 0, 0, static_cast<GLsizei>(w),
+                    static_cast<GLsizei>(hh), glPixelFormat(t->rec.format),
+                    glPixelType(t->rec.format), data.data());
+    return GfxError::None;
+}
+
 auto OpenGLDevice::createBufferUpload(const BufferDesc& desc, std::span<const std::byte> data)
     -> Result<BufferHandle, GfxError> {
     return createBuffer(desc, data);
@@ -529,6 +654,7 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
     impl_->lastPipeline_ = nullptr;
     impl_->glDepthTest_ = false;
     impl_->glCullFace_ = false;
+    impl_->glBlend_ = false;
     impl_->glDepthFunc_ = GL_LESS;
     impl_->glDepthMask_ = GL_TRUE;
     impl_->glProgram_ = 0;
@@ -631,9 +757,34 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                     glDepthMask(wantMask);
                     impl_->glDepthMask_ = wantMask;
                 }
+                // Blending (first color attachment only — enough for a fixed
+                // overlay; M8 material work can generalize this).
+                const ColorAttachmentState* blend = nullptr;
+                if (!p->rec.desc.colorAttachments.isEmpty()) {
+                    blend = &p->rec.desc.colorAttachments[0];
+                }
+                const bool wantBlend = blend != nullptr && blend->blendEnable;
+                if (wantBlend != impl_->glBlend_) {
+                    if (wantBlend) {
+                        glEnable(GL_BLEND);
+                    } else {
+                        glDisable(GL_BLEND);
+                    }
+                    impl_->glBlend_ = wantBlend;
+                }
+                if (wantBlend && blend != nullptr) {
+                    const GLenum src = glBlendFactor(blend->srcColor);
+                    const GLenum dst = glBlendFactor(blend->dstColor);
+                    if (src != impl_->glBlendSrc_ || dst != impl_->glBlendDst_) {
+                        glBlendFuncSeparate(src, dst, src, dst);
+                        impl_->glBlendSrc_ = src;
+                        impl_->glBlendDst_ = dst;
+                    }
+                }
                 impl_->lastPipeline_ = p;
             }
             impl_->boundPipeline_ = p;
+            impl_->boundTopology_ = p->rec.desc.topology;
             break;
         }
         case CommandKind::BindVertexBuffer: {
@@ -678,8 +829,21 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 impl_->lastSubmitError_ = GfxError::BadDescriptor;
                 return GfxError::BadDescriptor;
             }
-            glDrawArrays(impl_->boundPipeline_->mode, 0,
-                         static_cast<GLsizei>(command.vertexCount));
+            if (command.instanceCount > 1) {
+                glDrawArraysInstanced(impl_->boundPipeline_->mode, 0,
+                                      static_cast<GLsizei>(command.vertexCount),
+                                      static_cast<GLsizei>(command.instanceCount));
+            } else {
+                glDrawArrays(impl_->boundPipeline_->mode, 0,
+                             static_cast<GLsizei>(command.vertexCount));
+            }
+            ++impl_->stats_.drawCalls;
+            ++impl_->stats_.batches;
+            impl_->stats_.instances += command.instanceCount;
+            impl_->stats_.vertices +=
+                static_cast<std::uint64_t>(command.vertexCount) * command.instanceCount;
+            impl_->stats_.primitives +=
+                countPrimitives(impl_->boundTopology_, command.vertexCount) * command.instanceCount;
             break;
         }
         case CommandKind::DrawIndexed: {
@@ -691,27 +855,74 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 impl_->lastSubmitError_ = GfxError::BadDescriptor;
                 return GfxError::BadDescriptor;
             }
-            glDrawElements(impl_->boundPipeline_->mode, static_cast<GLsizei>(command.indexCount),
-                           glIndexType(impl_->boundIndexFormat_),
-                           reinterpret_cast<void*>(static_cast<std::uintptr_t>(
-                               command.firstIndex * indexFormatSize(impl_->boundIndexFormat_))));
+            const void* indexPtr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+                command.firstIndex * indexFormatSize(impl_->boundIndexFormat_)));
+            if (command.instanceCount > 1) {
+                glDrawElementsInstanced(impl_->boundPipeline_->mode,
+                                        static_cast<GLsizei>(command.indexCount),
+                                        glIndexType(impl_->boundIndexFormat_), indexPtr,
+                                        static_cast<GLsizei>(command.instanceCount));
+            } else {
+                glDrawElements(impl_->boundPipeline_->mode,
+                               static_cast<GLsizei>(command.indexCount),
+                               glIndexType(impl_->boundIndexFormat_), indexPtr);
+            }
+            ++impl_->stats_.drawIndexedCalls;
+            ++impl_->stats_.batches;
+            impl_->stats_.instances += command.instanceCount;
+            impl_->stats_.vertices +=
+                static_cast<std::uint64_t>(command.indexCount) * command.instanceCount;
+            impl_->stats_.primitives +=
+                countPrimitives(impl_->boundTopology_, command.indexCount) * command.instanceCount;
             break;
         }
         case CommandKind::BindResources: {
             for (std::uint8_t ri = 0; ri < command.resourceCount; ++ri) {
                 const BoundResource& res = command.resources[ri];
-                BufferHandle bh;
-                bh.index = res.handleIndex;
-                bh.generation = res.handleGeneration;
-                GlBuffer* b = impl_->buffers.get(bh);
-                if (b == nullptr) {
-                    impl_->lastSubmitError_ = GfxError::InvalidHandle;
-                    return GfxError::InvalidHandle;
-                }
-                if (hasUsage(b->rec.usage, BufferUsage::Uniform)) {
-                    glBindBufferBase(GL_UNIFORM_BUFFER, res.slot, b->id);
-                } else if (hasUsage(b->rec.usage, BufferUsage::Storage)) {
-                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, res.slot, b->id);
+                if (res.type == BindingType::Texture) {
+                    TextureHandle th;
+                    th.index = res.handleIndex;
+                    th.generation = res.handleGeneration;
+                    GlTexture* t = impl_->textures.get(th);
+                    if (t == nullptr) {
+                        impl_->lastSubmitError_ = GfxError::InvalidHandle;
+                        return GfxError::InvalidHandle;
+                    }
+                    // Convention: a texture at slot N lives on texture unit N.
+                    const GLenum unit = GL_TEXTURE0 + res.slot;
+                    glActiveTexture(unit);
+                    glBindTexture(GL_TEXTURE_2D, t->id);
+                    // Point the fragment sampler uniform at this unit. Sampler
+                    // names follow the convention uTex (slot 0) / uTex<N>.
+                    std::string uniformName = res.slot == 0 ? "uTex" : "uTex" + std::to_string(res.slot);
+                    const GLint loc = glGetUniformLocation(impl_->glProgram_, uniformName.c_str());
+                    if (loc >= 0) {
+                        glUniform1i(loc, static_cast<GLint>(res.slot));
+                    }
+                } else if (res.type == BindingType::Sampler) {
+                    SamplerHandle sh;
+                    sh.index = res.handleIndex;
+                    sh.generation = res.handleGeneration;
+                    GlSampler* s = impl_->samplers.get(sh);
+                    if (s == nullptr) {
+                        impl_->lastSubmitError_ = GfxError::InvalidHandle;
+                        return GfxError::InvalidHandle;
+                    }
+                    glBindSampler(res.slot, s->id);
+                } else {
+                    BufferHandle bh;
+                    bh.index = res.handleIndex;
+                    bh.generation = res.handleGeneration;
+                    GlBuffer* b = impl_->buffers.get(bh);
+                    if (b == nullptr) {
+                        impl_->lastSubmitError_ = GfxError::InvalidHandle;
+                        return GfxError::InvalidHandle;
+                    }
+                    if (hasUsage(b->rec.usage, BufferUsage::Uniform)) {
+                        glBindBufferBase(GL_UNIFORM_BUFFER, res.slot, b->id);
+                    } else if (hasUsage(b->rec.usage, BufferUsage::Storage)) {
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, res.slot, b->id);
+                    }
                 }
             }
             break;
@@ -722,6 +933,24 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
 }
 
 auto OpenGLDevice::waitIdle() -> void { glFinish(); }
+
+auto OpenGLDevice::stats() const -> DeviceStats {
+    DeviceStats s = impl_->stats_;
+    s.bufferCount = impl_->buffers.liveCount();
+    s.bufferBytes = 0;
+    impl_->buffers.forEach([&](GlBuffer* b) { s.bufferBytes += b->rec.sizeBytes; });
+    s.textureCount = impl_->textures.liveCount();
+    s.textureBytes = 0;
+    impl_->textures.forEach([&](GlTexture* t) { s.textureBytes += textureBytes(t->rec); });
+    s.samplerCount = impl_->samplers.liveCount();
+    s.shaderCount = impl_->shaders.liveCount();
+    s.pipelineCount = impl_->pipelines.liveCount();
+    s.framebufferCount = impl_->framebuffers.liveCount();
+    s.swapchainCount = impl_->swapchains.liveCount();
+    return s;
+}
+
+auto OpenGLDevice::resetFrameStats() -> void { impl_->stats_ = DeviceStats{}; }
 
 auto createOpenGLDevice() -> IDevice* { return new OpenGLDevice(); }
 

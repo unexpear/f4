@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <array>
+#include <span>
 #include <vector>
 
 #include "graphics/command/command_buffer.h"
@@ -551,5 +553,196 @@ TEST_CASE("CommandBuffer: pipeline+resources+draw full sequence") {
     cb.end();
     // beginRB, bindPipeline, bindVB, bindIB, bindResource(2 coalesced), drawIndexed, endRB = 7
     CHECK(cb.commandCount() == 7);
+    CHECK(cb.commands()[5].kind == CommandKind::DrawIndexed);
+    CHECK(cb.commands()[5].instanceCount == 2);
     CHECK(d->submit(cb) == GfxError::None);
+}
+
+TEST_CASE("Stats: per-frame draw/instance/primitive/batch counters") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    d->resetFrameStats();
+
+    ShaderDesc vdesc;
+    vdesc.stage = ShaderStage::Vertex;
+    auto vs = d->createShader(vdesc);
+    REQUIRE(vs.hasValue());
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
+    REQUIRE(pipe.hasValue());
+    BufferHandle vb = makeBuffer(d, 12, BufferUsage::Vertex);
+    BufferHandle ib = makeBuffer(d, 24, BufferUsage::Index);
+    FramebufferDesc fd;
+    fd.extent = {128, 72};
+    auto fb = d->createFramebuffer(fd);
+    REQUIRE(fb.hasValue());
+
+    auto submitFrame = [&]() {
+        CommandBuffer cb;
+        cb.begin();
+        cb.beginRenderPass(fb.value());
+        cb.bindPipeline(pipe.value());
+        cb.bindVertexBuffer(0, vb, 12);
+        cb.bindIndexBuffer(ib, IndexFormat::U16);
+        // One indexed draw (6 idx, 2 instances) + one non-indexed draw (3 verts,
+        // 1 instance).
+        cb.drawIndexed(6, 2);
+        cb.draw(3, 1);
+        cb.endRenderPass();
+        cb.end();
+        CHECK(d->submit(cb) == GfxError::None);
+    };
+
+    submitFrame();
+    DeviceStats s = d->stats();
+    CHECK(s.drawCalls == 1);
+    CHECK(s.drawIndexedCalls == 1);
+    CHECK(s.batches == 2);
+    CHECK(s.instances == 3);        // 2 + 1
+    CHECK(s.primitives == 2u * 2u + 1u * 1u); // (6/3*2) + (3/3*1) = 4 + 1
+    CHECK(s.vertices == 6u * 2u + 3u * 1u);
+
+    // A second frame accumulates on top.
+    submitFrame();
+    s = d->stats();
+    CHECK(s.batches == 4);
+    CHECK(s.instances == 6);
+    CHECK(s.drawCalls == 2);
+
+    // resetFrameStats clears the per-frame counters but not resource counts.
+    d->resetFrameStats();
+    s = d->stats();
+    CHECK(s.batches == 0);
+    CHECK(s.instances == 0);
+    CHECK(s.bufferCount == 2); // vb + ib
+    CHECK(s.textureCount == 0);
+}
+
+TEST_CASE("Stats: resource byte/count accounting") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    d->resetFrameStats();
+
+    BufferHandle big = makeBuffer(d, 4096, BufferUsage::Vertex);
+    BufferHandle small = makeBuffer(d, 128, BufferUsage::Uniform);
+
+    TextureDesc td;
+    td.width = 16;
+    td.height = 16;
+    td.format = TextureFormat::RGBA8_UNORM;
+    auto tex = d->createTexture(td);
+    REQUIRE(tex.hasValue());
+
+    DeviceStats s = d->stats();
+    CHECK(s.bufferCount == 2);
+    CHECK(s.bufferBytes == 4096 + 128);
+    CHECK(s.textureCount == 1);
+    CHECK(s.textureBytes == 16u * 16u * 4u); // RGBA8
+
+    // Destroying a buffer reduces both count and bytes.
+    REQUIRE(d->destroyBuffer(big) == GfxError::None);
+    s = d->stats();
+    CHECK(s.bufferCount == 1);
+    CHECK(s.bufferBytes == 128);
+
+    // Destroying the remaining buffer drops accounting to zero.
+    REQUIRE(d->destroyBuffer(small) == GfxError::None);
+    s = d->stats();
+    CHECK(s.bufferCount == 0);
+    CHECK(s.bufferBytes == 0);
+
+    REQUIRE(d->destroyTexture(tex.value()) == GfxError::None);
+    s = d->stats();
+    CHECK(s.textureCount == 0);
+    CHECK(s.textureBytes == 0);
+}
+
+TEST_CASE("Stats: shaderCompiled tracks successful compiles") {
+    TestDevice t;
+    IDevice* d = t.dev;
+    d->resetFrameStats();
+    ShaderDesc vs;
+    vs.stage = ShaderStage::Vertex;
+    auto h = d->createShader(vs);
+    REQUIRE(h.hasValue());
+    CHECK(d->stats().shaderCompiled == 1);
+    CHECK(d->stats().shaderCount == 1);
+}
+
+TEST_CASE("Texture: writeTexture validates footprint, mip level, and liveness") {
+    TestDevice t;
+    IDevice* d = t.dev;
+
+    TextureDesc td;
+    td.width = 16;
+    td.height = 16;
+    td.format = TextureFormat::RGBA8_UNORM; // mipLevels defaults to 1
+    auto tex = d->createTexture(td);
+    REQUIRE(tex.hasValue());
+
+    // Correct full-mip footprint succeeds.
+    std::array<std::byte, 16u * 16u * 4u> full{};
+    CHECK(d->writeTexture(tex.value(), 0, std::span(full)) == GfxError::None);
+
+    // A single mip with mismatched size is rejected.
+    std::array<std::byte, 7> tiny{};
+    CHECK(d->writeTexture(tex.value(), 0, std::span(tiny)) == GfxError::BadDescriptor);
+
+    // Out-of-range mip is rejected.
+    std::array<std::byte, 16u * 16u * 4u> again{};
+    CHECK(d->writeTexture(tex.value(), 1, std::span(again)) == GfxError::BadDescriptor);
+
+    // Stale handle is rejected.
+    TextureHandle stale = tex.value();
+    stale.index = stale.index + 1;
+    CHECK(d->writeTexture(stale, 0, std::span(full)) == GfxError::StaleHandle);
+}
+
+TEST_CASE("Resources: typed bindResource validates texture/sampler handles") {
+    TestDevice t;
+    IDevice* d = t.dev;
+
+    TextureDesc td;
+    td.width = 8;
+    td.height = 8;
+    td.format = TextureFormat::RGBA8_UNORM;
+    auto tex = d->createTexture(td);
+    REQUIRE(tex.hasValue());
+    auto samp = d->createSampler(SamplerDesc{});
+    REQUIRE(samp.hasValue());
+
+    // Texture + sampler bound at slots 0/1 with no draw succeeds.
+    {
+        CommandBuffer cb;
+        cb.begin();
+        cb.bindResource(0, BindingType::Texture, tex.value().index, tex.value().generation);
+        cb.bindResource(1, BindingType::Sampler, samp.value().index, samp.value().generation);
+        cb.end();
+        CHECK(d->submit(cb) == GfxError::None);
+    }
+
+    // A texture slot pointing at a bogus handle fails validation.
+    {
+        CommandBuffer cb;
+        cb.begin();
+        TextureHandle bogus = tex.value();
+        bogus.index = bogus.index + 1;
+        cb.bindResource(0, BindingType::Texture, bogus.index, bogus.generation);
+        cb.end();
+        CHECK(d->submit(cb) == GfxError::InvalidHandle);
+    }
+
+    // A sampler slot pointing at a bogus handle fails validation.
+    {
+        CommandBuffer cb;
+        cb.begin();
+        SamplerHandle bogus = samp.value();
+        bogus.generation = bogus.generation + 1;
+        cb.bindResource(0, BindingType::Sampler, bogus.index, bogus.generation);
+        cb.end();
+        CHECK(d->submit(cb) == GfxError::InvalidHandle);
+    }
 }

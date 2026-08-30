@@ -177,4 +177,52 @@ struct Texture {
     Array<TextureMip> mips; // mip 0 first, strictly halving dimensions
 };
 
+// CPU-side backing-store bytes held by a texture across all mip levels.
+[[nodiscard]] inline auto textureBytes(const Texture& tex) -> std::uint64_t {
+    std::uint64_t total = 0;
+    for (const TextureMip& m : tex.mips) {
+        total += static_cast<std::uint64_t>(m.bytes.size());
+    }
+    return total;
+}
+
+// Byte size of a single vector of texture data at the given dimensions/format
+// (useful for reporting in-flight / per-mip estimates before storage exists).
+// Block-compressed formats use their native 4x4 blocks (ASTC uses the format's
+// own block size). The result is a lower bound; a real slice may be padded.
+[[nodiscard]] constexpr auto textureSliceBytes(std::uint32_t width, std::uint32_t height,
+                                               TextureFormat format) -> std::uint64_t {
+    if (!isBlockCompressed(format)) {
+        const std::uint64_t pixels =
+            static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+        switch (format) {
+        case TextureFormat::R8_UNORM:    return pixels * 1;
+        case TextureFormat::RG8_UNORM:   return pixels * 2;
+        case TextureFormat::RGBA8_UNORM:
+        case TextureFormat::BGRA8_UNORM: return pixels * 4;
+        case TextureFormat::R16_FLOAT:   return pixels * 2;
+        case TextureFormat::RGBA16_FLOAT:return pixels * 8;
+        case TextureFormat::RGBA32_FLOAT:return pixels * 16;
+        default:                         return 0;
+        }
+    }
+
+    std::uint64_t blockW = 4; // BC block texel size
+    std::uint64_t blockH = 4;
+    const std::uint64_t astcW = astcBlockWidth(format);
+    const std::uint64_t astcH = astcBlockHeight(format);
+    if (astcW != 0 && astcH != 0) {
+        blockW = astcW;
+        blockH = astcH;
+    }
+    const std::uint64_t blocksX = (static_cast<std::uint64_t>(width) + blockW - 1) / blockW;
+    const std::uint64_t blocksY = (static_cast<std::uint64_t>(height) + blockH - 1) / blockH;
+    const std::uint64_t blocks = blocksX * blocksY;
+    switch (format) {
+    case TextureFormat::BC1_RGBA_UNORM:
+    case TextureFormat::BC4_UNORM: return blocks * 8;
+    default: return blocks * 16; // BC2/3/5/6/7 + ASTC
+    }
+}
+
 } // namespace f4::resources

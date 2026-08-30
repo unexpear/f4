@@ -89,8 +89,30 @@ void Window::swap() {
     }
 }
 
-auto Window::width() const -> std::uint32_t { return width_; }
-auto Window::height() const -> std::uint32_t { return height_; }
+auto Window::width() const -> std::uint32_t {
+    if (window_ == nullptr) return width_;
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
+    return w > 0 ? static_cast<std::uint32_t>(w) : width_;
+}
+auto Window::height() const -> std::uint32_t {
+    if (window_ == nullptr) return height_;
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
+    return h > 0 ? static_cast<std::uint32_t>(h) : height_;
+}
+auto Window::logicalWidth() const -> std::uint32_t {
+    if (window_ == nullptr) return width_;
+    int w = 0, h = 0;
+    SDL_GetWindowSize(static_cast<SDL_Window*>(window_), &w, &h);
+    return w > 0 ? static_cast<std::uint32_t>(w) : width_;
+}
+auto Window::logicalHeight() const -> std::uint32_t {
+    if (window_ == nullptr) return height_;
+    int w = 0, h = 0;
+    SDL_GetWindowSize(static_cast<SDL_Window*>(window_), &w, &h);
+    return h > 0 ? static_cast<std::uint32_t>(h) : height_;
+}
 auto Window::glContext() const -> void* { return glContext_; }
 
 } // namespace f4::platform
