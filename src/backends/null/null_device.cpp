@@ -92,6 +92,12 @@ auto NullDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, Gf
 }
 
 auto NullDevice::createPipeline(const PipelineStateDesc& desc) -> Result<PipelineHandle, GfxError> {
+    if (desc.layout.pushConstantSizeBytes != 0) return GfxError::BadDescriptor;
+    for (const BindGroup& group : desc.layout.groups) {
+        for (const BindingSlot& slot : group.slots) {
+            if (slot.count != 1) return GfxError::BadDescriptor;
+        }
+    }
     // Validate that referenced shader handles are live.
     if (desc.vertexShader.isValid() && !impl_->shaders.contains(desc.vertexShader)) {
         return GfxError::InvalidHandle;

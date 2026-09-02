@@ -1295,8 +1295,7 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     }
     VkPhysicalDeviceProperties deviceProperties{};
     vkGetPhysicalDeviceProperties(impl_->physicalDevice, &deviceProperties);
-    if (desc.layout.pushConstantSizeBytes > deviceProperties.limits.maxPushConstantsSize ||
-        desc.layout.pushConstantSizeBytes % 4 != 0) {
+    if (desc.layout.pushConstantSizeBytes != 0) {
         return GfxError::BadDescriptor;
     }
     if (desc.raster.depthClampEnable && !impl_->depthClamp) {
@@ -1425,13 +1424,6 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = static_cast<std::uint32_t>(record.setLayouts.size());
     layoutInfo.pSetLayouts = record.setLayouts.data();
-    VkPushConstantRange pushConstant{};
-    if (desc.layout.pushConstantSizeBytes != 0) {
-        pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        pushConstant.size = desc.layout.pushConstantSizeBytes;
-        layoutInfo.pushConstantRangeCount = 1;
-        layoutInfo.pPushConstantRanges = &pushConstant;
-    }
     VkResult result = vkCreatePipelineLayout(impl_->device, &layoutInfo, nullptr, &record.layout);
     if (result != VK_SUCCESS) {
         destroySetLayouts();

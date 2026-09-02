@@ -35,7 +35,7 @@ struct WindowDesc {
     bool visible = true;
 };
 
-// A wrapped SDL2 window with either an OpenGL context or Vulkan surface support.
+// A wrapped SDL2 window for OpenGL, Vulkan, or a native presentation API.
 // SDL stays hidden behind this seam so graphics backends never depend on SDL
 // types directly.
 class Window {
@@ -55,6 +55,10 @@ public:
     // Opens an SDL_WINDOW_VULKAN window without creating an OpenGL context.
     static auto createVulkan(const WindowDesc& desc) -> Result<Window*, WindowError>;
 
+    // Opens a plain native window for APIs such as DirectX 12 that own their
+    // presentation context.
+    static auto createNative(const WindowDesc& desc) -> Result<Window*, WindowError>;
+
     // Makes the GL context current on the calling thread.
     auto makeCurrent() -> bool;
 
@@ -72,6 +76,7 @@ public:
     [[nodiscard]] auto logicalWidth() const -> std::uint32_t;
     [[nodiscard]] auto logicalHeight() const -> std::uint32_t;
     [[nodiscard]] auto glContext() const -> void*;
+    [[nodiscard]] auto nativeHandle() const -> void*;
 
     // SDL Vulkan bridge using opaque arguments so Vulkan types do not leak into
     // the platform header. `surfaceOut` points to a VkSurfaceKHR.
@@ -84,12 +89,14 @@ public:
     void setVSyncEnabled(bool enabled);
 
 private:
-    static auto createInternal(const WindowDesc& desc, bool vulkan)
+    enum class Api : std::uint8_t { OpenGL, Vulkan, Native };
+
+    static auto createInternal(const WindowDesc& desc, Api api)
         -> Result<Window*, WindowError>;
 
     void* window_ = nullptr;   // SDL_Window*
     void* glContext_ = nullptr; // SDL_GLContext
-    bool vulkan_ = false;
+    Api api_ = Api::OpenGL;
     std::uint32_t width_ = 0;  // fallback size if SDL cannot report a drawable
     std::uint32_t height_ = 0;
 };

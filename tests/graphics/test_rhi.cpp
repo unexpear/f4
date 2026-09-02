@@ -701,6 +701,31 @@ TEST_CASE("Texture: writeTexture validates footprint, mip level, and liveness") 
     CHECK(d->writeTexture(stale, 0, std::span(full)) == GfxError::StaleHandle);
 }
 
+TEST_CASE("RHI: unimplemented resource arrays and push constants are rejected") {
+    TestDevice t;
+    ShaderDesc shaderDesc;
+    shaderDesc.stage = ShaderStage::Vertex;
+    auto vertex = t.dev->createShader(shaderDesc);
+    REQUIRE(vertex.hasValue());
+    shaderDesc.stage = ShaderStage::Fragment;
+    auto fragment = t.dev->createShader(shaderDesc);
+    REQUIRE(fragment.hasValue());
+    PipelineStateDesc desc;
+    desc.vertexShader = vertex.value();
+    desc.fragmentShader = fragment.value();
+    BindGroup group;
+    BindingSlot slot;
+    slot.count = 2;
+    group.slots.push(slot);
+    desc.layout.groups.push(group);
+    CHECK(t.dev->createPipeline(desc).error() == GfxError::BadDescriptor);
+    desc.layout.groups[0].slots[0].count = 1;
+    desc.layout.pushConstantSizeBytes = 16;
+    CHECK(t.dev->createPipeline(desc).error() == GfxError::BadDescriptor);
+    CHECK(t.dev->destroyShader(fragment.value()) == GfxError::None);
+    CHECK(t.dev->destroyShader(vertex.value()) == GfxError::None);
+}
+
 TEST_CASE("Texture: mip count cannot exceed the complete chain") {
     TestDevice t;
     TextureDesc valid;

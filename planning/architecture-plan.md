@@ -167,7 +167,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M7 OpenGL backend | ✅ Complete | SDL/OpenGL rendering, resources, framebuffers, draw/instancing, zero-to-one clipping, diagnostics, and pixel tests work. Scissor/depth-clamp state, independent attachment blend/write state, clear-mask handling, depth-only/depth-stencil framebuffers, and device-limit/layout validation now conform to the advertised RHI and have focused tests. |
 | M8 Renderer + render graph v1 | ✅ Complete | `Renderer::render()` executes through the graph and graph lifetimes/rollback are covered. The constant ring grows geometrically instead of silently stopping at 64 slots; direct 130-slot and 65-object renderer regressions verify the former boundary. Cross-backend parity remains an M9/M10 acceptance item rather than an M8 requirement. |
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
-| M10 DX12 | ❌ Not started | No DX12 backend, HLSL pipeline, or descriptor-heap implementation exists. |
+| M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ⚠ Prototype only | Demo GLSL covers GGX metallic/roughness and normal-map orientation. Engine material integration, IBL, shadows, tone mapping, HLSL, and backend parity are absent. |
 | M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo and pipeline-key sorting exist. Frustum/occlusion culling, draw batching, jobs, multithreaded recording, SIMD paths, graph scheduling, and async compute are absent. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
@@ -491,9 +491,22 @@ Completed delivery and acceptance gates:
    then run the same seeded float probe and RGBA8 reference scenes through
    OpenGL and Vulkan. Cross-backend parity becomes real at this point.
 
-### Milestone 10 — DX12 Backend
-- Same abstraction; descriptor heaps mapped onto our binding model
-- Validates that binding/descriptor design was API-neutral
+### Milestone 10 — DX12 Backend ✅
+Completed delivery and acceptance gates:
+1. Added native D3D12 hardware-adapter selection with WARP fallback, debug-layer
+   diagnostics, a direct queue, command allocators/lists, two fenced frames in
+   flight, and deferred resource retirement.
+2. Mapped the existing API-neutral binding model onto root signatures and
+   dynamically sized CBV/SRV/sampler descriptor heaps. A 130-draw regression
+   proves there is no hidden fixed descriptor/draw ceiling.
+3. Implemented buffers, texture upload/readback, samplers, graphics PSOs,
+   framebuffers, render targets, depth/stencil planes, explicit barriers, and
+   SDL HWND to DXGI flip-discard presentation with recreation.
+4. Added build-time DXC Shader Model 6 compilation and HLSL fixtures. Seeded
+   float and exact RGBA8 probes enforce the same parity contract used by M9.
+5. Full MinGW Debug/Release and MSVC Debug suites pass. Repeated 12-frame
+   captures are byte-identical, and the factory-selected DX12 smoke capture is
+   visually complete with no missing or stale geometry.
 
 ### Milestone 11 — PBR
 - BRDF (GGX), IBL, normal mapping, metallic/roughness workflow
@@ -748,12 +761,11 @@ needed for these deterministic or generated-fixture tests and were not extracted
 
 ### Current next work (2026-09-02 audit)
 
-1. Begin M10 DX12 using the completed OpenGL/Vulkan command, binding, lifetime,
-   and parity contract rather than introducing DX12-specific behavior above RHI.
-2. M14 may proceed in parallel; its Linux/Clang CPU determinism prerequisite is
-   closed.
-3. Keep M13 partially open until compute commands and a Vulkan compute pipeline
-   make CPU-reference versus GPU-sampled parity testable.
+1. Complete M14 now that its Linux/Clang CPU determinism prerequisite is closed.
+2. Complete M11 with engine material integration, IBL, shadows, tone mapping,
+   native GLSL/HLSL shader paths, and three-backend visual/parity coverage.
+3. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
+   pipelines make CPU-reference versus GPU-sampled parity testable.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

@@ -88,9 +88,70 @@ if(F4_ENABLE_SANITIZERS AND MSVC)
     # unsanitized vendor Vulkan driver can then fail with a shadow-memory
     # VirtualAlloc error before any test executes; Vulkan remains covered by
     # the Debug/Release validation-layer gates.
-    add_test(NAME core COMMAND f4_tests "--test-case-exclude=*Vulkan*")
+    add_test(NAME core COMMAND f4_tests "--test-case-exclude=*Vulkan*,*DX12*,M10:*")
 else()
     add_test(NAME core COMMAND f4_tests)
+endif()
+
+if(F4_GRAPHICS_HAS_DX12)
+    target_sources(f4_tests PRIVATE graphics/test_dx12_device.cpp)
+    target_link_libraries(f4_tests PRIVATE d3d12 dxgi dxguid)
+
+    find_program(F4_DXC_EXECUTABLE NAMES dxc dxc.exe
+        HINTS "$ENV{VULKAN_SDK}/Bin"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22000.0/x64")
+    if(F4_DXC_EXECUTABLE)
+        set(F4_DX12_TEST_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/dx12-shaders")
+        function(f4_compile_dxil output source profile entry)
+            add_custom_command(
+                OUTPUT "${output}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_DX12_TEST_SHADER_DIR}"
+                COMMAND "${F4_DXC_EXECUTABLE}"
+                        -T "${profile}" -E "${entry}" -Ges -WX
+                        -Fo "${output}" "${source}"
+                DEPENDS "${source}"
+                VERBATIM)
+        endfunction()
+        set(F4_DX12_TEST_VERTEX_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_triangle.vert.dxil")
+        set(F4_DX12_TEST_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_triangle.frag.dxil")
+        set(F4_DX12_TEST_BIND_VERTEX_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_bind.vert.dxil")
+        set(F4_DX12_TEST_BIND_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_bind.frag.dxil")
+        set(F4_DX12_TEST_PARITY_VERTEX_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_parity.vert.dxil")
+        set(F4_DX12_TEST_PARITY_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_parity.frag.dxil")
+        set(F4_DX12_TEST_IMAGE_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_image.frag.dxil")
+        f4_compile_dxil("${F4_DX12_TEST_VERTEX_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_triangle.vert.hlsl" vs_6_0 VSMain)
+        f4_compile_dxil("${F4_DX12_TEST_FRAGMENT_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_triangle.frag.hlsl" ps_6_0 PSMain)
+        f4_compile_dxil("${F4_DX12_TEST_BIND_VERTEX_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_bind.vert.hlsl" vs_6_0 VSMain)
+        f4_compile_dxil("${F4_DX12_TEST_BIND_FRAGMENT_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_bind.frag.hlsl" ps_6_0 PSMain)
+        f4_compile_dxil("${F4_DX12_TEST_PARITY_VERTEX_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_parity.vert.hlsl" vs_6_0 VSMain)
+        f4_compile_dxil("${F4_DX12_TEST_PARITY_FRAGMENT_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_parity.frag.hlsl" ps_6_0 PSMain)
+        f4_compile_dxil("${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_image.frag.hlsl" ps_6_0 PSMain)
+        add_custom_target(f4_dx12_test_shaders DEPENDS
+            "${F4_DX12_TEST_VERTEX_DXIL}"
+            "${F4_DX12_TEST_FRAGMENT_DXIL}"
+            "${F4_DX12_TEST_BIND_VERTEX_DXIL}"
+            "${F4_DX12_TEST_BIND_FRAGMENT_DXIL}"
+            "${F4_DX12_TEST_PARITY_VERTEX_DXIL}"
+            "${F4_DX12_TEST_PARITY_FRAGMENT_DXIL}"
+            "${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}")
+        add_dependencies(f4_tests f4_dx12_test_shaders)
+        target_compile_definitions(f4_tests PRIVATE
+            F4_DX12_TEST_VERTEX_DXIL="${F4_DX12_TEST_VERTEX_DXIL}"
+            F4_DX12_TEST_FRAGMENT_DXIL="${F4_DX12_TEST_FRAGMENT_DXIL}"
+            F4_DX12_TEST_BIND_VERTEX_DXIL="${F4_DX12_TEST_BIND_VERTEX_DXIL}"
+            F4_DX12_TEST_BIND_FRAGMENT_DXIL="${F4_DX12_TEST_BIND_FRAGMENT_DXIL}"
+            F4_DX12_TEST_PARITY_VERTEX_DXIL="${F4_DX12_TEST_PARITY_VERTEX_DXIL}"
+            F4_DX12_TEST_PARITY_FRAGMENT_DXIL="${F4_DX12_TEST_PARITY_FRAGMENT_DXIL}"
+            F4_DX12_TEST_IMAGE_FRAGMENT_DXIL="${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}")
+    endif()
 endif()
 add_test(NAME core_stripped COMMAND f4_tests_stripped)
 add_test(NAME determinism COMMAND f4_tests "--test-case=golden vectors are bit-exact")

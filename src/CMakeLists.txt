@@ -290,3 +290,62 @@ elseif(F4_GRAPHICS_BACKEND STREQUAL "vulkan")
 endif()
 set(F4_GRAPHICS_HAS_VULKAN ${F4_GRAPHICS_HAS_VULKAN} PARENT_SCOPE)
 set(F4_GRAPHICS_HAS_VULKAN_WINDOW ${F4_GRAPHICS_HAS_VULKAN_WINDOW} PARENT_SCOPE)
+
+# --- DirectX 12 backend (M10) ----------------------------------------------
+set(F4_GRAPHICS_HAS_DX12 OFF)
+set(F4_GRAPHICS_HAS_DX12_WINDOW OFF)
+if(WIN32)
+    set(F4_GRAPHICS_HAS_DX12 ON)
+    target_sources(f4_graphics PRIVATE backends/dx12/dx12_device.cpp)
+    target_link_libraries(f4_graphics PRIVATE d3d12 dxgi dxguid)
+    target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_DX12=1)
+    if(TARGET f4_platform)
+        set(F4_GRAPHICS_HAS_DX12_WINDOW ON)
+        target_compile_definitions(f4_graphics PRIVATE F4_DX12_HAS_PLATFORM=1)
+        target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_DX12_WINDOW=1)
+        target_link_libraries(f4_graphics PRIVATE f4_platform)
+
+        find_program(F4_DXC_EXECUTABLE NAMES dxc dxc.exe
+            HINTS "$ENV{VULKAN_SDK}/Bin"
+                  "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+                  "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22000.0/x64")
+        if(F4_DXC_EXECUTABLE)
+            set(F4_DX12_APP_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/dx12-app-shaders")
+            set(F4_DX12_APP_VERTEX_DXIL "${F4_DX12_APP_SHADER_DIR}/dx12_triangle.vert.dxil")
+            set(F4_DX12_APP_FRAGMENT_DXIL "${F4_DX12_APP_SHADER_DIR}/dx12_triangle.frag.dxil")
+            add_custom_command(
+                OUTPUT "${F4_DX12_APP_VERTEX_DXIL}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_DX12_APP_SHADER_DIR}"
+                COMMAND "${F4_DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Ges -WX
+                        -Fo "${F4_DX12_APP_VERTEX_DXIL}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/dx12_triangle.vert.hlsl"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/dx12_triangle.vert.hlsl"
+                VERBATIM)
+            add_custom_command(
+                OUTPUT "${F4_DX12_APP_FRAGMENT_DXIL}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_DX12_APP_SHADER_DIR}"
+                COMMAND "${F4_DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Ges -WX
+                        -Fo "${F4_DX12_APP_FRAGMENT_DXIL}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/dx12_triangle.frag.hlsl"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/dx12_triangle.frag.hlsl"
+                VERBATIM)
+            add_custom_target(f4_dx12_app_shaders DEPENDS
+                "${F4_DX12_APP_VERTEX_DXIL}" "${F4_DX12_APP_FRAGMENT_DXIL}")
+            add_executable(f4_dx12_app app/f4_dx12_app.cpp)
+            add_dependencies(f4_dx12_app f4_dx12_app_shaders)
+            target_compile_definitions(f4_dx12_app PRIVATE
+                F4_DX12_APP_VERTEX_DXIL="${F4_DX12_APP_VERTEX_DXIL}"
+                F4_DX12_APP_FRAGMENT_DXIL="${F4_DX12_APP_FRAGMENT_DXIL}")
+            target_include_directories(f4_dx12_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_link_libraries(f4_dx12_app PRIVATE
+                f4_graphics f4_platform f4_core SDL2::SDL2)
+            f4_set_warnings(f4_dx12_app)
+            f4_set_float_precision(f4_dx12_app)
+            f4_enable_sanitizers(f4_dx12_app)
+        endif()
+    endif()
+elseif(F4_GRAPHICS_BACKEND STREQUAL "dx12")
+    message(FATAL_ERROR "F4_GRAPHICS_BACKEND=dx12 is only available on Windows")
+endif()
+set(F4_GRAPHICS_HAS_DX12 ${F4_GRAPHICS_HAS_DX12} PARENT_SCOPE)
+set(F4_GRAPHICS_HAS_DX12_WINDOW ${F4_GRAPHICS_HAS_DX12_WINDOW} PARENT_SCOPE)

@@ -43,7 +43,7 @@ struct BindingSlot {
     std::uint32_t slot = 0;
     BindingType type = BindingType::UniformBuffer;
     std::uint32_t stageMask = 0; // OR of shaderStageBit() — 0 means all stages
-    std::uint32_t count = 1;     // array of `count` resources
+    std::uint32_t count = 1;     // reserved for arrays; current backends require 1
 };
 
 struct BindGroup {
@@ -51,8 +51,8 @@ struct BindGroup {
     Array<BindingSlot> slots;
 };
 
-// Whole-pipeline layout: the ordered bind groups plus optional push-constant
-// size hint (ignored by the null device, meaningful to Vulkan/DX12 later).
+// Whole-pipeline layout. Push-constant uploads are not yet command-buffer
+// operations, so real backends reject a nonzero size until that API lands.
 struct PipelineLayoutDesc {
     Array<BindGroup> groups;
     std::uint32_t pushConstantSizeBytes = 0;
