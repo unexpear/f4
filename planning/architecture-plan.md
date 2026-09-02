@@ -171,7 +171,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M11 PBR | ⚠ Prototype only | Demo GLSL covers GGX metallic/roughness and normal-map orientation. Engine material integration, IBL, shadows, tone mapping, HLSL, and backend parity are absent. |
 | M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo and pipeline-key sorting exist. Frustum/occlusion culling, draw batching, jobs, multithreaded recording, SIMD paths, graph scheduling, and async compute are absent. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
-| M14 World data model | ❌ Not started | No `ChunkCoord`, chunk lifecycle/deltas, `VoxelPolicy`, `HeightPolicy`, `HexPolicy`, or `RegionMap` implementation exists. `WorldGrid` is a rendering aid, not this data model. |
+| M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ❌ Not started | Demo terrain is not a policy mesher; no voxel greedy mesher, height-tile stitching, hex-prism mesher, or border-remesh system exists. |
 | M16 World streaming | ❌ Not started | No chunk residency, streaming queues, worker scheduling, generation staging, or terrain collision layer exists. |
 
@@ -504,7 +504,7 @@ Completed delivery and acceptance gates:
    SDL HWND to DXGI flip-discard presentation with recreation.
 4. Added build-time DXC Shader Model 6 compilation and HLSL fixtures. Seeded
    float and exact RGBA8 probes enforce the same parity contract used by M9.
-5. Full MinGW Debug/Release and MSVC Debug suites pass. Repeated 12-frame
+5. Full MinGW Debug/Release and MSVC Debug/Release suites pass. Repeated 12-frame
    captures are byte-identical, and the factory-selected DX12 smoke capture is
    visually complete with no missing or stale geometry.
 
@@ -528,7 +528,7 @@ Completed delivery and acceptance gates:
   required before claiming identical output on every backend
 - Pure CPU + headless-testable; can execute immediately after M4
 
-### Milestone 14 — World Data Model (procgen track)
+### Milestone 14 — World Data Model (procgen track) ✅
 - **All three cell styles are first-class by design decision** (voxel blocks,
   height tiles, hex cells) — none is a retrofit
 - Full technical specification: **§11** (chunk frame, storage layouts,
@@ -546,6 +546,17 @@ Completed delivery and acceptance gates:
   as sparse deltas over the generated base
 - Save/load of edits through the M2 chunk serialization format (endian
   marker + versioned chunks already proven)
+- Completed with negative-coordinate hash/region coverage, explicit
+  padding-free delta encoding, monotonic stale-work versions, immutable base
+  snapshots with locked overlays, and compile-time policy facades.
+- Voxel delivery includes exact 32³/u16 layout, empty scans, local and
+  world-spanning DDA; height delivery includes bit-identical shared edges,
+  normalized bilinear material sampling, and neighbor-fed seam normals; hex
+  delivery includes dense axial indexing, shared corner elevations and center
+  heights, rings, spirals, and line drawing.
+- Ten focused cases / 411 assertions pass on GCC, MSVC, and Clang ASan+UBSan.
+  The `world_determinism` CTest label locks generated voxel/height/hex data and
+  serialized edit bytes across all three toolchains.
 
 ### Milestone 15 — Terrain Meshing (procgen track)
 - One mesher per cell policy, all emitting the SAME MeshData
@@ -759,13 +770,21 @@ recreation, and OpenGL/Vulkan parity. Its Windows and Linux captures differ by a
 most one 8-bit channel value. The newly supplied zipped texture assets were not
 needed for these deterministic or generated-fixture tests and were not extracted.
 
+M10 and M14 completed on 2026-09-02. M10's native DX12 path passes hardware/WARP,
+resource, binding, 130-draw, barrier, swapchain-recreation, pixel-stability, and
+three-backend parity coverage; its selected-backend smoke capture is visually
+complete. M14 adds 10 focused cases / 411 assertions. Its fixed generated-data
+and padding-free delta-stream digests match GCC, MSVC, and Clang, and the full
+Linux Clang ASan+UBSan suite passes under Xvfb.
+
 ### Current next work (2026-09-02 audit)
 
-1. Complete M14 now that its Linux/Clang CPU determinism prerequisite is closed.
-2. Complete M11 with engine material integration, IBL, shadows, tone mapping,
+1. Complete M11 with engine material integration, IBL, shadows, tone mapping,
    native GLSL/HLSL shader paths, and three-backend visual/parity coverage.
-3. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
+2. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
    pipelines make CPU-reference versus GPU-sampled parity testable.
+3. Begin M15 policy meshers once the M11 material path can consume terrain
+   materials consistently across all three backends.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

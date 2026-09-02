@@ -46,6 +46,7 @@ add_executable(f4_tests
     core/test_frustum.cpp
     graphics/test_rhi.cpp
     engine/test_m8.cpp
+    engine/test_m14.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::doctest)
@@ -155,11 +156,13 @@ if(F4_GRAPHICS_HAS_DX12)
 endif()
 add_test(NAME core_stripped COMMAND f4_tests_stripped)
 add_test(NAME determinism COMMAND f4_tests "--test-case=golden vectors are bit-exact")
-set_tests_properties(determinism PROPERTIES LABELS determinism)
+add_test(NAME world_determinism COMMAND f4_tests
+    "--test-case=M14: generated policy outputs match cross-toolchain golden digests")
+set_tests_properties(determinism world_determinism PROPERTIES LABELS determinism)
 
 if(F4_ENABLE_SANITIZERS AND MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
     get_filename_component(F4_ASAN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    set_tests_properties(core core_stripped determinism PROPERTIES
+    set_tests_properties(core core_stripped determinism world_determinism PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${F4_ASAN_BIN_DIR}")
 endif()
 

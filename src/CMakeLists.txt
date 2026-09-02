@@ -158,6 +158,7 @@ f4_set_float_precision(f4_graphics)
 f4_enable_sanitizers(f4_graphics)
 
 add_library(f4_engine STATIC
+    engine/world/world_data.cpp
     engine/rendering/material.cpp
     engine/rendering/gpu_mesh.cpp
     engine/rendering/render_queue.cpp
