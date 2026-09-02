@@ -1,26 +1,13 @@
-// demo_triangle — the smallest focused demo: one colored triangle on the
-// backbuffer, with the diagnostics console + HUD overlay running to show the
-// metric registry in action. Everything else (window/device, overlay) is pulled
-// from the shared demo scaffolding so this file is purely about the triangle.
-//
-// Controls: Esc closes the window.
+#include "demos/demo_triangle.h"
 
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
-
-#include <array>
 #include <cstring>
 
-#include "core/diagnostics/diagnostics.h"
-#include "demos/demo_support.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
-#include "graphics/device/device.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
 
-using namespace f4;
-using namespace f4::gfx;
+namespace f4::demo {
 
 namespace {
 
@@ -52,164 +39,100 @@ constexpr float kColors[] = {
 
 } // namespace
 
-int main() {
-    demo::DemoWindow demo("demo_triangle");
-    if (!demo.ok()) {
-        return 1;
-    }
-    platform::Window* window = demo.window();
-    IDevice* dev = demo.device();
+bool TriangleScene::init(gfx::IDevice* dev, platform::Window*) {
+    if (inited_) return true;
 
-    // Framebuffer over the backbuffer (color attachment only, dark clear).
-    FramebufferHandle fb{};
-    FramebufferDesc fbd;
-    fbd.extent = {demo::DemoWindow::kWidth, demo::DemoWindow::kHeight};
-    AttachmentDesc color;
-    color.type = AttachmentType::Color;
-    color.clearOnLoad = true;
-    color.clear.color[0] = 0.05f;
-    color.clear.color[1] = 0.05f;
-    color.clear.color[2] = 0.07f;
-    fbd.attachments.push(color);
-    auto fbRes = dev->createFramebuffer(fbd);
-    if (!fbRes.hasValue()) {
-        return 1;
-    }
-    fb = fbRes.value();
-
-    // Triangle buffers (separate per-vertex position and color streams).
-    BufferDesc vbd;
+    // Position buffer
+    gfx::BufferDesc vbd;
     vbd.sizeBytes = sizeof(kPositions);
-    vbd.usage = BufferUsage::Vertex;
+    vbd.usage = gfx::BufferUsage::Vertex;
     auto vb = dev->createBuffer(vbd, std::span(reinterpret_cast<const std::byte*>(kPositions), sizeof(kPositions)));
-    if (!vb.hasValue()) {
-        return 1;
-    }
-    BufferDesc cbd;
-    cbd.sizeBytes = sizeof(kColors);
-    cbd.usage = BufferUsage::Vertex;
-    auto cb = dev->createBuffer(cbd, std::span(reinterpret_cast<const std::byte*>(kColors), sizeof(kColors)));
-    if (!cb.hasValue()) {
-        return 1;
-    }
+    if (!vb.hasValue()) return false;
+    vbPos_ = vb.value();
 
-    // Pipeline.
-    auto makeShader = [&](ShaderStage stage, const char* src) {
-        ShaderDesc d;
+    // Color buffer
+    gfx::BufferDesc cbd;
+    cbd.sizeBytes = sizeof(kColors);
+    cbd.usage = gfx::BufferUsage::Vertex;
+    auto cb = dev->createBuffer(cbd, std::span(reinterpret_cast<const std::byte*>(kColors), sizeof(kColors)));
+    if (!cb.hasValue()) return false;
+    vbColor_ = cb.value();
+
+    // Shaders
+    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
+        gfx::ShaderDesc d;
         d.stage = stage;
         d.blob.resize(std::strlen(src));
         std::memcpy(d.blob.data(), src, d.blob.size());
         return dev->createShader(d);
     };
-    auto vs = makeShader(ShaderStage::Vertex, kVs);
-    auto fs = makeShader(ShaderStage::Fragment, kFs);
-    if (!vs.hasValue() || !fs.hasValue()) {
-        return 1;
-    }
-    PipelineStateDesc pd;
-    pd.vertexShader = vs.value();
-    pd.fragmentShader = fs.value();
-    pd.topology = PrimitiveTopology::TriangleList;
-    pd.raster.cullMode = CullMode::None;
+    auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
+    auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
+    if (!vs.hasValue() || !fs.hasValue()) return false;
+    vs_ = vs.value();
+    fs_ = fs.value();
+
+    // Pipeline
+    gfx::PipelineStateDesc pd;
+    pd.vertexShader = vs_;
+    pd.fragmentShader = fs_;
+    pd.topology = gfx::PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = gfx::CullMode::None;
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 0;
         b.strideBytes = 12;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute pa;
+        gfx::VertexInputLayout::VertexAttribute pa;
         pa.binding = 0;
         pa.location = 0;
-        pa.format = VertexFormat::Float32x3;
+        pa.format = gfx::VertexFormat::Float32x3;
         pa.offsetBytes = 0;
         pd.vertexInput.attributes.push(pa);
     }
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 1;
         b.strideBytes = 12;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute ca;
+        gfx::VertexInputLayout::VertexAttribute ca;
         ca.binding = 1;
         ca.location = 1;
-        ca.format = VertexFormat::Float32x3;
+        ca.format = gfx::VertexFormat::Float32x3;
         ca.offsetBytes = 0;
         pd.vertexInput.attributes.push(ca);
     }
-    auto pipeline = dev->createPipeline(pd);
-    if (!pipeline.hasValue()) {
-        return 1;
-    }
+    auto pipe = dev->createPipeline(pd);
+    if (!pipe.hasValue()) return false;
+    pipeline_ = pipe.value();
 
-    // Diagnostics + HUD.
-    diag::Diagnostics diagnostics;
-    demo::Hud hud(dev);
-    if (!hud.init()) {
-        return 1;
-    }
-    diagnostics.setSampleSink(&demo::Hud::onSample, &hud);
-
-    const std::uint32_t idFps = diagnostics.metrics().declare({"fps", diag::MetricType::Double, "frame", "1/s"});
-    const std::uint32_t idTick = diagnostics.metrics().declare({"frame_ms", diag::MetricType::Double, "frame", "ms"});
-    const std::uint32_t idDraw = diagnostics.metrics().declare({"draw_calls", diag::MetricType::UInt, "gpu", "calls"});
-    const std::uint32_t idTri = diagnostics.metrics().declare({"triangles", diag::MetricType::UInt, "gpu", "count"});
-    const std::uint32_t idMem = diagnostics.metrics().declare({"live_bytes", diag::MetricType::UInt, "memory", "B"});
-
-    // Simple frame clock (high-res enough for the HUD).
-    const Uint64 perfFreq = SDL_GetPerformanceFrequency();
-    Uint64 prev = SDL_GetPerformanceCounter();
-    double firstNow = 0.0;
-    bool running = true;
-
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-                running = false;
-            }
-        }
-
-        const Uint64 now = SDL_GetPerformanceCounter();
-        const double dt = static_cast<double>(now - prev) / static_cast<double>(perfFreq);
-        prev = now;
-        if (dt <= 0.0) {
-            continue;
-        }
-        const double cur = firstNow + dt;
-        firstNow = cur;
-
-        // Push metrics, then sample (updates console + HUD when due).
-        const double fps = dt > 0.0 ? 1.0 / dt : 0.0;
-        diagnostics.metrics()[idFps].set(fps);
-        diagnostics.metrics()[idTick].set(dt * 1000.0);
-        diagnostics.metrics()[idDraw].set(dev->stats().drawCalls);
-        diagnostics.metrics()[idTri].set(dev->stats().drawCalls * 1u);
-        diagnostics.metrics()[idMem].set(dev->stats().bufferBytes + dev->stats().textureBytes);
-        diagnostics.update(cur);
-
-        {
-            CommandBuffer cbcb;
-            cbcb.begin();
-            cbcb.beginRenderPass(fb);
-            cbcb.setViewport({demo::DemoWindow::kWidth, demo::DemoWindow::kHeight});
-            cbcb.bindPipeline(pipeline.value());
-            cbcb.bindVertexBuffer(0, vb.value(), 12);
-            cbcb.bindVertexBuffer(1, cb.value(), 12);
-            cbcb.draw(3);
-
-            // HUD overlay pass on top.
-            hud.render(cbcb, demo::DemoWindow::kWidth, demo::DemoWindow::kHeight);
-            cbcb.endRenderPass();
-            cbcb.end();
-            dev->submit(cbcb);
-        }
-
-        // Per-frame counters are reset so the next sample sees this frame only.
-        dev->resetFrameStats();
-        window->swap();
-    }
-
-    dev->waitIdle();
-    return 0;
+    inited_ = true;
+    return true;
 }
+
+void TriangleScene::shutdown(gfx::IDevice* dev) {
+    if (!inited_) return;
+    if (pipeline_.isValid()) dev->destroyPipeline(pipeline_);
+    if (fs_.isValid()) dev->destroyShader(fs_);
+    if (vs_.isValid()) dev->destroyShader(vs_);
+    if (vbColor_.isValid()) dev->destroyBuffer(vbColor_);
+    if (vbPos_.isValid()) dev->destroyBuffer(vbPos_);
+    inited_ = false;
+}
+
+void TriangleScene::onResize(std::uint32_t, std::uint32_t) {
+    // Nothing to do for this simple demo
+}
+
+void TriangleScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {
+    // Static triangle, no update needed
+}
+
+void TriangleScene::render(gfx::CommandBuffer& cb, const FreeCamera&, std::uint32_t, std::uint32_t) {
+    cb.bindPipeline(pipeline_);
+    cb.bindVertexBuffer(0, vbPos_, 12);
+    cb.bindVertexBuffer(1, vbColor_, 12);
+    cb.draw(3);
+}
+
+} // namespace f4::demo

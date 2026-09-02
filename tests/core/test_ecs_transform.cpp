@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
@@ -23,11 +25,38 @@ using math::Quat;
 using math::Vec3;
 
 namespace {
+using DoubleMatrix = std::array<double, 16>;
+
 auto countDirty(const Registry& registry) -> int {
     if (!registry.hasStorage<TransformDirty>()) {
         return 0;
     }
     return static_cast<int>(registry.storage<TransformDirty>().size());
+}
+
+auto toDoubleMatrix(const Mat4& matrix) -> DoubleMatrix {
+    DoubleMatrix result{};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            result[static_cast<std::size_t>(row * 4 + column)] = matrix(row, column);
+        }
+    }
+    return result;
+}
+
+auto multiply(const DoubleMatrix& a, const DoubleMatrix& b) -> DoubleMatrix {
+    DoubleMatrix result{};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            double value = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                value += a[static_cast<std::size_t>(row * 4 + k)] *
+                         b[static_cast<std::size_t>(k * 4 + column)];
+            }
+            result[static_cast<std::size_t>(row * 4 + column)] = value;
+        }
+    }
+    return result;
 }
 } // namespace
 
@@ -110,6 +139,47 @@ TEST_CASE("three-level chain matches manual composition") {
     // (c, 0, -s)), and the uniform scale doubles its length.
     CHECK(f4test::veq(wm->matrix.transformVector(Vec3(1.0f, 0.0f, 0.0f)),
                       Vec3(0.0f, 0.0f, -2.0f)));
+    CHECK(ecs::transformsAreClean(registry));
+}
+
+TEST_CASE("deep hierarchy drift stays bounded against double accumulation") {
+    constexpr int depth = 512;
+    Registry registry(depth + 8);
+    const LocalTransform local{
+        Vec3(0.125f, -0.0625f, 0.03125f),
+        Quat::fromAxisAngle(math::normalized(Vec3(1.0f, 2.0f, -0.5f)), 0.013f),
+        Vec3(1.0001f, 0.9999f, 1.00005f)};
+    Entity parent{};
+    Entity deepest{};
+    for (int i = 0; i < depth; ++i) {
+        const Entity entity = registry.create();
+        registry.emplace<LocalTransform>(entity, local);
+        if (i != 0) REQUIRE(ecs::trySetParent(registry, entity, parent));
+        parent = entity;
+        deepest = entity;
+    }
+
+    ecs::updateWorldTransforms(registry);
+    const WorldMatrix* actual = registry.get<WorldMatrix>(deepest);
+    REQUIRE(actual != nullptr);
+
+    DoubleMatrix expected = toDoubleMatrix(Mat4::identity());
+    const DoubleMatrix localDouble = toDoubleMatrix(math::composeTRS(local));
+    for (int i = 0; i < depth; ++i) expected = multiply(expected, localDouble);
+
+    double maxAbsoluteError = 0.0;
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            const double observed = actual->matrix(row, column);
+            REQUIRE(std::isfinite(observed));
+            maxAbsoluteError = std::max(
+                maxAbsoluteError,
+                std::fabs(observed - expected[static_cast<std::size_t>(row * 4 + column)]));
+        }
+    }
+    INFO("512-level max absolute drift: " << maxAbsoluteError);
+    // GCC and MSVC both measured 1.528e-5; pin a four-times regression ceiling.
+    CHECK(maxAbsoluteError < 6.2e-5);
     CHECK(ecs::transformsAreClean(registry));
 }
 

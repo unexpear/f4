@@ -21,6 +21,8 @@ FetchContent_Declare(cgltf
 FetchContent_MakeAvailable(cgltf)
 
 FetchContent_Declare(zlib
+    SYSTEM
+    EXCLUDE_FROM_ALL
     GIT_REPOSITORY https://github.com/madler/zlib.git
     GIT_TAG v1.3.1
 )
@@ -28,8 +30,10 @@ FetchContent_MakeAvailable(zlib)
 
 FetchContent_Declare(basis_universal
     SYSTEM
+    EXCLUDE_FROM_ALL
     GIT_REPOSITORY https://github.com/BinomialLLC/basis_universal.git
     GIT_TAG v2_50
+    GIT_SHALLOW TRUE
 )
 set(BASISU_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BASISU_ZSTD OFF CACHE BOOL "" FORCE)
@@ -44,6 +48,8 @@ FetchContent_Declare(ufbx
 FetchContent_MakeAvailable(ufbx)
 
 FetchContent_Declare(Imath
+    SYSTEM
+    EXCLUDE_FROM_ALL
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/Imath.git
     GIT_TAG v3.2.0
 )
@@ -56,8 +62,9 @@ set(USE_HDF5 OFF CACHE BOOL "" FORCE)
 set(USE_PYALEMBIC OFF CACHE BOOL "" FORCE)
 set(USE_MAYA OFF CACHE BOOL "" FORCE)
 set(ALEMBIC_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(ALEMBIC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(USE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(Alembic
+    SYSTEM
     GIT_REPOSITORY https://github.com/alembic/alembic.git
     GIT_TAG 1.8.12
     EXCLUDE_FROM_ALL
@@ -80,6 +87,7 @@ endif()
 
 FetchContent_Declare(tinyusdz
     SYSTEM
+    EXCLUDE_FROM_ALL
     GIT_REPOSITORY https://github.com/lighttransport/tinyusdz.git
     GIT_TAG v0.9.1
     PATCH_COMMAND ${CMAKE_COMMAND} -Dtinyusdz_SOURCE_DIR=${CMAKE_BINARY_DIR}/_deps/tinyusdz-src -P ${CMAKE_SOURCE_DIR}/cmake/patch_tinyusdz.cmake
@@ -154,6 +162,9 @@ add_library(f4_engine STATIC
     engine/rendering/gpu_mesh.cpp
     engine/rendering/render_queue.cpp
     engine/rendering/renderer.cpp
+    engine/rendering/world_grid.cpp
+    engine/rendering/shader_constants.cpp
+    engine/rendering/shader_parity.cpp
 )
 
 target_include_directories(f4_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -162,12 +173,10 @@ f4_set_warnings(f4_engine)
 f4_set_float_precision(f4_engine)
 f4_enable_sanitizers(f4_engine)
 
-# --- OpenGL backend (M7) ---------------------------------------------------
-# Requires SDL2 + libepoxy, which are present on the MSYS2 ucrt64 (GCC)
-# toolchain. On toolchains without them (e.g. the MSVC presets) the graphics
-# library stays headless (NullDevice) and F4_GRAPHICS_HAS_OPENGL is OFF, so
-# f4_platform, the GL device, the windowed demo, and the GL-conformance tests
-# are all skipped. The 5-preset headless gate is therefore unchanged.
+# --- SDL platform + OpenGL backend (M7) -----------------------------------
+# The SDL window seam is shared by OpenGL and Vulkan. Epoxy is discovered
+# separately so a machine with SDL + Vulkan can build windowed Vulkan without
+# also installing the OpenGL backend's loader.
 find_package(SDL2 CONFIG QUIET)
 
 set(F4_GRAPHICS_HAS_OPENGL OFF)
@@ -175,16 +184,28 @@ set(F4_GRAPHICS_HAS_OPENGL OFF)
 # may still be discoverable from an MSVC configure, but it is not ABI/toolchain
 # compatible with cl.exe. Keep MSVC on the documented headless path.
 if(TARGET SDL2::SDL2 AND NOT MSVC)
-    set(F4_GRAPHICS_HAS_OPENGL ON)
     add_library(f4_platform STATIC
         platform/window.cpp
-        platform/gl_context.cpp
     )
     target_include_directories(f4_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(f4_platform PRIVATE f4_core SDL2::SDL2 epoxy)
+    target_link_libraries(f4_platform PRIVATE f4_core SDL2::SDL2)
     f4_set_warnings(f4_platform)
     f4_set_float_precision(f4_platform)
     f4_enable_sanitizers(f4_platform)
+endif()
+
+get_filename_component(F4_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+get_filename_component(F4_COMPILER_PREFIX "${F4_COMPILER_BIN_DIR}" DIRECTORY)
+find_path(F4_EPOXY_INCLUDE_DIR epoxy/gl.h HINTS "${F4_COMPILER_PREFIX}/include")
+find_library(F4_EPOXY_LIBRARY NAMES epoxy HINTS "${F4_COMPILER_PREFIX}/lib")
+if(TARGET f4_platform AND F4_EPOXY_INCLUDE_DIR AND F4_EPOXY_LIBRARY)
+    add_library(f4_epoxy UNKNOWN IMPORTED GLOBAL)
+    set_target_properties(f4_epoxy PROPERTIES
+        IMPORTED_LOCATION "${F4_EPOXY_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${F4_EPOXY_INCLUDE_DIR}")
+    set(F4_GRAPHICS_HAS_OPENGL ON)
+    target_sources(f4_platform PRIVATE platform/gl_context.cpp)
+    target_link_libraries(f4_platform PRIVATE f4_epoxy)
 
     target_sources(f4_graphics PRIVATE backends/opengl/opengl_device.cpp)
     target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_OPENGL=1)
@@ -202,3 +223,70 @@ if(TARGET SDL2::SDL2 AND NOT MSVC)
     add_subdirectory(demos)
 endif()
 set(F4_GRAPHICS_HAS_OPENGL ${F4_GRAPHICS_HAS_OPENGL} PARENT_SCOPE)
+
+# --- Vulkan backend (M9) ---------------------------------------------------
+# Vulkan is optional for the existing build matrix. When an SDK/loader is
+# present, compile the backend and its direct conformance tests even if the
+# selected createDevice() backend remains null or OpenGL.
+find_package(Vulkan 1.3 QUIET)
+set(F4_GRAPHICS_HAS_VULKAN OFF)
+set(F4_GRAPHICS_HAS_VULKAN_WINDOW OFF)
+if(Vulkan_FOUND)
+    set(F4_GRAPHICS_HAS_VULKAN ON)
+    target_sources(f4_graphics PRIVATE backends/vulkan/vulkan_device.cpp)
+    target_link_libraries(f4_graphics PRIVATE Vulkan::Vulkan)
+    target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_VULKAN=1)
+    if(F4_VULKAN_VALIDATION)
+        target_compile_definitions(f4_graphics PRIVATE
+            $<$<CONFIG:Debug>:F4_VULKAN_VALIDATION=1>)
+    endif()
+
+    if(TARGET f4_platform)
+        set(F4_GRAPHICS_HAS_VULKAN_WINDOW ON)
+        target_link_libraries(f4_platform PRIVATE Vulkan::Headers)
+        target_compile_definitions(f4_platform PRIVATE F4_PLATFORM_HAS_VULKAN=1)
+        target_compile_definitions(f4_graphics PRIVATE F4_VULKAN_HAS_PLATFORM=1)
+        target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_VULKAN_WINDOW=1)
+
+        if(TARGET Vulkan::glslangValidator)
+            set(F4_VK_APP_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/vulkan-app-shaders")
+            set(F4_VK_APP_VERTEX_SPV "${F4_VK_APP_SHADER_DIR}/vulkan_triangle.vert.spv")
+            set(F4_VK_APP_FRAGMENT_SPV "${F4_VK_APP_SHADER_DIR}/vulkan_triangle.frag.spv")
+            add_custom_command(
+                OUTPUT "${F4_VK_APP_VERTEX_SPV}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_VK_APP_SHADER_DIR}"
+                COMMAND $<TARGET_FILE:Vulkan::glslangValidator>
+                        -V --target-env vulkan1.3 --spirv-val -S vert
+                        -o "${F4_VK_APP_VERTEX_SPV}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/vulkan_triangle.vert"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/vulkan_triangle.vert"
+                VERBATIM)
+            add_custom_command(
+                OUTPUT "${F4_VK_APP_FRAGMENT_SPV}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_VK_APP_SHADER_DIR}"
+                COMMAND $<TARGET_FILE:Vulkan::glslangValidator>
+                        -V --target-env vulkan1.3 --spirv-val -S frag
+                        -o "${F4_VK_APP_FRAGMENT_SPV}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/vulkan_triangle.frag"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/vulkan_triangle.frag"
+                VERBATIM)
+            add_custom_target(f4_vk_app_shaders
+                DEPENDS "${F4_VK_APP_VERTEX_SPV}" "${F4_VK_APP_FRAGMENT_SPV}")
+            add_executable(f4_vulkan_app app/f4_vulkan_app.cpp)
+            add_dependencies(f4_vulkan_app f4_vk_app_shaders)
+            target_compile_definitions(f4_vulkan_app PRIVATE
+                F4_VK_APP_VERTEX_SPV="${F4_VK_APP_VERTEX_SPV}"
+                F4_VK_APP_FRAGMENT_SPV="${F4_VK_APP_FRAGMENT_SPV}")
+            target_include_directories(f4_vulkan_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_link_libraries(f4_vulkan_app PRIVATE
+                f4_graphics f4_platform f4_core SDL2::SDL2)
+            f4_set_warnings(f4_vulkan_app)
+            f4_set_float_precision(f4_vulkan_app)
+            f4_enable_sanitizers(f4_vulkan_app)
+        endif()
+    endif()
+elseif(F4_GRAPHICS_BACKEND STREQUAL "vulkan")
+    message(FATAL_ERROR "F4_GRAPHICS_BACKEND=vulkan requires Vulkan 1.3 headers and loader")
+endif()
+set(F4_GRAPHICS_HAS_VULKAN ${F4_GRAPHICS_HAS_VULKAN} PARENT_SCOPE)
+set(F4_GRAPHICS_HAS_VULKAN_WINDOW ${F4_GRAPHICS_HAS_VULKAN_WINDOW} PARENT_SCOPE)

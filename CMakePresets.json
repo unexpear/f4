@@ -1,6 +1,6 @@
 {
     "version": 6,
-    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "cmakeMinimumRequired": { "major": 3, "minor": 29, "patch": 0 },
     "configurePresets": [
         {
             "name": "base",
@@ -30,6 +30,39 @@
             "inherits": "base",
             "displayName": "Debug + ASan/UBSan (Ninja)",
             "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "F4_ENABLE_SANITIZERS": "ON"
+            }
+        },
+        {
+            "name": "linux-clang-base",
+            "hidden": true,
+            "inherits": "base",
+            "generator": "Ninja",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "environment": {
+                "CC": "clang",
+                "CXX": "clang++",
+                "CMAKE_PREFIX_PATH": ""
+            },
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
+            }
+        },
+        {
+            "name": "linux-clang-debug",
+            "inherits": "linux-clang-base",
+            "displayName": "Linux Clang Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "linux-clang-asan",
+            "inherits": "linux-clang-base",
+            "displayName": "Linux Clang ASan + UBSan",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "F4_ENABLE_SANITIZERS": "ON"
@@ -69,6 +102,16 @@
         { "name": "build-debug", "configurePreset": "debug" },
         { "name": "build-release", "configurePreset": "release" },
         { "name": "build-asan", "configurePreset": "asan" },
+        {
+            "name": "build-linux-clang-debug",
+            "configurePreset": "linux-clang-debug",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
+        {
+            "name": "build-linux-clang-asan",
+            "configurePreset": "linux-clang-asan",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
         { "name": "build-msvc-debug", "configurePreset": "msvc-debug", "configuration": "Debug" },
         { "name": "build-msvc-release", "configurePreset": "msvc-release", "configuration": "Release" },
         { "name": "build-msvc-asan", "configurePreset": "msvc-asan", "configuration": "Debug" }
@@ -87,6 +130,25 @@
         {
             "name": "test-asan",
             "configurePreset": "asan",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-linux-clang-debug",
+            "configurePreset": "linux-clang-debug",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-linux-clang-determinism",
+            "configurePreset": "linux-clang-debug",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "filter": { "include": { "label": "determinism" } },
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "test-linux-clang-asan",
+            "configurePreset": "linux-clang-asan",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
             "output": { "outputOnFailure": true }
         },
         {

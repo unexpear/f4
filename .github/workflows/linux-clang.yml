@@ -1,0 +1,49 @@
+name: Linux Clang
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@v4.3.3
+      - name: Install Clang and graphics test dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          clang glslang-tools libepoxy-dev libsdl2-dev libvulkan-dev
+          mesa-vulkan-drivers vulkan-validationlayers xauth xvfb
+      - name: Configure
+        run: cmake --preset linux-clang-debug
+      - name: Build
+        run: cmake --build --preset build-linux-clang-debug
+      - name: Determinism gate
+        run: ctest --preset test-linux-clang-determinism
+      - name: Full test suite
+        run: xvfb-run --auto-servernum ctest --preset test-linux-clang-debug
+      - name: Vulkan presentation smoke
+        run: >-
+          xvfb-run --auto-servernum
+          ./build/linux-clang-debug/src/f4_vulkan_app --smoke 3
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@v4.3.3
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install --yes clang
+      - name: Configure
+        run: cmake --preset linux-clang-asan
+      - name: Build
+        run: cmake --build --preset build-linux-clang-asan
+      - name: ASan and UBSan suite
+        run: ctest --preset test-linux-clang-asan

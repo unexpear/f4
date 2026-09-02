@@ -89,6 +89,19 @@ TEST_CASE("perspective RH zero-to-one depth") {
     CHECK(feq(ndcX, 0.5f));
 }
 
+TEST_CASE("forward-Z policy is monotonic from near zero to far one") {
+    CHECK_FALSE(kUsesReversedZ);
+    const Mat4 projection = Mat4::perspectiveRH_ZO(radians(65.0f), 1.7f, 0.25f, 400.0f);
+    const float nearDepth = projection.transformPoint(Vec3(0.0f, 0.0f, -0.25f)).z;
+    const float middleDepth = projection.transformPoint(Vec3(0.0f, 0.0f, -10.0f)).z;
+    const float farDepth = projection.transformPoint(Vec3(0.0f, 0.0f, -400.0f)).z;
+
+    CHECK(feq(nearDepth, 0.0f));
+    CHECK(nearDepth < middleDepth);
+    CHECK(middleDepth < farDepth);
+    CHECK(feq(farDepth, 1.0f));
+}
+
 TEST_CASE("ortho maps box corners to NDC cube") {
     const Mat4 o = Mat4::orthoRH_ZO(-1.0f, 1.0f, -1.0f, 1.0f, 0.5f, 2.0f);
     const Vec3 nearCorner = o.transformPoint(Vec3(1.0f, 1.0f, -0.5f));

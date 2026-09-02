@@ -1,30 +1,17 @@
-// demo_resize — a resizable window whose framebuffer, viewport and aspect
-// ratio all track the live drawable size. A perspective triangle shows the
-// aspect tracking; the HUD reports the current pixel size so resize is visible
-// in the metrics too.
-//
-// Controls: resize the window, or press Esc to close.
+#include "demos/demo_resize.h"
 
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
-
-#include <array>
 #include <cstring>
 
-#include "core/diagnostics/diagnostics.h"
 #include "core/math/mat4.h"
-#include "demos/demo_support.h"
 #include "graphics/command/command_buffer.h"
-#include "graphics/device/device.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
 
-using namespace f4;
-using namespace f4::gfx;
-using namespace f4::math;
+namespace f4::demo {
 
 namespace {
+
 constexpr float kTri[] = {
     0.0f, 0.0f, 0.0f, 1.0f, 0.3f, 0.3f,
     1.0f, 0.0f, 0.0f, 0.3f, 1.0f, 0.3f,
@@ -44,174 +31,104 @@ in vec3 vColor;
 out vec4 fragColor;
 void main() { fragColor = vec4(vColor, 1.0); }
 )glsl";
+
 } // namespace
 
-int main() {
-    // Note: resizable window, larger initial size.
-    demo::DemoWindow demo("demo_resize", 1000, 640, true);
-    if (!demo.ok()) {
-        return 1;
-    }
-    platform::Window* window = demo.window();
-    IDevice* dev = demo.device();
+bool ResizeScene::init(gfx::IDevice* dev, platform::Window* window) {
+    if (inited_) return true;
+    device_ = dev;
+    width_ = window->width();
+    height_ = window->height();
 
-    auto vb = dev->createBuffer(
-        []() {
-            BufferDesc d;
-            d.sizeBytes = sizeof(kTri);
-            d.usage = BufferUsage::Vertex;
-            return d;
-        }(),
-        std::span(reinterpret_cast<const std::byte*>(kTri), sizeof(kTri)));
-    if (!vb.hasValue()) {
-        return 1;
-    }
+    // Vertex buffer (interleaved pos+color, stride 24)
+    gfx::BufferDesc vbd;
+    vbd.sizeBytes = sizeof(kTri);
+    vbd.usage = gfx::BufferUsage::Vertex;
+    auto vb = dev->createBuffer(vbd, std::span(reinterpret_cast<const std::byte*>(kTri), sizeof(kTri)));
+    if (!vb.hasValue()) return false;
+    vbPos_ = vb.value();
 
-    BufferDesc ubd;
-    ubd.sizeBytes = sizeof(Mat4);
-    ubd.usage = BufferUsage::Uniform;
-    auto ubo = dev->createBuffer(ubd, {});
-    if (!ubo.hasValue()) {
-        return 1;
-    }
+    // Per-object constant ring (std140: mat4 = 64 bytes)
+    if (constRing_.create(*dev, 64, 16) != gfx::GfxError::None) return false;
 
-    auto makeShader = [&](ShaderStage stage, const char* src) {
-        ShaderDesc d;
+    // Shaders
+    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
+        gfx::ShaderDesc d;
         d.stage = stage;
         d.blob.resize(std::strlen(src));
         std::memcpy(d.blob.data(), src, d.blob.size());
         return dev->createShader(d);
     };
-    auto vs = makeShader(ShaderStage::Vertex, kVs);
-    auto fs = makeShader(ShaderStage::Fragment, kFs);
-    if (!vs.hasValue() || !fs.hasValue()) {
-        return 1;
-    }
-    PipelineStateDesc pd;
-    pd.vertexShader = vs.value();
-    pd.fragmentShader = fs.value();
-    pd.topology = PrimitiveTopology::TriangleList;
-    pd.raster.cullMode = CullMode::None;
+    auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
+    auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
+    if (!vs.hasValue() || !fs.hasValue()) return false;
+    vs_ = vs.value();
+    fs_ = fs.value();
+
+    // Pipeline
+    gfx::PipelineStateDesc pd;
+    pd.vertexShader = vs_;
+    pd.fragmentShader = fs_;
+    pd.topology = gfx::PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = gfx::CullMode::None;
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 0;
-        b.strideBytes = 24; // pos(12) + color(12)
+        b.strideBytes = 24;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute pa;
+        gfx::VertexInputLayout::VertexAttribute pa;
         pa.binding = 0;
         pa.location = 0;
-        pa.format = VertexFormat::Float32x3;
+        pa.format = gfx::VertexFormat::Float32x3;
         pa.offsetBytes = 0;
         pd.vertexInput.attributes.push(pa);
-        VertexInputLayout::VertexAttribute ca;
+        gfx::VertexInputLayout::VertexAttribute ca;
         ca.binding = 0;
         ca.location = 1;
-        ca.format = VertexFormat::Float32x3;
+        ca.format = gfx::VertexFormat::Float32x3;
         ca.offsetBytes = 12;
         pd.vertexInput.attributes.push(ca);
     }
-    auto pipeline = dev->createPipeline(pd);
-    if (!pipeline.hasValue()) {
-        return 1;
-    }
+    auto pipe = dev->createPipeline(pd);
+    if (!pipe.hasValue()) return false;
+    pipeline_ = pipe.value();
 
-    diag::Diagnostics diagnostics;
-    demo::Hud hud(dev);
-    if (!hud.init()) {
-        return 1;
-    }
-    diagnostics.setSampleSink(&demo::Hud::onSample, &hud);
-    const std::uint32_t idFps = diagnostics.metrics().declare({"fps", diag::MetricType::Double, "frame", "1/s"});
-    const std::uint32_t idW = diagnostics.metrics().declare({"width", diag::MetricType::UInt, "swapchain", "px"});
-    const std::uint32_t idH = diagnostics.metrics().declare({"height", diag::MetricType::UInt, "swapchain", "px"});
-
-    FramebufferHandle fb{};
-    std::uint32_t fbW = 0;
-    std::uint32_t fbH = 0;
-    Mat4 proj = Mat4::identity();
-    auto rebuild = [&]() -> bool {
-        const std::uint32_t w = window->width();
-        const std::uint32_t h = window->height();
-        if (w == 0 || h == 0) {
-            return false;
-        }
-        if (fb.index != 0) {
-            dev->destroyFramebuffer(fb);
-        }
-        FramebufferDesc fbd;
-        fbd.extent = {w, h};
-        AttachmentDesc color;
-        color.type = AttachmentType::Color;
-        color.clearOnLoad = true;
-        color.clear.color[2] = 0.06f;
-        fbd.attachments.push(color);
-        auto r = dev->createFramebuffer(fbd);
-        if (!r.hasValue()) {
-            return false;
-        }
-        fb = r.value();
-        fbW = w;
-        fbH = h;
-        proj = Mat4::perspectiveRH_ZO(0.9f, static_cast<float>(w) / static_cast<float>(h), 0.1f, 10.0f);
-        return true;
-    };
-    if (!rebuild()) {
-        return 1;
-    }
-
-    const Uint64 perfFreq = SDL_GetPerformanceFrequency();
-    Uint64 prev = SDL_GetPerformanceCounter();
-    double t = 0.0;
-    bool running = true;
-
-    // Spin angle.
-    float angle = 0.0f;
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-                running = false;
-            } else if (event.type == SDL_WINDOWEVENT &&
-                       (event.window.event == SDL_WINDOWEVENT_RESIZED ||
-                        event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
-                if (!rebuild()) {
-                    return 1;
-                }
-            }
-        }
-        const Uint64 now = SDL_GetPerformanceCounter();
-        const double dt = static_cast<double>(now - prev) / static_cast<double>(perfFreq);
-        prev = now;
-        t += dt;
-        angle += static_cast<float>(dt) * 1.2f;
-
-        diagnostics.metrics()[idFps].set(dt > 0.0 ? 1.0 / dt : 0.0);
-        diagnostics.metrics()[idW].set(static_cast<std::uint64_t>(fbW));
-        diagnostics.metrics()[idH].set(static_cast<std::uint64_t>(fbH));
-        diagnostics.update(t);
-
-        const Mat4 mvp = proj.mul(Mat4::rotationZ(angle)).mul(Mat4::translation({0.0f, 0.0f, -3.0f}));
-        dev->writeBuffer(ubo.value(), 0, std::span(reinterpret_cast<const std::byte*>(&mvp), sizeof(mvp)));
-
-        {
-            CommandBuffer cb;
-            cb.begin();
-            cb.beginRenderPass(fb);
-            cb.setViewport({fbW, fbH});
-            cb.bindPipeline(pipeline.value());
-            cb.bindResource(0, ubo.value().index, ubo.value().generation);
-            cb.bindVertexBuffer(0, vb.value(), 24);
-            cb.draw(3);
-            hud.render(cb, fbW, fbH);
-            cb.endRenderPass();
-            cb.end();
-            dev->submit(cb);
-        }
-        window->swap();
-    }
-
-    dev->waitIdle();
-    return 0;
+    inited_ = true;
+    return true;
 }
+
+void ResizeScene::shutdown(gfx::IDevice* dev) {
+    if (!inited_) return;
+    if (pipeline_.isValid()) dev->destroyPipeline(pipeline_);
+    if (fs_.isValid()) dev->destroyShader(fs_);
+    if (vs_.isValid()) dev->destroyShader(vs_);
+    if (vbPos_.isValid()) dev->destroyBuffer(vbPos_);
+    constRing_.destroy(*dev);
+    inited_ = false;
+}
+
+void ResizeScene::onResize(std::uint32_t width, std::uint32_t height) {
+    width_ = width;
+    height_ = height;
+}
+
+void ResizeScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {
+    // MVP is computed in render() since it needs the command buffer for writeAndBind
+}
+
+void ResizeScene::render(gfx::CommandBuffer& cb, const FreeCamera&, std::uint32_t, std::uint32_t) {
+    constRing_.beginFrame();
+    float aspect = height_ > 0 ? static_cast<float>(width_) / static_cast<float>(height_) : 1.f;
+    math::Mat4 proj = math::Mat4::perspectiveRH_ZO(1.04719758f, aspect, 0.1f, 100.f);
+    math::Mat4 view = math::Mat4::lookAtRH({0.f, 0.f, 3.f}, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f});
+    math::Mat4 mvp = proj.mul(view);
+    auto slot = constRing_.writeAndBind(*device_, cb, std::span(reinterpret_cast<const std::byte*>(&mvp), sizeof(mvp)));
+    if (slot.valid) {
+        cb.bindPipeline(pipeline_);
+        cb.bindVertexBuffer(0, vbPos_, 24);
+        cb.bindResource(0, gfx::BindingType::UniformBuffer, slot.handle.index, slot.handle.generation);
+        cb.draw(3);
+    }
+}
+
+} // namespace f4::demo

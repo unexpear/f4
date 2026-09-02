@@ -16,6 +16,12 @@ struct ComponentTag {};
 struct Counter {
     int value = 0;
 };
+struct LifetimeCounter {
+    explicit LifetimeCounter(int* counter) : destructionCount(counter) {}
+    ~LifetimeCounter() { ++*destructionCount; }
+
+    int* destructionCount;
+};
 using WidgetId = Handle<WidgetTag>;
 using ComponentId = Handle<ComponentTag>;
 using WidgetArena = GenerationalArena<Counter, WidgetTag>;
@@ -139,4 +145,16 @@ TEST_CASE("generational arena clear kills every outstanding handle") {
     CHECK(staleAfterClear);
     CHECK(arena.liveCount() == 1);
     CHECK(fresh.isValid());
+}
+
+TEST_CASE("generational arena destroys live payloads on teardown") {
+    int destructionCount = 0;
+    {
+        GenerationalArena<LifetimeCounter, ComponentTag> arena(2);
+        const auto released = arena.acquire(&destructionCount);
+        (void)arena.acquire(&destructionCount);
+        arena.release(released);
+        CHECK(destructionCount == 1);
+    }
+    CHECK(destructionCount == 2);
 }

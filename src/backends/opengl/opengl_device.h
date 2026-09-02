@@ -15,7 +15,6 @@ namespace f4::gfx {
 // test) keeps it current and calls present() after submit.
 class OpenGLDevice final : public IDevice {
 public:
-    OpenGLDevice();
     ~OpenGLDevice() override;
 
     OpenGLDevice(const OpenGLDevice&) = delete;
@@ -62,6 +61,10 @@ public:
     auto resetFrameStats() -> void override;
 
 private:
+    friend auto createOpenGLDevice() -> IDevice*;
+
+    OpenGLDevice();
+
     struct Impl;
     Impl* impl_;
     const char* renderer_ = nullptr;

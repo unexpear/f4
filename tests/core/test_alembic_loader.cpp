@@ -35,6 +35,11 @@ using namespace Alembic::AbcGeom;
 
 namespace {
 
+struct ScopedFileRemove {
+    const char* path;
+    ~ScopedFileRemove() { std::remove(path); }
+};
+
 // A unit cube as an OPolyMesh: 8 vertices, 6 quad faces. Writes a frozen .abc
 // to `path`, which we then read back as bytes to exercise the memory loader.
 void makeCubeArchive(const char* path) {
@@ -101,8 +106,10 @@ TEST_CASE("Alembic: garbage input rejected") {
 }
 
 TEST_CASE("Alembic: cube loads a mesh from memory") {
-    makeCubeArchive("f4_alembic_test_cube.abc");
-    auto data = loadBytes("f4_alembic_test_cube.abc");
+    constexpr const char* archivePath = "f4_alembic_test_cube_mesh.abc";
+    const ScopedFileRemove cleanup{archivePath};
+    makeCubeArchive(archivePath);
+    auto data = loadBytes(archivePath);
     REQUIRE(data.size() > 0);
 
     auto result = loadAlembic(data);
@@ -135,8 +142,10 @@ TEST_CASE("Alembic: cube loads a mesh from memory") {
 }
 
 TEST_CASE("Alembic: cube has a position attribute stream") {
-    makeCubeArchive("f4_alembic_test_cube.abc");
-    auto data = loadBytes("f4_alembic_test_cube.abc");
+    constexpr const char* archivePath = "f4_alembic_test_cube_attributes.abc";
+    const ScopedFileRemove cleanup{archivePath};
+    makeCubeArchive(archivePath);
+    auto data = loadBytes(archivePath);
 
     auto result = loadAlembic(data);
     REQUIRE(result.hasValue());

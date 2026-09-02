@@ -8,6 +8,7 @@
 #include "core/memory/serialization.h"
 #include "core/resources/asset_file.h"
 #include "core/resources/file_io.h"
+#include "core/resources/load_error.h"
 #include "core/resources/resource_cache.h"
 
 using namespace f4;
@@ -124,6 +125,40 @@ TEST_CASE("path registration is exclusive and follows destroy") {
     const auto reReg = cache.createNamed<resources::ShaderTag>("shaders/basic.vert");
     CHECK(reReg.isValid());
     CHECK(reReg != first);
+}
+
+TEST_CASE("getOrLoad caches successes and preserves loader errors") {
+    resources::ResourceCache cache;
+    int loadCalls = 0;
+
+    const auto first = cache.getOrLoad<resources::MeshTag>(
+        "meshes/generated.mesh", [&]() -> Result<Mesh, resources::LoadError> {
+            ++loadCalls;
+            return quadMesh();
+        });
+    REQUIRE(first.hasValue());
+    CHECK(loadCalls == 1);
+    CHECK(cache.contains(first.value()));
+
+    const auto second = cache.getOrLoad<resources::MeshTag>(
+        "meshes/generated.mesh", [&]() -> Result<Mesh, resources::LoadError> {
+            ++loadCalls;
+            return resources::LoadError::BadSignature;
+        });
+    REQUIRE(second.hasValue());
+    CHECK(second.value() == first.value());
+    CHECK(loadCalls == 1);
+
+    const auto failed = cache.getOrLoad<resources::MeshTag>(
+        "meshes/broken.mesh", [&]() -> Result<Mesh, resources::LoadError> {
+            ++loadCalls;
+            return resources::LoadError::BadSignature;
+        });
+    REQUIRE(failed.hasError());
+    CHECK(failed.error() == resources::LoadError::BadSignature);
+    CHECK(loadCalls == 2);
+    CHECK(!cache.find<resources::MeshTag>("meshes/broken.mesh").isValid());
+    CHECK(cache.liveCount<resources::MeshTag>() == 1u);
 }
 
 TEST_CASE("clear empties every family and bumps generations") {

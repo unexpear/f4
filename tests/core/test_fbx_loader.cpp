@@ -9,7 +9,8 @@
 
 using namespace f4::resources;
 
-static const char* kCubeFbx = "build/debug/_deps/ufbx-src/data/blender_272_cube_7400_binary.fbx";
+static const char* kCubeFbx =
+    F4_UFBX_TEST_DATA_DIR "/blender_272_cube_7400_binary.fbx";
 
 static std::vector<std::byte> loadTestFbx() {
     FILE* f = nullptr;

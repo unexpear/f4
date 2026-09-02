@@ -16,6 +16,7 @@
 #include "core/resources/resource_ids.h"
 #include "core/resources/shader.h"
 #include "core/resources/texture.h"
+#include "core/result.h"
 
 namespace f4::resources {
 
@@ -69,7 +70,7 @@ public:
     }
 
     // Creates AND registers a canonical path. Returns a null handle if the
-    // path is already taken - callers decide whether that means get_or_load.
+    // path is already taken - callers decide whether that means getOrLoad.
     template <typename Tag, typename... Args>
     auto createNamed(StringView path, Args&&... args) -> Handle<Tag> {
         ResourceFamily<Tag>& f = family<Tag>();
@@ -83,6 +84,33 @@ public:
         const bool insertedReverse = f.pathOf.insert(handleKey(handle), static_cast<String&&>(owned));
         F4_ASSERT(insertedPath && insertedReverse, "path bookkeeping invariant broken");
         return handle;
+    }
+
+    // Returns the existing named resource, or invokes loader once and stores
+    // its successful value. Loader errors pass through without mutating the
+    // cache. The loader must return Result<ResourceTrait<Tag>::type, E>.
+    template <typename Tag, typename Loader>
+    auto getOrLoad(StringView path, Loader&& loader)
+        -> Result<Handle<Tag>, decltype(std::declval<Loader&&>()().error())> {
+        const String ownedPath(path);
+        if (const Handle<Tag> existing = find<Tag>(ownedPath.view()); existing.isValid()) {
+            return existing;
+        }
+
+        auto loaded = static_cast<Loader&&>(loader)();
+        if (loaded.hasError()) {
+            return loaded.error();
+        }
+
+        const Handle<Tag> created = createNamed<Tag>(
+            ownedPath.view(), static_cast<typename ResourceTrait<Tag>::type&&>(loaded.value()));
+        if (created.isValid()) {
+            return created;
+        }
+
+        const Handle<Tag> existing = find<Tag>(ownedPath.view());
+        F4_ASSERT(existing.isValid(), "resource path bookkeeping invariant broken");
+        return existing;
     }
 
     template <typename Tag>

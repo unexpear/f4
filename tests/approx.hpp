@@ -95,7 +95,7 @@ using f4::math::Tolerance;
 #define F4_CHECK_NEAR(actual, expected, ...)                                             \
     do {                                                                                 \
         INFO("actual=" << (actual) << "\n\texpected=" << (expected));                    \
-        CHECK(f4::math::within((actual), (expected), ##__VA_ARGS__));                    \
+        CHECK(f4::math::within((actual), (expected) __VA_OPT__(,) __VA_ARGS__));         \
     } while (false)
 
 } // namespace f4test

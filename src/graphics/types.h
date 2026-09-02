@@ -82,6 +82,10 @@ enum class TextureFilter : std::uint8_t {
     MinNearestMagLinear,
 };
 
+// Mip filtering is independent from the minification/magnification filter.
+// None preserves the original level-zero-only sampling behavior.
+enum class MipFilter : std::uint8_t { None, Nearest, Linear };
+
 enum class BlendFactor : std::uint8_t {
     Zero,
     One,
@@ -99,6 +103,57 @@ struct ColorWriteMask {
     static constexpr std::uint32_t B = 1u << 2;
     static constexpr std::uint32_t A = 1u << 3;
     static constexpr std::uint32_t All = R | G | B | A;
+};
+
+// Backend-neutral synchronization vocabulary. Values are flags rather than
+// native API constants; explicit backends translate them at command replay.
+struct PipelineStageMask {
+    static constexpr std::uint32_t None = 0;
+    static constexpr std::uint32_t VertexInput = 1u << 0;
+    static constexpr std::uint32_t VertexShader = 1u << 1;
+    static constexpr std::uint32_t FragmentShader = 1u << 2;
+    static constexpr std::uint32_t ColorAttachment = 1u << 3;
+    static constexpr std::uint32_t DepthStencil = 1u << 4;
+    static constexpr std::uint32_t Transfer = 1u << 5;
+    static constexpr std::uint32_t Host = 1u << 6;
+    static constexpr std::uint32_t AllGraphics = 1u << 7;
+    static constexpr std::uint32_t AllCommands = 1u << 8;
+};
+
+struct ResourceAccessMask {
+    static constexpr std::uint32_t None = 0;
+    static constexpr std::uint32_t VertexRead = 1u << 0;
+    static constexpr std::uint32_t IndexRead = 1u << 1;
+    static constexpr std::uint32_t UniformRead = 1u << 2;
+    static constexpr std::uint32_t ShaderRead = 1u << 3;
+    static constexpr std::uint32_t ShaderWrite = 1u << 4;
+    static constexpr std::uint32_t ColorRead = 1u << 5;
+    static constexpr std::uint32_t ColorWrite = 1u << 6;
+    static constexpr std::uint32_t DepthRead = 1u << 7;
+    static constexpr std::uint32_t DepthWrite = 1u << 8;
+    static constexpr std::uint32_t TransferRead = 1u << 9;
+    static constexpr std::uint32_t TransferWrite = 1u << 10;
+    static constexpr std::uint32_t HostRead = 1u << 11;
+    static constexpr std::uint32_t HostWrite = 1u << 12;
+};
+
+enum class TextureLayout : std::uint8_t {
+    Undefined,
+    General,
+    ShaderRead,
+    ColorAttachment,
+    DepthStencilAttachment,
+    TransferSource,
+    TransferDestination,
+    Present,
+};
+
+struct ResourceState {
+    std::uint32_t stages = PipelineStageMask::None;
+    std::uint32_t access = ResourceAccessMask::None;
+    TextureLayout layout = TextureLayout::Undefined;
+
+    friend constexpr auto operator==(const ResourceState&, const ResourceState&) -> bool = default;
 };
 
 // Clear color / depth for render-pass attachment clears.

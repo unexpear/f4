@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -197,6 +198,13 @@ TEST_CASE("OpenGL backend: real GL version is desktop 4.3+ core") {
     const int got = (h.major << 8) | h.minor;
     constexpr int kMin430 = (4 << 8) | 3;
     CHECK(got >= kMin430);
+
+    GLint clipOrigin = 0;
+    GLint clipDepthMode = 0;
+    glGetIntegerv(GL_CLIP_ORIGIN, &clipOrigin);
+    glGetIntegerv(GL_CLIP_DEPTH_MODE, &clipDepthMode);
+    CHECK(clipOrigin == GL_LOWER_LEFT);
+    CHECK(clipDepthMode == GL_ZERO_TO_ONE);
 }
 
 TEST_CASE("OpenGL backend: default framebuffer uses FBO 0") {
@@ -399,6 +407,101 @@ TEST_CASE("OpenGL backend: consecutive same-pipeline binds render correctly") {
     CHECK(center2[0] > 0.7f);
     // Values should be identical (same rendering).
     CHECK(center1[0] == doctest::Approx(center2[0]));
+}
+
+TEST_CASE("OpenGL backend: pipeline creation invalidates cached VAO binding") {
+    TriangleHarness h;
+    h.render();
+
+    PipelineStateDesc desc;
+    desc.vertexShader = h.vs;
+    desc.fragmentShader = h.fs;
+    desc.vertexInput.bindings.push({0, sizeof(float) * 3, 0});
+    desc.vertexInput.attributes.push({0, 0, VertexFormat::Float32x3, 0});
+    auto extraPipeline = h.dev->createPipeline(desc);
+    REQUIRE(extraPipeline.hasValue());
+
+    // createPipeline builds a VAO and leaves VAO 0 bound. The cached original
+    // pipeline must still restore its VAO on the next submit.
+    h.render();
+    std::array<float, 3> center{};
+    glReadPixels(h.kWidth / 2, h.kHeight / 2, 1, 1, GL_RGB, GL_FLOAT, center.data());
+    CHECK(center[0] > 0.7f);
+    CHECK(center[1] < 0.7f);
+    CHECK(glGetError() == GL_NO_ERROR);
+}
+
+TEST_CASE("OpenGL backend: depth clear survives a previous depth-write-disabled pipeline") {
+    TriangleHarness h;
+
+    FramebufferDesc fbd;
+    fbd.extent = {h.kWidth, h.kHeight};
+    AttachmentDesc color;
+    color.type = AttachmentType::Color;
+    color.clearOnLoad = true;
+    color.clear.color[0] = 0.1f;
+    color.clear.color[1] = 0.1f;
+    color.clear.color[2] = 0.2f;
+    fbd.attachments.push(color);
+    AttachmentDesc depth;
+    depth.type = AttachmentType::Depth;
+    depth.clearOnLoad = true;
+    depth.clear.depth = 1.0f;
+    fbd.attachments.push(depth);
+    auto fb = h.dev->createFramebuffer(fbd);
+    REQUIRE(fb.hasValue());
+
+    PipelineStateDesc pd;
+    pd.vertexShader = h.vs;
+    pd.fragmentShader = h.fs;
+    pd.topology = PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = CullMode::None;
+    pd.depthStencil.depthTestEnable = true;
+    pd.depthStencil.depthWriteEnable = true;
+    pd.depthStencil.depthCompare = CompareOp::Less;
+    pd.vertexInput.bindings.push({0, sizeof(float) * 3, 0});
+    pd.vertexInput.attributes.push({0, 0, VertexFormat::Float32x3, 0});
+    auto depthPipeline = h.dev->createPipeline(pd);
+    REQUIRE(depthPipeline.hasValue());
+
+    struct Vertex { float x, y, z; };
+    constexpr std::array<Vertex, 3> farTriangle = {{
+        {0.0f, 0.6f, 0.5f}, {-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f},
+    }};
+    BufferDesc vbd;
+    vbd.sizeBytes = farTriangle.size() * sizeof(Vertex);
+    vbd.usage = BufferUsage::Vertex;
+    auto farVb = h.dev->createBuffer(
+        vbd, std::as_bytes(std::span(farTriangle)));
+    REQUIRE(farVb.hasValue());
+
+    CommandBuffer first;
+    first.begin();
+    first.beginRenderPass(fb.value());
+    first.bindPipeline(depthPipeline.value());
+    first.bindVertexBuffer(0, h.vb, sizeof(Vertex));
+    first.draw(3);
+    // Leave the persistent driver state with depth writes disabled.
+    first.bindPipeline(h.pipeline);
+    first.endRenderPass();
+    first.end();
+    REQUIRE(h.dev->submit(first) == GfxError::None);
+
+    CommandBuffer second;
+    second.begin();
+    second.beginRenderPass(fb.value());
+    second.bindPipeline(depthPipeline.value());
+    second.bindVertexBuffer(0, farVb.value(), sizeof(Vertex));
+    second.draw(3);
+    second.endRenderPass();
+    second.end();
+    REQUIRE(h.dev->submit(second) == GfxError::None);
+    glFinish();
+
+    std::array<float, 3> center{};
+    glReadPixels(h.kWidth / 2, h.kHeight / 2, 1, 1, GL_RGB, GL_FLOAT, center.data());
+    CHECK(center[0] > 0.7f);
+    CHECK(center[1] < 0.7f);
 }
 
 TEST_CASE("OpenGL backend: different pipeline cull mode changes rendering") {
@@ -708,6 +811,64 @@ TEST_CASE("OpenGL backend: setViewport restricts rendering to the viewport regio
     CHECK(farRight[0] < 0.3f);
 }
 
+TEST_CASE("OpenGL backend: setScissor clips draws and does not leak into the next pass") {
+    TriangleHarness h;
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.setScissor({TriangleHarness::kWidth / 2, TriangleHarness::kHeight});
+    cb.bindPipeline(h.pipeline);
+    cb.bindVertexBuffer(0, h.vb, sizeof(float) * 3);
+    cb.draw(3);
+    cb.endRenderPass();
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+    glFinish();
+    CHECK(glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE);
+
+    std::array<float, 3> left{};
+    std::array<float, 3> right{};
+    glReadPixels(100, 100, 1, 1, GL_RGB, GL_FLOAT, left.data());
+    glReadPixels(156, 100, 1, 1, GL_RGB, GL_FLOAT, right.data());
+    CHECK(left[0] > 0.7f);
+    CHECK(right[0] < 0.3f);
+
+    h.render();
+    CHECK(glIsEnabled(GL_SCISSOR_TEST) == GL_FALSE);
+    glReadPixels(156, 100, 1, 1, GL_RGB, GL_FLOAT, right.data());
+    CHECK(right[0] > 0.7f);
+}
+
+TEST_CASE("OpenGL backend: pipeline toggles depth clamp") {
+    TriangleHarness h;
+    PipelineStateDesc desc;
+    desc.vertexShader = h.vs;
+    desc.fragmentShader = h.fs;
+    desc.raster.depthClampEnable = true;
+    desc.vertexInput.bindings.push({0, sizeof(float) * 3, 0});
+    desc.vertexInput.attributes.push({0, 0, VertexFormat::Float32x3, 0});
+    auto depthClampPipeline = h.dev->createPipeline(desc);
+    REQUIRE(depthClampPipeline.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.bindPipeline(depthClampPipeline.value());
+    cb.endRenderPass();
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+    CHECK(glIsEnabled(GL_DEPTH_CLAMP) == GL_TRUE);
+
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.bindPipeline(h.pipeline);
+    cb.endRenderPass();
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+    CHECK(glIsEnabled(GL_DEPTH_CLAMP) == GL_FALSE);
+}
+
 TEST_CASE("OpenGL backend: stats accumulate draw/instance/primitive counts") {
     TriangleHarness h;
     h.dev->resetFrameStats();
@@ -841,6 +1002,238 @@ TEST_CASE("OpenGL backend: writeTexture uploads with footprint validation") {
     dev->waitIdle();
     deleteDevice(dev);
     delete window;
+}
+
+TEST_CASE("OpenGL backend: allocates and accepts every declared mip level") {
+    auto w = platform::Window::create({"mip upload", 64, 64, false});
+    REQUIRE(w.hasValue());
+    platform::Window* window = w.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    IDevice* dev = createOpenGLDevice();
+    REQUIRE(dev != nullptr);
+
+    TextureDesc td;
+    td.width = 8;
+    td.height = 4;
+    td.format = TextureFormat::RGBA8_UNORM;
+    td.mipLevels = 4;
+    auto tex = dev->createTexture(td);
+    REQUIRE(tex.hasValue());
+
+    std::array<std::byte, 8u * 4u * 4u> level0{};
+    std::array<std::byte, 4u * 2u * 4u> level1{};
+    std::array<std::byte, 2u * 1u * 4u> level2{};
+    std::array<std::byte, 1u * 1u * 4u> level3{};
+    CHECK(dev->writeTexture(tex.value(), 0, level0) == GfxError::None);
+    CHECK(dev->writeTexture(tex.value(), 1, level1) == GfxError::None);
+    CHECK(dev->writeTexture(tex.value(), 2, level2) == GfxError::None);
+    CHECK(dev->writeTexture(tex.value(), 3, level3) == GfxError::None);
+    CHECK(glGetError() == GL_NO_ERROR);
+
+    TextureDesc partialDesc;
+    partialDesc.width = 8;
+    partialDesc.height = 8;
+    partialDesc.format = TextureFormat::RGBA8_UNORM;
+    partialDesc.mipLevels = 2;
+    auto partial = dev->createTexture(partialDesc);
+    REQUIRE(partial.hasValue());
+    std::array<std::byte, 8u * 8u * 4u> partialLevel0{};
+    REQUIRE(dev->writeTexture(partial.value(), 0, partialLevel0) == GfxError::None);
+    GLint maxLevel = -1;
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxLevel);
+    CHECK(maxLevel == 1);
+
+    TextureDesc invalid = td;
+    invalid.mipLevels = 5;
+    const auto tooMany = dev->createTexture(invalid);
+    REQUIRE(tooMany.hasError());
+    CHECK(tooMany.error() == GfxError::BadDescriptor);
+
+    dev->waitIdle();
+    deleteDevice(dev);
+    delete window;
+}
+
+TEST_CASE("OpenGL backend: sampler applies mip filter and address modes") {
+    TriangleHarness h;
+    SamplerDesc desc;
+    desc.filter = TextureFilter::MinMagLinear;
+    desc.mipFilter = MipFilter::Linear;
+    desc.addressU = AddressMode::Repeat;
+    desc.addressV = AddressMode::MirroredRepeat;
+    auto sampler = h.dev->createSampler(desc);
+    REQUIRE(sampler.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.bindResource(0, BindingType::Sampler, sampler.value().index,
+                    sampler.value().generation);
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+
+    glActiveTexture(GL_TEXTURE0);
+    GLint samplerId = 0;
+    glGetIntegerv(GL_SAMPLER_BINDING, &samplerId);
+    REQUIRE(samplerId != 0);
+    GLint value = 0;
+    glGetSamplerParameteriv(static_cast<GLuint>(samplerId), GL_TEXTURE_MIN_FILTER, &value);
+    CHECK(value == GL_LINEAR_MIPMAP_LINEAR);
+    glGetSamplerParameteriv(static_cast<GLuint>(samplerId), GL_TEXTURE_WRAP_S, &value);
+    CHECK(value == GL_REPEAT);
+    glGetSamplerParameteriv(static_cast<GLuint>(samplerId), GL_TEXTURE_WRAP_T, &value);
+    CHECK(value == GL_MIRRORED_REPEAT);
+}
+
+TEST_CASE("OpenGL backend: pipeline applies separate alpha blend and color mask state") {
+    TriangleHarness h;
+    PipelineStateDesc desc;
+    desc.vertexShader = h.vs;
+    desc.fragmentShader = h.fs;
+    desc.vertexInput.bindings.push({0, sizeof(float) * 3, 0});
+    desc.vertexInput.attributes.push({0, 0, VertexFormat::Float32x3, 0});
+    ColorAttachmentState color;
+    color.blendEnable = true;
+    color.srcColor = BlendFactor::SrcAlpha;
+    color.dstColor = BlendFactor::OneMinusSrcAlpha;
+    color.colorOp = BlendOp::RevSub;
+    color.srcAlpha = BlendFactor::One;
+    color.dstAlpha = BlendFactor::Zero;
+    color.alphaOp = BlendOp::Max;
+    color.writeMask = ColorWriteMask::R | ColorWriteMask::A;
+    desc.colorAttachments.push(color);
+    ColorAttachmentState secondColor;
+    secondColor.blendEnable = true;
+    secondColor.srcColor = BlendFactor::One;
+    secondColor.dstColor = BlendFactor::One;
+    secondColor.colorOp = BlendOp::Add;
+    secondColor.srcAlpha = BlendFactor::SrcAlpha;
+    secondColor.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+    secondColor.alphaOp = BlendOp::Sub;
+    secondColor.writeMask = ColorWriteMask::G | ColorWriteMask::B;
+    desc.colorAttachments.push(secondColor);
+    auto pipeline = h.dev->createPipeline(desc);
+    REQUIRE(pipeline.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.bindPipeline(pipeline.value());
+    cb.endRenderPass();
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+
+    CHECK(glIsEnabled(GL_BLEND) == GL_TRUE);
+    GLint value = 0;
+    glGetIntegerv(GL_BLEND_SRC_RGB, &value);
+    CHECK(value == GL_SRC_ALPHA);
+    glGetIntegerv(GL_BLEND_DST_RGB, &value);
+    CHECK(value == GL_ONE_MINUS_SRC_ALPHA);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &value);
+    CHECK(value == GL_ONE);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &value);
+    CHECK(value == GL_ZERO);
+    glGetIntegerv(GL_BLEND_EQUATION_RGB, &value);
+    CHECK(value == GL_FUNC_REVERSE_SUBTRACT);
+    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &value);
+    CHECK(value == GL_MAX);
+    std::array<GLboolean, 4> mask{};
+    glGetBooleanv(GL_COLOR_WRITEMASK, mask.data());
+    CHECK(mask[0] == GL_TRUE);
+    CHECK(mask[1] == GL_FALSE);
+    CHECK(mask[2] == GL_FALSE);
+    CHECK(mask[3] == GL_TRUE);
+
+    CHECK(glIsEnabledi(GL_BLEND, 1) == GL_TRUE);
+    glGetIntegeri_v(GL_BLEND_SRC_RGB, 1, &value);
+    CHECK(value == GL_ONE);
+    glGetIntegeri_v(GL_BLEND_DST_RGB, 1, &value);
+    CHECK(value == GL_ONE);
+    glGetIntegeri_v(GL_BLEND_SRC_ALPHA, 1, &value);
+    CHECK(value == GL_SRC_ALPHA);
+    glGetIntegeri_v(GL_BLEND_DST_ALPHA, 1, &value);
+    CHECK(value == GL_ONE_MINUS_SRC_ALPHA);
+    glGetIntegeri_v(GL_BLEND_EQUATION_ALPHA, 1, &value);
+    CHECK(value == GL_FUNC_SUBTRACT);
+    glGetBooleani_v(GL_COLOR_WRITEMASK, 1, mask.data());
+    CHECK(mask[0] == GL_FALSE);
+    CHECK(mask[1] == GL_TRUE);
+    CHECK(mask[2] == GL_TRUE);
+    CHECK(mask[3] == GL_FALSE);
+
+    cb.begin();
+    cb.beginRenderPass(h.fb);
+    cb.bindPipeline(h.pipeline);
+    cb.endRenderPass();
+    cb.end();
+    REQUIRE(h.dev->submit(cb) == GfxError::None);
+    CHECK(glIsEnabledi(GL_BLEND, 1) == GL_FALSE);
+    glGetBooleani_v(GL_COLOR_WRITEMASK, 1, mask.data());
+    CHECK(mask[0] == GL_TRUE);
+    CHECK(mask[1] == GL_TRUE);
+    CHECK(mask[2] == GL_TRUE);
+    CHECK(mask[3] == GL_TRUE);
+}
+
+TEST_CASE("OpenGL backend: rejects attachment and pipeline layout limits") {
+    TriangleHarness h;
+    GLint maxDrawBuffers = 0;
+    GLint maxColorAttachments = 0;
+    glGetIntegerv(GL_MAX_DRAW_BUFFERS, &maxDrawBuffers);
+    glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maxColorAttachments);
+    const GLint colorLimit = std::min(maxDrawBuffers, maxColorAttachments);
+
+    FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {16, 16};
+    for (GLint i = 0; i <= colorLimit; ++i) {
+        framebufferDesc.attachments.push(AttachmentDesc{});
+    }
+    CHECK(h.dev->createFramebuffer(framebufferDesc).error() == GfxError::BadDescriptor);
+
+    PipelineStateDesc desc;
+    desc.vertexShader = h.vs;
+    desc.fragmentShader = h.fs;
+    for (GLint i = 0; i <= maxDrawBuffers; ++i) {
+        desc.colorAttachments.push(ColorAttachmentState{});
+    }
+    CHECK(h.dev->createPipeline(desc).error() == GfxError::BadDescriptor);
+
+    desc.colorAttachments.clear();
+    BindGroup group;
+    BindingSlot arrayBinding;
+    arrayBinding.count = 2;
+    group.slots.push(arrayBinding);
+    desc.layout.groups.push(group);
+    CHECK(h.dev->createPipeline(desc).error() == GfxError::BadDescriptor);
+
+    desc.layout.groups[0].slots[0].count = 1;
+    desc.layout.groups[0].bindPoint = 1;
+    CHECK(h.dev->createPipeline(desc).error() == GfxError::BadDescriptor);
+
+    desc.layout.groups[0].bindPoint = 0;
+    auto pipeline = h.dev->createPipeline(desc);
+    REQUIRE(pipeline.hasValue());
+
+    BufferDesc uniformDesc;
+    uniformDesc.sizeBytes = 16;
+    uniformDesc.usage = BufferUsage::Uniform;
+    auto uniform = h.dev->createBuffer(uniformDesc, {});
+    REQUIRE(uniform.hasValue());
+
+    CommandBuffer cb;
+    cb.begin();
+    cb.bindPipeline(pipeline.value());
+    cb.bindResource(1, BindingType::UniformBuffer, uniform.value().index,
+                    uniform.value().generation);
+    cb.end();
+    CHECK(h.dev->submit(cb) == GfxError::BadDescriptor);
+
+    cb.begin();
+    cb.bindPipeline(pipeline.value());
+    cb.bindResource(0, BindingType::UniformBuffer, h.vb.index, h.vb.generation);
+    cb.end();
+    CHECK(h.dev->submit(cb) == GfxError::BadDescriptor);
+    CHECK(h.dev->destroyBuffer(uniform.value()) == GfxError::None);
 }
 
 #endif // F4_GRAPHICS_HAS_OPENGL

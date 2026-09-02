@@ -28,6 +28,7 @@ struct Tolerance {
 inline constexpr Tolerance kTightTolerance{1e-7f, 1e-6f};
 inline constexpr Tolerance kDefaultTolerance{1e-6f, 1e-5f};
 inline constexpr Tolerance kLooseTolerance{1e-4f, 1e-3f};
+inline constexpr Tolerance kParityTolerance{1e-5f, 1e-4f};
 
 [[nodiscard]] inline auto within(float a, float b, const Tolerance& t = kDefaultTolerance) -> bool {
     if (a == b) {

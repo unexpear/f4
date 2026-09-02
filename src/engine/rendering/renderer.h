@@ -9,6 +9,7 @@
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
 #include "engine/rendering/render_queue.h"
+#include "engine/rendering/shader_constants.h"
 #include "graphics/device/device.h"
 #include "graphics/render_graph/render_graph.h"
 
@@ -30,8 +31,8 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    // Must be called once after construction; creates UBO, white texture/sampler,
-    // and default framebuffer-sized graph resources lazily. Returns error on failure.
+    // Must be called once after construction; creates per-draw constant buffers
+    // and the fallback white texture/sampler. Returns error on failure.
     [[nodiscard]] auto init() -> gfx::GfxError;
 
     // Logical mesh creation — stores a copy of the mesh and creates its GpuMesh
@@ -72,9 +73,9 @@ private:
     RenderQueue queue_;
     FrameStats stats_{};
 
-    // Per-frame UBO for viewProj/model/tint (std140: mat4 viewProj + mat4 model + vec4 tint = 144 bytes)
-    gfx::BufferHandle sceneUbo_{};
-    gfx::BufferHandle modelUbo_{}; // unused — kept for future
+    // One UBO per queued draw prevents deferred command replay from observing
+    // only the final model/tint upload.
+    ConstantRing sceneConstants_;
     gfx::TextureHandle whiteTex_{};
     gfx::SamplerHandle whiteSmp_{};
 

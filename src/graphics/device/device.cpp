@@ -1,6 +1,9 @@
 #include "graphics/device/device.h"
 
 #include "core/assert.h"
+#if defined(F4_GRAPHICS_BACKEND_vulkan)
+#include "backends/vulkan/vulkan_device.h"
+#endif
 
 namespace f4::gfx {
 
@@ -11,6 +14,8 @@ auto createDevice() -> IDevice* {
 #elif defined(F4_GRAPHICS_BACKEND_opengl)
     extern auto createOpenGLDevice() -> IDevice*;
     return createOpenGLDevice();
+#elif defined(F4_GRAPHICS_BACKEND_vulkan)
+    return createVulkanDevice();
 #else
     // No backend selected in this build; nothing to instantiate.
     F4_VERIFY(false, "F4_GRAPHICS_BACKEND does not resolve to a compiled backend");

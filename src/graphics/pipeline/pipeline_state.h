@@ -32,6 +32,13 @@ enum class BindingType : std::uint8_t {
     StorageBuffer,
 };
 
+// Backends with one descriptor-binding namespace use this stable flattening of
+// the RHI's per-type slot namespaces. Shader build rules use the same mapping.
+[[nodiscard]] constexpr auto bindingIndex(BindingType type, std::uint32_t slot)
+    -> std::uint32_t {
+    return slot * 4u + static_cast<std::uint32_t>(type);
+}
+
 struct BindingSlot {
     std::uint32_t slot = 0;
     BindingType type = BindingType::UniformBuffer;
@@ -94,6 +101,7 @@ struct DepthStencilState {
     bool depthTestEnable = false;
     bool depthWriteEnable = false;
     CompareOp depthCompare = CompareOp::Less;
+    TextureFormat format = TextureFormat::Depth32F;
 };
 
 struct RasterState {
@@ -110,6 +118,7 @@ struct ColorAttachmentState {
     BlendFactor dstAlpha = BlendFactor::Zero;
     BlendOp alphaOp = BlendOp::Add;
     std::uint32_t writeMask = ColorWriteMask::All;
+    TextureFormat format = TextureFormat::RGBA8_UNORM;
 };
 
 struct PipelineStateDesc {

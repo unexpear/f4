@@ -1,32 +1,18 @@
-// demo_collision — simple 2D collision in NDC: colored squares bounce off the
-// screen edges and off one another. Demonstrates simulation-owned state
-// (position/velocity is owned by this demo's physics, not the registry) with
-// diagnostics observing via telemetry metrics, plus a couple of String metrics
-// to show the registry's generic type coverage.
-//
-// Controls: Esc closes the window.
+#include "demos/demo_collision.h"
 
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
-
-#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
-#include "core/diagnostics/diagnostics.h"
-#include "demos/demo_support.h"
 #include "graphics/command/command_buffer.h"
-#include "graphics/device/device.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
 
-using namespace f4;
-using namespace f4::gfx;
+namespace f4::demo {
 
 namespace {
-constexpr int kBodies = 8;
+
 constexpr float kQuad[] = {
     -0.5f, -0.5f, 0.0f,
     0.5f, -0.5f, 0.0f,
@@ -35,22 +21,10 @@ constexpr float kQuad[] = {
 };
 constexpr std::uint16_t kIndices[] = {0, 1, 2, 2, 1, 3};
 
-struct Instance {
-    float x, y, size; // center + half-extent
-    float r, g, b;    // color
-};
-static_assert(sizeof(Instance) == 24);
-
-struct Body {
-    float x, y, vx, vy;
-    float r, g, b;
-    float size;
-};
-
 constexpr const char* kVs = R"glsl(
 #version 430 core
-layout(location = 0) in vec3 aPos;      // unit quad, -0.5..0.5
-layout(location = 1) in vec3 aCenter;   // center (xy) + size (z)
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aCenter;
 layout(location = 2) in vec3 aColor;
 out vec3 vColor;
 void main() {
@@ -65,226 +39,191 @@ in vec3 vColor;
 out vec4 fragColor;
 void main() { fragColor = vec4(vColor, 1.0); }
 )glsl";
+
 } // namespace
 
-int main() {
-    demo::DemoWindow demo("demo_collision");
-    if (!demo.ok()) {
-        return 1;
-    }
-    platform::Window* window = demo.window();
-    IDevice* dev = demo.device();
-    const std::uint32_t width = demo::DemoWindow::kWidth;
-    const std::uint32_t height = demo::DemoWindow::kHeight;
+bool CollisionScene::init(gfx::IDevice* dev, platform::Window*) {
+    if (inited_) return true;
+    device_ = dev;
 
-    FramebufferDesc fbd;
-    fbd.extent = {width, height};
-    AttachmentDesc color;
-    color.type = AttachmentType::Color;
-    color.clearOnLoad = true;
-    color.clear.color[2] = 0.06f;
-    fbd.attachments.push(color);
-    auto fbr = dev->createFramebuffer(fbd);
-    if (!fbr.hasValue()) {
-        return 1;
-    }
-    FramebufferHandle fb = fbr.value();
+    // Quad vertex buffer
+    gfx::BufferDesc vbd;
+    vbd.sizeBytes = sizeof(kQuad);
+    vbd.usage = gfx::BufferUsage::Vertex;
+    auto vb = dev->createBuffer(vbd, std::span(reinterpret_cast<const std::byte*>(kQuad), sizeof(kQuad)));
+    if (!vb.hasValue()) return false;
+    vbQuad_ = vb.value();
 
-    auto vb = dev->createBuffer(
-        []() {
-            BufferDesc d;
-            d.sizeBytes = sizeof(kQuad);
-            d.usage = BufferUsage::Vertex;
-            return d;
-        }(),
-        std::span(reinterpret_cast<const std::byte*>(kQuad), sizeof(kQuad)));
-    auto ib = dev->createBuffer(
-        []() {
-            BufferDesc d;
-            d.sizeBytes = sizeof(kIndices);
-            d.usage = BufferUsage::Index;
-            return d;
-        }(),
-        std::span(reinterpret_cast<const std::byte*>(kIndices), sizeof(kIndices)));
-    BufferDesc instDesc;
-    instDesc.sizeBytes = kBodies * sizeof(Instance);
-    instDesc.usage = BufferUsage::Vertex;
-    auto inst = dev->createBuffer(instDesc, {});
+    // Index buffer
+    gfx::BufferDesc ibd;
+    ibd.sizeBytes = sizeof(kIndices);
+    ibd.usage = gfx::BufferUsage::Index;
+    auto ib = dev->createBuffer(ibd, std::span(reinterpret_cast<const std::byte*>(kIndices), sizeof(kIndices)));
+    if (!ib.hasValue()) return false;
+    ibQuad_ = ib.value();
 
-    auto makeShader = [&](ShaderStage stage, const char* src) {
-        ShaderDesc d;
+    // Instance buffer (alloc)
+    gfx::BufferDesc id;
+    id.sizeBytes = kBodies * sizeof(Instance);
+    id.usage = gfx::BufferUsage::Vertex;
+    auto iib = dev->createBuffer(id, {});
+    if (!iib.hasValue()) return false;
+    vbInstance_ = iib.value();
+
+    // Shaders
+    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
+        gfx::ShaderDesc d;
         d.stage = stage;
         d.blob.resize(std::strlen(src));
         std::memcpy(d.blob.data(), src, d.blob.size());
         return dev->createShader(d);
     };
-    auto vs = makeShader(ShaderStage::Vertex, kVs);
-    auto fs = makeShader(ShaderStage::Fragment, kFs);
-    if (!vb.hasValue() || !ib.hasValue() || !inst.hasValue() || !vs.hasValue() || !fs.hasValue()) {
-        return 1;
-    }
-    PipelineStateDesc pd;
-    pd.vertexShader = vs.value();
-    pd.fragmentShader = fs.value();
-    pd.topology = PrimitiveTopology::TriangleList;
-    pd.raster.cullMode = CullMode::None;
+    auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
+    auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
+    if (!vs.hasValue() || !fs.hasValue()) return false;
+    vs_ = vs.value();
+    fs_ = fs.value();
+
+    // Pipeline
+    gfx::PipelineStateDesc pd;
+    pd.vertexShader = vs_;
+    pd.fragmentShader = fs_;
+    pd.topology = gfx::PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = gfx::CullMode::None;
+    // Binding 0: quad vertices
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 0;
-        b.strideBytes = 12; // pos only (colors are per-instance)
+        b.strideBytes = 12;
+        b.divisor = 0;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute a;
-        a.binding = 0;
-        a.location = 0;
-        a.format = VertexFormat::Float32x3;
-        pd.vertexInput.attributes.push(a);
+        gfx::VertexInputLayout::VertexAttribute pa;
+        pa.binding = 0;
+        pa.location = 0;
+        pa.format = gfx::VertexFormat::Float32x3;
+        pa.offsetBytes = 0;
+        pd.vertexInput.attributes.push(pa);
     }
+    // Binding 1: per-instance center+size + color
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 1;
         b.strideBytes = sizeof(Instance);
         b.divisor = 1;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute a1;
-        a1.binding = 1;
-        a1.location = 1;
-        a1.format = VertexFormat::Float32x3;
-        a1.offsetBytes = 0;
-        pd.vertexInput.attributes.push(a1);
-        VertexInputLayout::VertexAttribute a2;
-        a2.binding = 1;
-        a2.location = 2;
-        a2.format = VertexFormat::Float32x3;
-        a2.offsetBytes = 12;
-        pd.vertexInput.attributes.push(a2);
+        gfx::VertexInputLayout::VertexAttribute ca;
+        ca.binding = 1;
+        ca.location = 1;
+        ca.format = gfx::VertexFormat::Float32x3;
+        ca.offsetBytes = 0;
+        pd.vertexInput.attributes.push(ca);
+        gfx::VertexInputLayout::VertexAttribute cb;
+        cb.binding = 1;
+        cb.location = 2;
+        cb.format = gfx::VertexFormat::Float32x3;
+        cb.offsetBytes = 12;
+        pd.vertexInput.attributes.push(cb);
     }
-    auto pipeline = dev->createPipeline(pd);
-    if (!pipeline.hasValue()) {
-        return 1;
-    }
+    auto pipe = dev->createPipeline(pd);
+    if (!pipe.hasValue()) return false;
+    pipeline_ = pipe.value();
 
-    diag::Diagnostics diagnostics;
-    demo::Hud hud(dev);
-    if (!hud.init()) {
-        return 1;
-    }
-    diagnostics.setSampleSink(&demo::Hud::onSample, &hud);
-    const std::uint32_t idFps = diagnostics.metrics().declare({"fps", diag::MetricType::Double, "frame", "1/s"});
-    const std::uint32_t idBodies = diagnostics.metrics().declare({"bodies", diag::MetricType::UInt, "telemetry", "count"});
-    const std::uint32_t idBounces = diagnostics.metrics().declare({"bounces", diag::MetricType::UInt, "telemetry", "count"});
-    const std::uint32_t idSamplePos = diagnostics.metrics().declare({"sample_positions", diag::MetricType::String, "telemetry", nullptr});
-
-    // Physics state lives here (simulation-owned); metrics only observe it.
-    std::array<Body, kBodies> bodies{};
+    // Initialize bodies
     for (int i = 0; i < kBodies; ++i) {
-        const float a = static_cast<float>(i) * 0.9f;
-        bodies[i] = {std::cos(a) * 0.4f, std::sin(a) * 0.4f,
-                     std::cos(a * 1.7f) * 0.4f, std::sin(a * 2.3f) * 0.4f,
-                     0.5f + 0.5f * std::sin(a),
-                     0.5f + 0.5f * std::sin(a + 2.1f),
-                     0.5f + 0.5f * std::sin(a + 4.2f), 0.10f + 0.05f * (i % 3)};
+        bodies_[i].x = (i % 4) * 0.4f - 0.6f;
+        bodies_[i].y = (i / 4) * 0.4f - 0.2f;
+        bodies_[i].vx = (i % 2 == 0 ? 0.3f : -0.4f);
+        bodies_[i].vy = (i < 4 ? 0.25f : -0.35f);
+        bodies_[i].size = 0.08f + i * 0.01f;
+        float h = i * 0.4f;
+        bodies_[i].r = 0.5f + 0.5f * std::sin(h);
+        bodies_[i].g = 0.5f + 0.5f * std::sin(h + 2.1f);
+        bodies_[i].b = 0.5f + 0.5f * std::sin(h + 4.2f);
     }
-    std::uint32_t bounces = 0;
 
-    const Uint64 perfFreq = SDL_GetPerformanceFrequency();
-    Uint64 prev = SDL_GetPerformanceCounter();
-    double t = 0.0;
-    bool running = true;
+    inited_ = true;
+    return true;
+}
 
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-                running = false;
-            }
-        }
-        const Uint64 now = SDL_GetPerformanceCounter();
-        const double dt = static_cast<double>(now - prev) / static_cast<double>(perfFreq);
-        prev = now;
-        t += dt;
-        const float h = static_cast<float>(dt);
-        if (h <= 0.0f) {
-            continue;
-        }
+void CollisionScene::shutdown(gfx::IDevice* dev) {
+    if (!inited_) return;
+    if (pipeline_.isValid()) dev->destroyPipeline(pipeline_);
+    if (fs_.isValid()) dev->destroyShader(fs_);
+    if (vs_.isValid()) dev->destroyShader(vs_);
+    if (vbInstance_.isValid()) dev->destroyBuffer(vbInstance_);
+    if (ibQuad_.isValid()) dev->destroyBuffer(ibQuad_);
+    if (vbQuad_.isValid()) dev->destroyBuffer(vbQuad_);
+    inited_ = false;
+}
 
-        // Step physics (a handful of substeps for stability at low FPS).
-        for (int s = 0; s < 4; ++s) {
-            const float dts = h / 4.0f;
-            for (Body& b : bodies) {
-                b.x += b.vx * dts;
-                b.y += b.vy * dts;
-                const float bound = 1.0f - b.size;
-                if (b.x < -bound) { b.x = -bound; b.vx = std::abs(b.vx); ++bounces; }
-                if (b.x > bound) { b.x = bound; b.vx = -std::abs(b.vx); ++bounces; }
-                if (b.y < -bound) { b.y = -bound; b.vy = std::abs(b.vy); ++bounces; }
-                if (b.y > bound) { b.y = bound; b.vy = -std::abs(b.vy); ++bounces; }
-            }
-            for (int i = 0; i < kBodies; ++i) {
-                for (int j = i + 1; j < kBodies; ++j) {
-                    Body& a = bodies[i];
-                    Body& b = bodies[j];
-                    const float dx = b.x - a.x;
-                    const float dy = b.y - a.y;
-                    const float minD = a.size + b.size;
-                    const float d2 = dx * dx + dy * dy;
-                    if (d2 < minD * minD) {
-                        const float d = std::sqrt(d2);
-                        float nx = d > 0.0f ? dx / d : 1.0f;
-                        float ny = d > 0.0f ? dy / d : 0.0f;
-                        const float push = (minD - d) * 0.5f;
-                        a.x -= nx * push; a.y -= ny * push;
-                        b.x += nx * push; b.y += ny * push;
-                        const float rel = 2.0f * ((a.vx - b.vx) * nx + (a.vy - b.vy) * ny) * 0.5f;
-                        a.vx -= rel * nx; a.vy -= rel * ny;
-                        b.vx += rel * nx; b.vy += rel * ny;
-                        ++bounces;
-                    }
+void CollisionScene::onResize(std::uint32_t, std::uint32_t) {
+    // NDC demo, no resize handling needed
+}
+
+void CollisionScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
+    if (!inited_) return;
+
+    // Simple 2D collision simulation in NDC space
+    for (int i = 0; i < kBodies; ++i) {
+        bodies_[i].x += bodies_[i].vx * dt;
+        bodies_[i].y += bodies_[i].vy * dt;
+
+        // Wall bounce
+        float half = bodies_[i].size;
+        if (bodies_[i].x - half < -1.f) { bodies_[i].x = -1.f + half; bodies_[i].vx = -bodies_[i].vx; }
+        if (bodies_[i].x + half > 1.f) { bodies_[i].x = 1.f - half; bodies_[i].vx = -bodies_[i].vx; }
+        if (bodies_[i].y - half < -1.f) { bodies_[i].y = -1.f + half; bodies_[i].vy = -bodies_[i].vy; }
+        if (bodies_[i].y + half > 1.f) { bodies_[i].y = 1.f - half; bodies_[i].vy = -bodies_[i].vy; }
+
+        // Body-body collision (simple elastic)
+        for (int j = i + 1; j < kBodies; ++j) {
+            float dx = bodies_[j].x - bodies_[i].x;
+            float dy = bodies_[j].y - bodies_[i].y;
+            float dist = std::sqrt(dx * dx + dy * dy);
+            float minDist = bodies_[i].size + bodies_[j].size;
+            if (dist < minDist && dist > 0.001f) {
+                float nx = dx / dist, ny = dy / dist;
+                float dvx = bodies_[j].vx - bodies_[i].vx;
+                float dvy = bodies_[j].vy - bodies_[i].vy;
+                float dp = dvx * nx + dvy * ny;
+                if (dp < 0) {
+                    float impulse = dp / (1.f + 1.f); // equal mass
+                    bodies_[i].vx += impulse * nx;
+                    bodies_[i].vy += impulse * ny;
+                    bodies_[j].vx -= impulse * nx;
+                    bodies_[j].vy -= impulse * ny;
+                    // Separate slightly
+                    float overlap = minDist - dist;
+                    bodies_[i].x -= nx * overlap * 0.5f;
+                    bodies_[i].y -= ny * overlap * 0.5f;
+                    bodies_[j].x += nx * overlap * 0.5f;
+                    bodies_[j].y += ny * overlap * 0.5f;
                 }
             }
         }
-
-        // Telemetry.
-        diagnostics.metrics()[idFps].set(dt > 0.0 ? 1.0 / dt : 0.0);
-        diagnostics.metrics()[idBodies].set(static_cast<std::uint64_t>(kBodies));
-        diagnostics.metrics()[idBounces].set(static_cast<std::uint64_t>(bounces));
-        {
-            char buf[96];
-            std::snprintf(buf, sizeof(buf), "(%.2f, %.2f) (%.2f, %.2f)",
-                          static_cast<double>(bodies[0].x), static_cast<double>(bodies[0].y),
-                          static_cast<double>(bodies[1].x), static_cast<double>(bodies[1].y));
-            diagnostics.metrics()[idSamplePos].set(buf);
-        }
-        diagnostics.update(t);
-
-        // Upload per-instance transforms.
-        Instance instances[kBodies];
-        for (int i = 0; i < kBodies; ++i) {
-            instances[i] = {bodies[i].x, bodies[i].y, bodies[i].size, bodies[i].r, bodies[i].g,
-                            bodies[i].b};
-        }
-        dev->writeBuffer(inst.value(), 0,
-                         std::span(reinterpret_cast<const std::byte*>(instances), sizeof(instances)));
-
-        {
-            CommandBuffer cb;
-            cb.begin();
-            cb.beginRenderPass(fb);
-            cb.setViewport({width, height});
-            cb.bindPipeline(pipeline.value());
-            cb.bindVertexBuffer(0, vb.value(), 12);
-            cb.bindVertexBuffer(1, inst.value(), sizeof(Instance));
-            cb.bindIndexBuffer(ib.value(), IndexFormat::U16);
-            cb.drawIndexed(6, kBodies);
-            hud.render(cb, width, height);
-            cb.endRenderPass();
-            cb.end();
-            dev->submit(cb);
-        }
-        window->swap();
     }
 
-    dev->waitIdle();
-    return 0;
+    // Update instance buffer
+    Instance instances[kBodies];
+    for (int i = 0; i < kBodies; ++i) {
+        instances[i].x = bodies_[i].x;
+        instances[i].y = bodies_[i].y;
+        instances[i].size = bodies_[i].size;
+        instances[i].r = bodies_[i].r;
+        instances[i].g = bodies_[i].g;
+        instances[i].b = bodies_[i].b;
+    }
+    if (device_) {
+        device_->writeBuffer(vbInstance_, 0, std::span(reinterpret_cast<const std::byte*>(instances), sizeof(instances)));
+    }
 }
+
+void CollisionScene::render(gfx::CommandBuffer& cb, const FreeCamera&, std::uint32_t, std::uint32_t) {
+    cb.bindPipeline(pipeline_);
+    cb.bindVertexBuffer(0, vbQuad_, 12);
+    cb.bindVertexBuffer(1, vbInstance_, sizeof(Instance));
+    cb.bindIndexBuffer(ibQuad_, gfx::IndexFormat::U16);
+    cb.drawIndexed(6, kBodies);
+}
+
+} // namespace f4::demo

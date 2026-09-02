@@ -109,14 +109,19 @@ constexpr std::uint16_t kCubeIndices[] = {
 };
 
 constexpr Vertex kPyramidVerts[] = {
+    // +Z side
     {-S, -S,  S, 1, 0, 0}, { S, -S,  S, 1, 0, 0},
-    { 0,   S,  0, 1, 0, 0}, { 0,  S,  0, 1, 0, 0},
+    { 0,   S,  0, 1, 0, 0},
+    // +X side
     { S, -S,  S, 0, 0, 1}, { S, -S, -S, 0, 0, 1},
-    { 0,   S,  0, 0, 0, 1}, { 0,  S,  0, 0, 0, 1},
+    { 0,   S,  0, 0, 0, 1},
+    // -Z side
     { S, -S, -S, 0, 1, 0}, {-S, -S, -S, 0, 1, 0},
-    { 0,   S,  0, 0, 1, 0}, { 0,  S,  0, 0, 1, 0},
+    { 0,   S,  0, 0, 1, 0},
+    // -X side
     {-S, -S, -S, 0, 1, 1}, {-S, -S,  S, 0, 1, 1},
-    { 0,   S,  0, 0, 1, 1}, { 0,  S,  0, 0, 1, 1},
+    { 0,   S,  0, 0, 1, 1},
+    // -Y base
     {-S, -S, -S, 1, 1, 0}, {-S, -S,  S, 1, 1, 0},
     { S, -S,  S, 1, 1, 0}, { S, -S, -S, 1, 1, 0},
 };
@@ -163,7 +168,7 @@ constexpr std::uint16_t kTetraIndices[] = {
 
 constexpr Mesh kMeshes[] = {
     {kCubeVerts,     24, kCubeIndices,     36, 0.707f},
-    {kPyramidVerts,  20, kPyramidIndices,  18, 0.75f},
+    {kPyramidVerts,  16, kPyramidIndices,  18, 0.75f},
     {kOctaVerts,      6, kOctaIndices,     24, 0.5f},
     {kDiamondVerts,   6, kDiamondIndices,  24, 1.0f},
     {kTetraVerts,     4, kTetraIndices,    12, 0.75f},

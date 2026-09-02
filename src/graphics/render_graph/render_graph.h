@@ -11,32 +11,38 @@
 
 namespace f4::gfx {
 
-// M8 RenderGraph v1: declarations-only, executed in declaration order on GL.
-// No auto-reordering, barrier synthesis, or lifetime allocation.
-// Engine declares WHAT and WHEN; RHI executes HOW.
+// M8 RenderGraph v1: declared resources and passes, executed in declaration
+// order. No auto-reordering or barrier synthesis yet; those remain M9/M12
+// concerns. Persistent resources live until release()/clear(), while transient
+// resources are released after each submission.
 
 using containers::Array;
 using containers::String;
 
 enum class ResourceLifetime : std::uint8_t { Persistent, Transient };
-enum class ResourceType : std::uint8_t { Texture, Buffer };
+enum class ResourceType : std::uint8_t { Texture, Buffer, Framebuffer };
 
 struct ResourceDesc {
     String name;
     ResourceType type = ResourceType::Texture;
     ResourceLifetime lifetime = ResourceLifetime::Persistent;
-    // Texture path
     TextureDesc texture{};
-    // Buffer path
     BufferDesc buffer{};
-    // Framebuffer handle used when writing; null-texture attachments mean default FBO 0.
     FramebufferDesc framebuffer{};
+    // Imported framebuffers are borrowed and are never destroyed by the graph.
+    FramebufferHandle importedFramebuffer{};
+};
+
+struct PassResourceAccess {
+    std::uint32_t resource = 0; // ResourceId
+    ResourceState state{};
 };
 
 struct PassDesc {
     String name;
     Array<std::uint32_t> reads;  // ResourceId
     Array<std::uint32_t> writes; // ResourceId
+    Array<PassResourceAccess> accesses;
     // Record callback: called during execute() inside a render pass if the pass
     // writes a framebuffer resource; otherwise called outside any pass (e.g. compute).
     // Keep it small; capture by value where possible.
@@ -54,6 +60,7 @@ public:
     using ResourceId = std::uint32_t;
 
     [[nodiscard]] auto declareResource(ResourceDesc desc) -> ResourceId;
+    [[nodiscard]] auto importFramebuffer(String name, FramebufferHandle framebuffer) -> ResourceId;
     [[nodiscard]] auto declarePass(PassDesc desc) -> std::uint32_t;
 
     [[nodiscard]] auto resourceCount() const -> std::size_t { return resources_.size(); }
@@ -61,27 +68,39 @@ public:
     [[nodiscard]] auto resource(ResourceId id) const -> const ResourceDesc& { return resources_[id]; }
     [[nodiscard]] auto pass(std::uint32_t index) const -> const PassDesc& { return passes_[index]; }
 
-    void clear();
+    // Releases materialized resources, then removes all declarations.
+    [[nodiscard]] auto clear(IDevice& dev) -> GfxError;
 
     // Executes passes in declaration order. For each pass, if it writes a
     // framebuffer resource, a BeginRenderPass/EndRenderPass is wrapped around
     // record(). Otherwise record() is invoked bare. After all passes, the
-    // supplied CommandBuffer is submitted.
+    // supplied CommandBuffer is begun, ended, and submitted by the graph.
     [[nodiscard]] auto execute(IDevice& dev, CommandBuffer& cb) -> GfxError;
 
     // Materializes all declared resources (createTexture/createBuffer/createFramebuffer).
-    // Call before execute() on first frame or after clear().
+    // Persistent handles are reused; missing transient handles are recreated.
     [[nodiscard]] auto realize(IDevice& dev) -> GfxError;
-    void release(IDevice& dev);
+    [[nodiscard]] auto release(IDevice& dev) -> GfxError;
+
+    [[nodiscard]] auto texture(ResourceId id) const -> TextureHandle;
+    [[nodiscard]] auto buffer(ResourceId id) const -> BufferHandle;
+    [[nodiscard]] auto framebuffer(ResourceId id) const -> FramebufferHandle;
 
 private:
+    [[nodiscard]] auto validateResources() const -> GfxError;
+    [[nodiscard]] auto validatePasses() const -> GfxError;
+    [[nodiscard]] auto releaseTransient(IDevice& dev) -> GfxError;
+    [[nodiscard]] auto releaseResource(IDevice& dev, ResourceId id) -> GfxError;
+
     Array<ResourceDesc> resources_;
     Array<PassDesc> passes_;
-    // Realized handles — parallel to resources_
+    // Materialized handles and ownership flags, parallel to resources_.
     Array<TextureHandle> textures_;
     Array<BufferHandle> buffers_;
     Array<FramebufferHandle> framebuffers_;
-    bool realized_ = false;
+    Array<ResourceState> states_;
+    Array<std::uint8_t> owned_;
+    IDevice* owner_ = nullptr;
 };
 
 } // namespace f4::gfx

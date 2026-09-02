@@ -1,43 +1,27 @@
-// demo_instancing — hardware instancing with a divisor-1 per-instance buffer.
-// Draws a grid of spinning triangles; each instance carries its own color and a
-// 2D offset, so one draw call renders the whole set. Exercises the instancing
-// path (per-instance attribute locations) and reports instancing metrics.
-//
-// Controls: Esc closes the window.
-
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
+#include "demos/demo_instancing.h"
 
 #include <cmath>
 #include <cstring>
 
-#include "core/diagnostics/diagnostics.h"
-#include "core/math/mat4.h"
-#include "demos/demo_support.h"
 #include "graphics/command/command_buffer.h"
-#include "graphics/device/device.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
 
-using namespace f4;
-using namespace f4::gfx;
+namespace f4::demo {
 
 namespace {
-constexpr int kGrid = 10;         // kGrid x kGrid instances
-constexpr int kInstanceCount = kGrid * kGrid;
+
 constexpr float kTriangleVerts[] = {
     0.0f, 0.08f, 0.0f,
     -0.07f, -0.06f, 0.0f,
     0.07f, -0.06f, 0.0f,
 };
 
-// Per-instance: offset (xy) + color (rgb). Binding 1, divisor 1.
 struct Instance {
     float ox, oy;
     float r, g, b;
 };
-static_assert(sizeof(Instance) == 20);
 
 constexpr const char* kVs = R"glsl(
 #version 430 core
@@ -57,172 +41,147 @@ in vec3 vColor;
 out vec4 fragColor;
 void main() { fragColor = vec4(vColor, 1.0); }
 )glsl";
+
 } // namespace
 
-int main() {
-    demo::DemoWindow demo("demo_instancing");
-    if (!demo.ok()) {
-        return 1;
-    }
-    platform::Window* window = demo.window();
-    IDevice* dev = demo.device();
+bool InstancingScene::init(gfx::IDevice* dev, platform::Window*) {
+    if (inited_) return true;
+    device_ = dev;
 
-    const std::uint32_t width = demo::DemoWindow::kWidth;
-    const std::uint32_t height = demo::DemoWindow::kHeight;
+    // Triangle vertex buffer (binding 0)
+    gfx::BufferDesc vbd;
+    vbd.sizeBytes = sizeof(kTriangleVerts);
+    vbd.usage = gfx::BufferUsage::Vertex;
+    auto vb = dev->createBuffer(vbd, std::span(reinterpret_cast<const std::byte*>(kTriangleVerts), sizeof(kTriangleVerts)));
+    if (!vb.hasValue()) return false;
+    vbPos_ = vb.value();
 
-    FramebufferDesc fbd;
-    fbd.extent = {width, height};
-    AttachmentDesc color;
-    color.type = AttachmentType::Color;
-    color.clearOnLoad = true;
-    color.clear.color[2] = 0.07f;
-    fbd.attachments.push(color);
-    auto fbr = dev->createFramebuffer(fbd);
-    if (!fbr.hasValue()) {
-        return 1;
-    }
-    FramebufferHandle fb = fbr.value();
-
-    auto vb = dev->createBuffer(
-        []() {
-            BufferDesc d;
-            d.sizeBytes = sizeof(kTriangleVerts);
-            d.usage = BufferUsage::Vertex;
-            return d;
-        }(),
-        std::span(reinterpret_cast<const std::byte*>(kTriangleVerts), sizeof(kTriangleVerts)));
-    if (!vb.hasValue()) {
-        return 1;
-    }
-
-    BufferDesc id;
+    // Instance buffer (binding 1, divisor 1) - allocate storage
+    gfx::BufferDesc id;
     id.sizeBytes = kInstanceCount * sizeof(Instance);
-    id.usage = BufferUsage::Vertex;
+    id.usage = gfx::BufferUsage::Vertex;
     auto ib = dev->createBuffer(id, {});
-    if (!ib.hasValue()) {
-        return 1;
-    }
+    if (!ib.hasValue()) return false;
+    vbInstance_ = ib.value();
 
-    // Per-instance data: one triangle per grid cell with a hue color.
-    Instance instances[kInstanceCount];
-    int idx = 0;
-    for (int gy = 0; gy < kGrid; ++gy) {
-        for (int gx = 0; gx < kGrid; ++gx) {
-            float ox = (static_cast<float>(gx) / (kGrid - 1) - 0.5f) * 1.6f;
-            float oy = (static_cast<float>(gy) / (kGrid - 1) - 0.5f) * 1.6f;
-            float h = static_cast<float>(idx) / kInstanceCount;
-            instances[idx++] = {ox, oy, 0.5f + 0.5f * std::sin(h * 6.28f),
-                                0.5f + 0.5f * std::sin(h * 6.28f + 2.1f),
-                                0.5f + 0.5f * std::sin(h * 6.28f + 4.2f)};
-        }
-    }
-    dev->writeBuffer(ib.value(), 0,
-                     std::span(reinterpret_cast<const std::byte*>(instances), sizeof(instances)));
-
-    auto makeShader = [&](ShaderStage stage, const char* src) {
-        ShaderDesc d;
+    // Shaders
+    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
+        gfx::ShaderDesc d;
         d.stage = stage;
         d.blob.resize(std::strlen(src));
         std::memcpy(d.blob.data(), src, d.blob.size());
         return dev->createShader(d);
     };
-    auto vs = makeShader(ShaderStage::Vertex, kVs);
-    auto fs = makeShader(ShaderStage::Fragment, kFs);
-    if (!vs.hasValue() || !fs.hasValue()) {
-        return 1;
-    }
-    PipelineStateDesc pd;
-    pd.vertexShader = vs.value();
-    pd.fragmentShader = fs.value();
-    pd.topology = PrimitiveTopology::TriangleList;
-    pd.raster.cullMode = CullMode::None;
+    auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
+    auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
+    if (!vs.hasValue() || !fs.hasValue()) return false;
+    vs_ = vs.value();
+    fs_ = fs.value();
+
+    // Pipeline
+    gfx::PipelineStateDesc pd;
+    pd.vertexShader = vs_;
+    pd.fragmentShader = fs_;
+    pd.topology = gfx::PrimitiveTopology::TriangleList;
+    pd.raster.cullMode = gfx::CullMode::None;
+    // Binding 0: per-vertex position (divisor 0)
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 0;
         b.strideBytes = 12;
+        b.divisor = 0;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute a;
-        a.binding = 0;
-        a.location = 0;
-        a.format = VertexFormat::Float32x3;
-        pd.vertexInput.attributes.push(a);
+        gfx::VertexInputLayout::VertexAttribute pa;
+        pa.binding = 0;
+        pa.location = 0;
+        pa.format = gfx::VertexFormat::Float32x3;
+        pa.offsetBytes = 0;
+        pd.vertexInput.attributes.push(pa);
     }
+    // Binding 1: per-instance offset + color (divisor 1)
     {
-        VertexInputLayout::VertexBinding b;
+        gfx::VertexInputLayout::VertexBinding b;
         b.binding = 1;
         b.strideBytes = sizeof(Instance);
         b.divisor = 1;
         pd.vertexInput.bindings.push(b);
-        VertexInputLayout::VertexAttribute a1;
-        a1.binding = 1;
-        a1.location = 1;
-        a1.format = VertexFormat::Float32x2;
-        a1.offsetBytes = 0;
-        pd.vertexInput.attributes.push(a1);
-        VertexInputLayout::VertexAttribute a2;
-        a2.binding = 1;
-        a2.location = 2;
-        a2.format = VertexFormat::Float32x3;
-        a2.offsetBytes = 8;
-        pd.vertexInput.attributes.push(a2);
+        gfx::VertexInputLayout::VertexAttribute oa;
+        oa.binding = 1;
+        oa.location = 1;
+        oa.format = gfx::VertexFormat::Float32x2;
+        oa.offsetBytes = 0;
+        pd.vertexInput.attributes.push(oa);
+        gfx::VertexInputLayout::VertexAttribute ca;
+        ca.binding = 1;
+        ca.location = 2;
+        ca.format = gfx::VertexFormat::Float32x3;
+        ca.offsetBytes = 8;
+        pd.vertexInput.attributes.push(ca);
     }
-    auto pipeline = dev->createPipeline(pd);
-    if (!pipeline.hasValue()) {
-        return 1;
-    }
+    auto pipe = dev->createPipeline(pd);
+    if (!pipe.hasValue()) return false;
+    pipeline_ = pipe.value();
 
-    diag::Diagnostics diagnostics;
-    demo::Hud hud(dev);
-    if (!hud.init()) {
-        return 1;
-    }
-    diagnostics.setSampleSink(&demo::Hud::onSample, &hud);
-    const std::uint32_t idFps = diagnostics.metrics().declare({"fps", diag::MetricType::Double, "frame", "1/s"});
-    const std::uint32_t idInst = diagnostics.metrics().declare({"instances", diag::MetricType::UInt, "gpu", "count"});
-    const std::uint32_t idBatch = diagnostics.metrics().declare({"batches", diag::MetricType::UInt, "gpu", "count"});
-
-    const Uint64 perfFreq = SDL_GetPerformanceFrequency();
-    Uint64 prev = SDL_GetPerformanceCounter();
-    double t = 0.0;
-    bool running = true;
-
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-                running = false;
-            }
+    // Initial instance data upload
+    std::vector<Instance> instances(kInstanceCount);
+    float spacing = 0.20f;
+    for (int y = 0; y < kGrid; ++y) {
+        for (int x = 0; x < kGrid; ++x) {
+            int i = y * kGrid + x;
+            instances[i].ox = (x - (kGrid - 1) * 0.5f) * spacing;
+            instances[i].oy = (y - (kGrid - 1) * 0.5f) * spacing;
+            float h = (x * 13 + y * 7) * 0.01f;
+            instances[i].r = 0.5f + 0.5f * std::sin(h);
+            instances[i].g = 0.5f + 0.5f * std::sin(h + 2.1f);
+            instances[i].b = 0.5f + 0.5f * std::sin(h + 4.2f);
         }
-        const Uint64 now = SDL_GetPerformanceCounter();
-        const double dt = static_cast<double>(now - prev) / static_cast<double>(perfFreq);
-        prev = now;
-        t += dt;
-
-        diagnostics.metrics()[idFps].set(dt > 0.0 ? 1.0 / dt : 0.0);
-        diagnostics.metrics()[idInst].set(static_cast<std::uint64_t>(kInstanceCount));
-        diagnostics.metrics()[idBatch].set(dev->stats().batches);
-        diagnostics.update(t);
-
-        {
-            CommandBuffer cb;
-            cb.begin();
-            cb.beginRenderPass(fb);
-            cb.setViewport({width, height});
-            cb.bindPipeline(pipeline.value());
-            cb.bindVertexBuffer(0, vb.value(), 12);
-            cb.bindVertexBuffer(1, ib.value(), sizeof(Instance));
-            cb.draw(3, kInstanceCount);
-            hud.render(cb, width, height);
-            cb.endRenderPass();
-            cb.end();
-            dev->submit(cb);
-        }
-        dev->resetFrameStats();
-        window->swap();
     }
+    dev->writeBuffer(vbInstance_, 0, std::span(reinterpret_cast<const std::byte*>(instances.data()), instances.size() * sizeof(Instance)));
 
-    dev->waitIdle();
-    return 0;
+    inited_ = true;
+    return true;
 }
+
+void InstancingScene::shutdown(gfx::IDevice* dev) {
+    if (!inited_) return;
+    if (pipeline_.isValid()) dev->destroyPipeline(pipeline_);
+    if (fs_.isValid()) dev->destroyShader(fs_);
+    if (vs_.isValid()) dev->destroyShader(vs_);
+    if (vbInstance_.isValid()) dev->destroyBuffer(vbInstance_);
+    if (vbPos_.isValid()) dev->destroyBuffer(vbPos_);
+    inited_ = false;
+}
+
+void InstancingScene::onResize(std::uint32_t, std::uint32_t) {
+    // Nothing special
+}
+
+void InstancingScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
+    time_ += dt;
+    // Update instance colors over time (animate)
+    std::vector<Instance> instances(kInstanceCount);
+    float spacing = 0.20f;
+    for (int y = 0; y < kGrid; ++y) {
+        for (int x = 0; x < kGrid; ++x) {
+            int i = y * kGrid + x;
+            instances[i].ox = (x - (kGrid - 1) * 0.5f) * spacing;
+            instances[i].oy = (y - (kGrid - 1) * 0.5f) * spacing;
+            float h = (x * 13 + y * 7) * 0.01f + time_;
+            instances[i].r = 0.5f + 0.5f * std::sin(h);
+            instances[i].g = 0.5f + 0.5f * std::sin(h + 2.1f);
+            instances[i].b = 0.5f + 0.5f * std::sin(h + 4.2f);
+        }
+    }
+    if (device_) {
+        device_->writeBuffer(vbInstance_, 0, std::span(reinterpret_cast<const std::byte*>(instances.data()), instances.size() * sizeof(Instance)));
+    }
+}
+
+void InstancingScene::render(gfx::CommandBuffer& cb, const FreeCamera&, std::uint32_t, std::uint32_t) {
+    cb.bindPipeline(pipeline_);
+    cb.bindVertexBuffer(0, vbPos_, 12);
+    cb.bindVertexBuffer(1, vbInstance_, sizeof(Instance));
+    cb.draw(3, kInstanceCount);
+}
+
+} // namespace f4::demo

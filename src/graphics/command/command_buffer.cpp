@@ -47,8 +47,15 @@ void CommandBuffer::bindIndexBuffer(BufferHandle buffer, IndexFormat format) {
 
 void CommandBuffer::bindResource(std::uint32_t slot, BindingType type, std::uint32_t handleIndex,
                                  std::uint32_t handleGeneration) {
+    bindResource(0, slot, type, handleIndex, handleGeneration);
+}
+
+void CommandBuffer::bindResource(std::uint32_t bindPoint, std::uint32_t slot, BindingType type,
+                                 std::uint32_t handleIndex,
+                                 std::uint32_t handleGeneration) {
     F4_ASSERT(recording_, "bindResource while not recording");
     BoundResource res;
+    res.bindPoint = bindPoint;
     res.slot = slot;
     res.type = type;
     res.handleIndex = handleIndex;
@@ -74,6 +81,30 @@ void CommandBuffer::bindResource(std::uint32_t slot, BindingType type, std::uint
 void CommandBuffer::bindResource(std::uint32_t slot, std::uint32_t handleIndex,
                                  std::uint32_t handleGeneration) {
     bindResource(slot, BindingType::UniformBuffer, handleIndex, handleGeneration);
+}
+
+void CommandBuffer::bufferBarrier(BufferHandle buffer, ResourceState before,
+                                  ResourceState after) {
+    F4_ASSERT(buffer.isValid(), "bufferBarrier with invalid handle");
+    Command cmd;
+    cmd.kind = CommandKind::ResourceBarrier;
+    cmd.barrierType = BarrierResourceType::Buffer;
+    cmd.buffer = buffer;
+    cmd.before = before;
+    cmd.after = after;
+    pushCommand(std::move(cmd));
+}
+
+void CommandBuffer::textureBarrier(TextureHandle texture, ResourceState before,
+                                   ResourceState after) {
+    F4_ASSERT(texture.isValid(), "textureBarrier with invalid handle");
+    Command cmd;
+    cmd.kind = CommandKind::ResourceBarrier;
+    cmd.barrierType = BarrierResourceType::Texture;
+    cmd.texture = texture;
+    cmd.before = before;
+    cmd.after = after;
+    pushCommand(std::move(cmd));
 }
 
 void CommandBuffer::setViewport(Extent viewport) {

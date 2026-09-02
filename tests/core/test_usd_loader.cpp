@@ -10,8 +10,8 @@
 using namespace f4::resources;
 
 static const char* kCubeUsda =
-    "build/debug/_deps/tinyusdz-src/models/cube-indexed-primvar.usda";
-static const char* kCubeUsdc = "build/debug/_deps/tinyusdz-src/models/cube.usdc";
+    F4_TINYUSDZ_TEST_DATA_DIR "/cube-indexed-primvar.usda";
+static const char* kCubeUsdc = F4_TINYUSDZ_TEST_DATA_DIR "/cube.usdc";
 
 static std::vector<std::byte> loadFile(const char* path) {
     FILE* f = nullptr;

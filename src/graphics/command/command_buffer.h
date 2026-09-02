@@ -21,6 +21,7 @@ using containers::Array;
 // ---------------------------------------------------------------------------
 
 enum class CommandKind : std::uint8_t {
+    ResourceBarrier,
     BindPipeline,
     BindVertexBuffer,
     BindIndexBuffer,
@@ -33,10 +34,13 @@ enum class CommandKind : std::uint8_t {
     EndRenderPass,
 };
 
+enum class BarrierResourceType : std::uint8_t { Buffer, Texture };
+
 // One resource bound at (bindPoint, slot) within BindResources. `type` tells the
 // backend which handle namespace to resolve (a buffer for Uniform/Storage, a
 // texture/sampler otherwise) and how to bind it on the device.
 struct BoundResource {
+    std::uint32_t bindPoint = 0;
     std::uint32_t slot = 0;
     BindingType type = BindingType::UniformBuffer;
     std::uint32_t handleIndex = 0;
@@ -52,6 +56,10 @@ struct Command {
     std::uint32_t strideBytes = 0;
     IndexFormat indexFormat = IndexFormat::U16;
     FramebufferHandle framebuffer{};
+    TextureHandle texture{};
+    BarrierResourceType barrierType = BarrierResourceType::Buffer;
+    ResourceState before{};
+    ResourceState after{};
     Extent viewport;
     Extent scissor;
     std::uint32_t vertexCount = 0;
@@ -83,7 +91,11 @@ public:
     // handle as a uniform buffer (existing callers keep compiling untyped).
     void bindResource(std::uint32_t slot, BindingType type, std::uint32_t handleIndex,
                       std::uint32_t handleGeneration);
+    void bindResource(std::uint32_t bindPoint, std::uint32_t slot, BindingType type,
+                      std::uint32_t handleIndex, std::uint32_t handleGeneration);
     void bindResource(std::uint32_t slot, std::uint32_t handleIndex, std::uint32_t handleGeneration);
+    void bufferBarrier(BufferHandle buffer, ResourceState before, ResourceState after);
+    void textureBarrier(TextureHandle texture, ResourceState before, ResourceState after);
     void setViewport(Extent viewport);
     void setScissor(Extent scissor);
     void draw(std::uint32_t vertexCount, std::uint32_t instanceCount = 1);

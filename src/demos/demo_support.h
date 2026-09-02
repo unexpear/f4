@@ -39,7 +39,7 @@ private:
 // Diagnostics layer stays renderer-independent and only hands us the metrics.
 class Hud {
 public:
-    explicit Hud(f4::gfx::IDevice* dev) : dev_(dev), overlay_(dev) {}
+    explicit Hud(f4::gfx::IDevice* dev) : overlay_(dev) {}
     ~Hud() = default;
     Hud(const Hud&) = delete;
     Hud& operator=(const Hud&) = delete;
@@ -56,7 +56,6 @@ public:
 private:
     void rebuild(const f4::diag::MetricRegistry& metrics);
 
-    f4::gfx::IDevice* dev_ = nullptr;
     f4::gfx::hud::Overlay overlay_;
     f4::containers::Array<f4::gfx::hud::HudLine> lines_;
     f4::containers::Array<f4::containers::String> texts_;

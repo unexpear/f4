@@ -54,8 +54,10 @@ struct BmpBuilder {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(pixels.data());
         const std::size_t rowBytesRaw2 = static_cast<std::size_t>(width) * bytesPerPixel;
         for (std::uint32_t row = 0; row < height; ++row) {
-            std::memcpy(dst, src, rowBytesRaw2);
-            src += rowBytesRaw2;
+            if (rowBytesRaw2 != 0) {
+                std::memcpy(dst, src, rowBytesRaw2);
+                src += rowBytesRaw2;
+            }
             dst += rowStride;
         }
         return buf;

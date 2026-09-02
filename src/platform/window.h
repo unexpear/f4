@@ -35,8 +35,9 @@ struct WindowDesc {
     bool visible = true;
 };
 
-// A wrapped SDL2 window with an OpenGL (WGL) context. Owns both. SDL is
-// completely hidden behind this seam so GL/Vulkan/DX12 backends never see SDL.
+// A wrapped SDL2 window with either an OpenGL context or Vulkan surface support.
+// SDL stays hidden behind this seam so graphics backends never depend on SDL
+// types directly.
 class Window {
 public:
     Window() = default;
@@ -50,6 +51,9 @@ public:
     // Opens the window and creates a GL 3.3+ core context. Returns the window
     // if successful (caller owns it and must delete it) or an error.
     static auto create(const WindowDesc& desc) -> Result<Window*, WindowError>;
+
+    // Opens an SDL_WINDOW_VULKAN window without creating an OpenGL context.
+    static auto createVulkan(const WindowDesc& desc) -> Result<Window*, WindowError>;
 
     // Makes the GL context current on the calling thread.
     auto makeCurrent() -> bool;
@@ -69,10 +73,24 @@ public:
     [[nodiscard]] auto logicalHeight() const -> std::uint32_t;
     [[nodiscard]] auto glContext() const -> void*;
 
+    // SDL Vulkan bridge using opaque arguments so Vulkan types do not leak into
+    // the platform header. `surfaceOut` points to a VkSurfaceKHR.
+    [[nodiscard]] auto vulkanInstanceExtensions(std::uint32_t* count,
+                                                const char** names) const -> bool;
+    [[nodiscard]] auto createVulkanSurface(void* instance, void* surfaceOut) const -> bool;
+
+    // OpenGL VSync control. Vulkan present mode belongs to the swapchain.
+    [[nodiscard]] auto vsyncEnabled() const -> bool;
+    void setVSyncEnabled(bool enabled);
+
 private:
+    static auto createInternal(const WindowDesc& desc, bool vulkan)
+        -> Result<Window*, WindowError>;
+
     void* window_ = nullptr;   // SDL_Window*
     void* glContext_ = nullptr; // SDL_GLContext
-    std::uint32_t width_ = 0;  // cached drawable size (per GL context)
+    bool vulkan_ = false;
+    std::uint32_t width_ = 0;  // fallback size if SDL cannot report a drawable
     std::uint32_t height_ = 0;
 };
 

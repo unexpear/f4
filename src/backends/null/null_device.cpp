@@ -58,7 +58,8 @@ auto NullDevice::createBuffer(const BufferDesc& desc, std::span<const std::byte>
 }
 
 auto NullDevice::createTexture(const TextureDesc& desc) -> Result<TextureHandle, GfxError> {
-    if (desc.width == 0 || desc.height == 0 || desc.mipLevels == 0) {
+    if (desc.width == 0 || desc.height == 0 || desc.mipLevels == 0 ||
+        desc.mipLevels > maxTextureMipLevels(desc.width, desc.height)) {
         return GfxError::BadDescriptor;
     }
     GpuTexture record;
@@ -73,6 +74,7 @@ auto NullDevice::createTexture(const TextureDesc& desc) -> Result<TextureHandle,
 auto NullDevice::createSampler(const SamplerDesc& desc) -> Result<SamplerHandle, GfxError> {
     GpuSampler record;
     record.filter = desc.filter;
+    record.mipFilter = desc.mipFilter;
     record.addressU = desc.addressU;
     record.addressV = desc.addressV;
     record.addressW = desc.addressW;
@@ -231,6 +233,13 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
 
     for (const Command& cmd : cb.commands()) {
         switch (cmd.kind) {
+        case CommandKind::ResourceBarrier:
+            if (cmd.barrierType == BarrierResourceType::Texture) {
+                if (!impl_->textures.contains(cmd.texture)) err = GfxError::InvalidHandle;
+            } else if (!impl_->buffers.contains(cmd.buffer)) {
+                err = GfxError::InvalidHandle;
+            }
+            break;
         case CommandKind::BeginRenderPass:
             if (!impl_->framebuffers.contains(cmd.framebuffer)) {
                 err = GfxError::InvalidHandle;

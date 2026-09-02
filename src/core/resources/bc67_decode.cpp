@@ -47,8 +47,6 @@ struct Bc6hModeInfo {
 // ---------------------------------------------------------------------------
 
 constexpr std::uint16_t kF16SignMask = 0x8000;
-constexpr std::uint16_t kF16EMMask = 0x7FFF;
-constexpr std::uint16_t kF16Max = 0x7BFF; // max finite half magnitude bits
 
 auto halfBitsToFloat(std::uint16_t h) -> float {
     const std::uint32_t sign = (static_cast<std::uint32_t>(h) >> 15u) & 1u;

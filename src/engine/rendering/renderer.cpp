@@ -28,34 +28,41 @@ Renderer::Renderer(ecs::Registry& registry, gfx::IDevice& device)
     : registry_(registry), device_(device), meshArena_(64) {}
 
 Renderer::~Renderer() {
+    device_.waitIdle();
     if (whiteSmp_.isValid()) device_.destroySampler(whiteSmp_);
     if (whiteTex_.isValid()) device_.destroyTexture(whiteTex_);
-    if (sceneUbo_.isValid()) device_.destroyBuffer(sceneUbo_);
+    sceneConstants_.destroy(device_);
     for (auto& kv : meshMap_) {
         destroyGpuMesh(device_, kv.second.gpu);
     }
     materials_.clear(device_);
-    graph_.release(device_);
+    (void)graph_.release(device_);
 }
 
 auto Renderer::init() -> gfx::GfxError {
     if (inited_) return gfx::GfxError::None;
     {
-        gfx::BufferDesc d; d.sizeBytes = sizeof(SceneUbo); d.usage = gfx::BufferUsage::Uniform;
-        auto r = device_.createBuffer(d, {});
-        if (!r.hasValue()) return r.error();
-        sceneUbo_ = r.value();
+        const gfx::GfxError error = sceneConstants_.create(device_, sizeof(SceneUbo), 64);
+        if (error != gfx::GfxError::None) return error;
     }
     {
         gfx::TextureDesc td; td.width = 1; td.height = 1; td.format = gfx::TextureFormat::RGBA8_UNORM; td.mipLevels = 1;
         auto tr = device_.createTexture(td);
         if (!tr.hasValue()) return tr.error();
-        whiteTex_ = tr.value();
+        const gfx::TextureHandle texture = tr.value();
         const std::uint8_t white[4] = {0xFF,0xFF,0xFF,0xFF};
-        auto err = device_.writeTexture(whiteTex_, 0, std::span(reinterpret_cast<const std::byte*>(white), 4));
-        if (err != gfx::GfxError::None) return err;
+        const auto pixels = std::span(reinterpret_cast<const std::byte*>(white), 4);
+        if (const auto error = device_.writeTexture(texture, 0, pixels);
+            error != gfx::GfxError::None) {
+            (void)device_.destroyTexture(texture);
+            return error;
+        }
         auto sr = device_.createSampler(gfx::SamplerDesc{});
-        if (!sr.hasValue()) return sr.error();
+        if (!sr.hasValue()) {
+            (void)device_.destroyTexture(texture);
+            return sr.error();
+        }
+        whiteTex_ = texture;
         whiteSmp_ = sr.value();
     }
     inited_ = true;
@@ -90,6 +97,8 @@ void Renderer::record(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float as
     updateCameras(registry_, aspect);
     const Camera* cam = registry_.get<Camera>(cameraEntity);
     if (cam == nullptr) return;
+    const math::Mat4 view = cameraView(*cam);
+    sceneConstants_.beginFrame();
     queue_.clear();
     for (auto [entity, renderer, world] : ecs::View<MeshRenderer, ecs::WorldMatrix>(registry_)) {
         (void)entity;
@@ -105,7 +114,7 @@ void Renderer::record(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float as
         item.entity = entity;
         item.meshRenderer = renderer;
         item.material = renderer.material;
-        item.depth = world.matrix.col[3].z;
+        item.depth = -view.transformPoint(world.matrix.col[3].xyz()).z;
         item.transparent = renderer.transparent || mat2->desc.transparent;
         item.pipelineSortKey = mat2->pipeline.index;
         queue_.push(item);
@@ -119,9 +128,11 @@ void Renderer::record(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float as
         const ecs::WorldMatrix* wm = registry_.get<ecs::WorldMatrix>(item.entity);
         if (wm == nullptr) continue;
         SceneUbo ubo; ubo.viewProj = cam->viewProj; ubo.model = wm->matrix; ubo.tint = mat->desc.tint;
-        device_.writeBuffer(sceneUbo_, 0, std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
+        const ConstantRing::Slot constants = sceneConstants_.alloc(
+            device_, std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
+        if (!constants.valid) continue;
         cb.bindPipeline(mat->pipeline);
-        cb.bindResource(0, gfx::BindingType::UniformBuffer, sceneUbo_.index, sceneUbo_.generation);
+        sceneConstants_.bind(cb, constants);
         gfx::TextureHandle tex = whiteTex_;
         gfx::SamplerHandle smp = whiteSmp_;
         cb.bindResource(0, gfx::BindingType::Texture, tex.index, tex.generation);
@@ -149,14 +160,20 @@ void Renderer::record(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float as
 }
 
 auto Renderer::render(gfx::FramebufferHandle fb, ecs::Entity cameraEntity, float aspect) -> gfx::GfxError {
-    graph_.clear();
+    if (!inited_) return gfx::GfxError::BadDescriptor;
+    if (!fb.isValid()) return gfx::GfxError::InvalidHandle;
+    if (const gfx::GfxError error = graph_.clear(device_); error != gfx::GfxError::None) return error;
+
+    const gfx::RenderGraph::ResourceId target =
+        graph_.importFramebuffer(containers::String("main-target"), fb);
     gfx::PassDesc pass; pass.name = containers::String("main");
-    pass.record = [this, cameraEntity, aspect](gfx::CommandBuffer& cb) { (void)cb; (void)cameraEntity; (void)aspect; };
+    pass.writes.push(target);
+    pass.record = [this, cameraEntity, aspect](gfx::CommandBuffer& cb) {
+        record(cb, cameraEntity, aspect);
+    };
     (void)graph_.declarePass(std::move(pass));
-    gfx::CommandBuffer cb; cb.begin(); cb.beginRenderPass(fb);
-    record(cb, cameraEntity, aspect);
-    cb.endRenderPass(); cb.end();
-    return device_.submit(cb);
+    gfx::CommandBuffer cb;
+    return graph_.execute(device_, cb);
 }
 
 } // namespace f4::engine

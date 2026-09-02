@@ -115,6 +115,21 @@ TEST_CASE("plane normalization preserves the plane and rescales distances") {
     CHECK(feq(n.distanceTo(above), scaled.distanceTo(above) * 0.5f));
 }
 
+TEST_CASE("three-plane intersection reconstructs a point") {
+    const Plane x = Plane::fromNormalPoint(Vec3(1.0f, 0.0f, 0.0f), Vec3(2.0f, 0.0f, 0.0f));
+    const Plane y = Plane::fromNormalPoint(Vec3(0.0f, 1.0f, 0.0f), Vec3(0.0f, -3.0f, 0.0f));
+    const Plane z = Plane::fromNormalPoint(Vec3(0.0f, 0.0f, 1.0f), Vec3(0.0f, 0.0f, 4.0f));
+    Vec3 point{};
+    REQUIRE(Plane::intersection(x, y, z, point));
+    CHECK(veq(point, Vec3(2.0f, -3.0f, 4.0f)));
+    CHECK(approxZero(x.distanceTo(point)));
+    CHECK(approxZero(y.distanceTo(point)));
+    CHECK(approxZero(z.distanceTo(point)));
+
+    const Plane parallel = Plane::fromNormalPoint(Vec3(1.0f, 0.0f, 0.0f), Vec3(-5.0f, 0.0f, 0.0f));
+    CHECK_FALSE(Plane::intersection(x, parallel, z, point));
+}
+
 TEST_CASE("degenerate point aabb") {
     const AABB point{Vec3(1.0f, 2.0f, 3.0f), Vec3(1.0f, 2.0f, 3.0f)};
     CHECK(point.isValid());

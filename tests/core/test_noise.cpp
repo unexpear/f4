@@ -160,12 +160,13 @@ TEST_CASE("golden vectors are bit-exact") {
             return fbm3D(p, x, y, z, s);
         });
     SUBCASE("warp2D components") {
-        const math::Vec2 w1 = warp2D(0.5f, 1.25f, 99ull, 3.5f);
-        CHECK(bitsOf(w1.x) == 0xBFA35777u);
-        CHECK(bitsOf(w1.y) == 0xBD768368u);
-        const math::Vec2 w2 = warp2D(-9.75f, 22.5f, 99ull, 3.5f);
-        CHECK(bitsOf(w2.x) == 0x3D8C0000u);
-        CHECK(bitsOf(w2.y) == 0xBF50B22Bu);
+        for (std::size_t i = 0; i < std::size(kWarp2D); i += 2) {
+            const Golden& x = kWarp2D[i];
+            const Golden& y = kWarp2D[i + 1];
+            const math::Vec2 warped = warp2D(x.x, x.y, x.seed, 3.5f);
+            CHECK(bitsOf(warped.x) == static_cast<std::uint32_t>(x.bits));
+            CHECK(bitsOf(warped.y) == static_cast<std::uint32_t>(y.bits));
+        }
     }
 }
 

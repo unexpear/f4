@@ -29,7 +29,7 @@ struct BitWriter {
 
     void write(std::uint32_t value, std::size_t count) {
         for (std::size_t i = 0; i < count; ++i) {
-            if ((value >> i) & 1u) {
+            if (i < 32 && ((value >> i) & 1u)) {
                 data[pos >> 3u] |= static_cast<std::uint8_t>(1u << (pos & 7u));
             }
             ++pos;

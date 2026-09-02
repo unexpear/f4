@@ -1,5 +1,6 @@
 #include "backends/opengl/opengl_device.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -49,6 +50,17 @@ struct GlSwapchain {
 struct GlFramebuffer {
     GpuFramebuffer rec;
     GLuint fbo = 0; // 0 = default (window) framebuffer
+};
+
+struct GlColorState {
+    bool blendEnabled = false;
+    GLenum srcColor = GL_ONE;
+    GLenum dstColor = GL_ZERO;
+    GLenum srcAlpha = GL_ONE;
+    GLenum dstAlpha = GL_ZERO;
+    GLenum colorOp = GL_FUNC_ADD;
+    GLenum alphaOp = GL_FUNC_ADD;
+    std::uint32_t writeMask = ColorWriteMask::All;
 };
 
 [[nodiscard]] auto glTextureInternal(TextureFormat format) -> GLenum {
@@ -107,8 +119,37 @@ struct GlFramebuffer {
     case TextureFormat::RGBA16_FLOAT: return GL_HALF_FLOAT;
     case TextureFormat::RGBA32_FLOAT:
     case TextureFormat::Depth32F: return GL_FLOAT;
+    case TextureFormat::Depth24Stencil8: return GL_UNSIGNED_INT_24_8;
     default: return GL_UNSIGNED_BYTE;
     }
+}
+
+[[nodiscard]] auto glAddressMode(AddressMode mode) -> GLenum {
+    switch (mode) {
+    case AddressMode::Repeat: return GL_REPEAT;
+    case AddressMode::MirroredRepeat: return GL_MIRRORED_REPEAT;
+    case AddressMode::ClampToEdge: return GL_CLAMP_TO_EDGE;
+    }
+    return GL_CLAMP_TO_EDGE;
+}
+
+[[nodiscard]] auto glMinFilter(TextureFilter filter, MipFilter mipFilter) -> GLenum {
+    const bool linear = filter == TextureFilter::MinMagLinear ||
+                        filter == TextureFilter::MinLinearMagNearest;
+    if (mipFilter == MipFilter::Nearest) {
+        return linear ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST;
+    }
+    if (mipFilter == MipFilter::Linear) {
+        return linear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
+    }
+    return linear ? GL_LINEAR : GL_NEAREST;
+}
+
+[[nodiscard]] auto glMagFilter(TextureFilter filter) -> GLenum {
+    return filter == TextureFilter::MinMagLinear ||
+                   filter == TextureFilter::MinNearestMagLinear
+               ? GL_LINEAR
+               : GL_NEAREST;
 }
 
 [[nodiscard]] auto glBlendFactor(BlendFactor factor) -> GLenum {
@@ -121,6 +162,17 @@ struct GlFramebuffer {
     case BlendFactor::OneMinusSrcColor: return GL_ONE_MINUS_SRC_COLOR;
     }
     return GL_ONE;
+}
+
+[[nodiscard]] auto glBlendOp(BlendOp op) -> GLenum {
+    switch (op) {
+    case BlendOp::Add: return GL_FUNC_ADD;
+    case BlendOp::Sub: return GL_FUNC_SUBTRACT;
+    case BlendOp::RevSub: return GL_FUNC_REVERSE_SUBTRACT;
+    case BlendOp::Min: return GL_MIN;
+    case BlendOp::Max: return GL_MAX;
+    }
+    return GL_FUNC_ADD;
 }
 
 // Bytes one mip level of the given format occupies at `width` x `height`.
@@ -274,18 +326,31 @@ struct OpenGLDevice::Impl {
     // This avoids redundant state changes when the same pipeline is re-bound.
     GlPipeline* lastPipeline_ = nullptr;
     bool glDepthTest_ = false;
+    bool glDepthClamp_ = false;
     bool glCullFace_ = false;
-    bool glBlend_ = false;
+    bool glScissorTest_ = false;
     GLenum glDepthFunc_ = GL_LESS;
     GLboolean glDepthMask_ = GL_TRUE;
-    GLenum glBlendSrc_ = GL_ONE;
-    GLenum glBlendDst_ = GL_ZERO;
+    std::vector<GlColorState> glColorStates_;
+    std::size_t activeColorStateCount_ = 1;
+    GLint maxDrawBuffers_ = 0;
+    GLint maxColorAttachments_ = 0;
+    GLint maxUniformBufferBindings_ = 0;
+    GLint maxStorageBufferBindings_ = 0;
+    GLint maxTextureUnits_ = 0;
     GLuint glProgram_ = 0;
     GLuint glVao_ = 0;
 };
 
 OpenGLDevice::OpenGLDevice() : impl_(new Impl()) {
     F4_ASSERT(impl_ != nullptr, "OpenGLDevice impl allocation failed");
+    glGetIntegerv(GL_MAX_DRAW_BUFFERS, &impl_->maxDrawBuffers_);
+    glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &impl_->maxColorAttachments_);
+    glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &impl_->maxUniformBufferBindings_);
+    glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &impl_->maxStorageBufferBindings_);
+    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &impl_->maxTextureUnits_);
+    F4_ASSERT(impl_->maxDrawBuffers_ > 0, "OpenGL reports no draw buffers");
+    impl_->glColorStates_.resize(static_cast<std::size_t>(impl_->maxDrawBuffers_));
 }
 
 OpenGLDevice::~OpenGLDevice() {
@@ -330,7 +395,8 @@ auto OpenGLDevice::createBuffer(const BufferDesc& desc, std::span<const std::byt
 }
 
 auto OpenGLDevice::createTexture(const TextureDesc& desc) -> Result<TextureHandle, GfxError> {
-    if (desc.width == 0 || desc.height == 0) {
+    if (desc.width == 0 || desc.height == 0 || desc.mipLevels == 0 ||
+        desc.mipLevels > maxTextureMipLevels(desc.width, desc.height)) {
         return GfxError::BadDescriptor;
     }
     GlTexture t;
@@ -340,9 +406,19 @@ auto OpenGLDevice::createTexture(const TextureDesc& desc) -> Result<TextureHandl
     t.rec.mipLevels = desc.mipLevels;
     glGenTextures(1, &t.id);
     glBindTexture(GL_TEXTURE_2D, t.id);
-    glTexImage2D(GL_TEXTURE_2D, 0, glTextureInternal(desc.format),
-                 static_cast<GLsizei>(desc.width), static_cast<GLsizei>(desc.height), 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    std::uint32_t width = desc.width;
+    std::uint32_t height = desc.height;
+    for (std::uint32_t level = 0; level < desc.mipLevels; ++level) {
+        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), glTextureInternal(desc.format),
+                     static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0,
+                     glPixelFormat(desc.format), glPixelType(desc.format), nullptr);
+        width = width > 1 ? width >> 1u : 1u;
+        height = height > 1 ? height >> 1u : 1u;
+    }
+    // The OpenGL default is 1000. Restrict completeness checks to the mip
+    // levels declared by the RHI texture, including valid partial chains.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                    static_cast<GLint>(desc.mipLevels - 1));
     glBindTexture(GL_TEXTURE_2D, 0);
     return impl_->textures.create(t);
 }
@@ -350,19 +426,22 @@ auto OpenGLDevice::createTexture(const TextureDesc& desc) -> Result<TextureHandl
 auto OpenGLDevice::createSampler(const SamplerDesc& desc) -> Result<SamplerHandle, GfxError> {
     GlSampler s;
     s.rec.filter = desc.filter;
+    s.rec.mipFilter = desc.mipFilter;
     s.rec.addressU = desc.addressU;
     s.rec.addressV = desc.addressV;
     s.rec.addressW = desc.addressW;
     s.rec.maxAnisotropy = desc.maxAnisotropy;
     glGenSamplers(1, &s.id);
-    const GLenum filter = desc.filter == TextureFilter::MinMagLinear ||
-                                  desc.filter == TextureFilter::MinLinearMagNearest
-                              ? GL_LINEAR
-                              : GL_NEAREST;
-    glSamplerParameteri(s.id, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(filter));
-    glSamplerParameteri(s.id, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(filter));
-    glSamplerParameteri(s.id, GL_TEXTURE_WRAP_S, static_cast<GLint>(GL_CLAMP_TO_EDGE));
-    glSamplerParameteri(s.id, GL_TEXTURE_WRAP_T, static_cast<GLint>(GL_CLAMP_TO_EDGE));
+    glSamplerParameteri(s.id, GL_TEXTURE_MIN_FILTER,
+                        static_cast<GLint>(glMinFilter(desc.filter, desc.mipFilter)));
+    glSamplerParameteri(s.id, GL_TEXTURE_MAG_FILTER,
+                        static_cast<GLint>(glMagFilter(desc.filter)));
+    glSamplerParameteri(s.id, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(glAddressMode(desc.addressU)));
+    glSamplerParameteri(s.id, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(glAddressMode(desc.addressV)));
+    glSamplerParameteri(s.id, GL_TEXTURE_WRAP_R,
+                        static_cast<GLint>(glAddressMode(desc.addressW)));
     if (desc.maxAnisotropy > 1.0f) {
         glSamplerParameterf(s.id, GL_TEXTURE_MAX_ANISOTROPY, desc.maxAnisotropy);
     }
@@ -397,6 +476,52 @@ auto OpenGLDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, 
 
 auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
     -> Result<PipelineHandle, GfxError> {
+    const std::size_t colorStateCount =
+        desc.colorAttachments.isEmpty() ? 1 : desc.colorAttachments.size();
+    if (colorStateCount > static_cast<std::size_t>(impl_->maxDrawBuffers_) ||
+        desc.layout.pushConstantSizeBytes != 0 || desc.layout.groups.size() > 1) {
+        return GfxError::BadDescriptor;
+    }
+    for (const ColorAttachmentState& color : desc.colorAttachments) {
+        if ((color.writeMask & ~ColorWriteMask::All) != 0) {
+            return GfxError::BadDescriptor;
+        }
+    }
+
+    constexpr std::uint32_t graphicsStageMask =
+        shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
+    if (!desc.layout.groups.isEmpty()) {
+        const BindGroup& group = desc.layout.groups[0];
+        if (group.bindPoint != 0) {
+            return GfxError::BadDescriptor;
+        }
+        for (std::size_t i = 0; i < group.slots.size(); ++i) {
+            const BindingSlot& slot = group.slots[i];
+            GLint bindingLimit = 0;
+            switch (slot.type) {
+            case BindingType::UniformBuffer:
+                bindingLimit = impl_->maxUniformBufferBindings_;
+                break;
+            case BindingType::StorageBuffer:
+                bindingLimit = impl_->maxStorageBufferBindings_;
+                break;
+            case BindingType::Texture:
+            case BindingType::Sampler:
+                bindingLimit = impl_->maxTextureUnits_;
+                break;
+            }
+            if (slot.count != 1 || slot.slot >= static_cast<std::uint32_t>(bindingLimit) ||
+                (slot.stageMask != 0 && (slot.stageMask & ~graphicsStageMask) != 0)) {
+                return GfxError::BadDescriptor;
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (group.slots[j].type == slot.type && group.slots[j].slot == slot.slot) {
+                    return GfxError::BadDescriptor;
+                }
+            }
+        }
+    }
+
     GlShader* vs = impl_->shaders.get(desc.vertexShader);
     GlShader* fs = impl_->shaders.get(desc.fragmentShader);
     if (vs == nullptr || fs == nullptr) {
@@ -438,6 +563,10 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
         glVertexAttribBinding(attribute.location, attribute.binding);
     }
     glBindVertexArray(0);
+    // Pipeline construction changes the real VAO binding outside submit().
+    // Invalidate the fast-path guard so the next bind restores its full state.
+    impl_->glVao_ = 0;
+    impl_->lastPipeline_ = nullptr;
 
     GlPipeline p;
     p.rec.desc = desc;
@@ -457,6 +586,25 @@ auto OpenGLDevice::createSwapchain(const SwapchainDesc& desc) -> Result<Swapchai
 
 auto OpenGLDevice::createFramebuffer(const FramebufferDesc& desc)
     -> Result<FramebufferHandle, GfxError> {
+    if (desc.extent.width == 0 || desc.extent.height == 0) {
+        return GfxError::BadDescriptor;
+    }
+
+    std::size_t colorAttachmentCount = 0;
+    std::size_t depthAttachmentCount = 0;
+    for (const AttachmentDesc& attachment : desc.attachments) {
+        if (attachment.type == AttachmentType::Color) {
+            ++colorAttachmentCount;
+        } else {
+            ++depthAttachmentCount;
+        }
+    }
+    const GLint colorLimit = std::min(impl_->maxDrawBuffers_, impl_->maxColorAttachments_);
+    if (colorAttachmentCount > static_cast<std::size_t>(colorLimit) ||
+        depthAttachmentCount > 1) {
+        return GfxError::BadDescriptor;
+    }
+
     GlFramebuffer fb;
     fb.rec.extent = desc.extent;
     fb.rec.attachments = desc.attachments;
@@ -474,33 +622,58 @@ auto OpenGLDevice::createFramebuffer(const FramebufferDesc& desc)
         glGenFramebuffers(1, &fb.fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
-        GLenum drawBuffers[8]{};
-        std::uint32_t colorIndex = 0;
+        std::vector<GLenum> drawBuffers;
+        drawBuffers.reserve(colorAttachmentCount);
+        std::size_t colorIndex = 0;
 
         for (const auto& att : desc.attachments) {
-            if (att.type == AttachmentType::Color && att.texture.isValid()) {
-                GlTexture* tex = impl_->textures.get(att.texture);
-                if (tex == nullptr) {
+            if (!att.texture.isValid()) {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glDeleteFramebuffers(1, &fb.fbo);
+                return GfxError::BadDescriptor;
+            }
+            GlTexture* tex = impl_->textures.get(att.texture);
+            if (tex == nullptr) {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glDeleteFramebuffers(1, &fb.fbo);
+                return GfxError::InvalidHandle;
+            }
+            if (tex->rec.width != desc.extent.width || tex->rec.height != desc.extent.height) {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glDeleteFramebuffers(1, &fb.fbo);
+                return GfxError::BadDescriptor;
+            }
+
+            const bool depthFormat = tex->rec.format == TextureFormat::Depth32F ||
+                                     tex->rec.format == TextureFormat::Depth24Stencil8;
+            if (att.type == AttachmentType::Color) {
+                if (depthFormat) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     glDeleteFramebuffers(1, &fb.fbo);
-                    return GfxError::InvalidHandle;
+                    return GfxError::BadDescriptor;
                 }
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + colorIndex,
-                                       GL_TEXTURE_2D, tex->id, 0);
-                drawBuffers[colorIndex] = GL_COLOR_ATTACHMENT0 + colorIndex;
+                const GLenum target = GL_COLOR_ATTACHMENT0 + static_cast<GLenum>(colorIndex);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, target, GL_TEXTURE_2D, tex->id, 0);
+                drawBuffers.push_back(target);
                 ++colorIndex;
-            } else if (att.type == AttachmentType::Depth && att.texture.isValid()) {
-                GlTexture* tex = impl_->textures.get(att.texture);
-                if (tex == nullptr) {
+            } else {
+                if (!depthFormat) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     glDeleteFramebuffers(1, &fb.fbo);
-                    return GfxError::InvalidHandle;
+                    return GfxError::BadDescriptor;
                 }
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                                       GL_TEXTURE_2D, tex->id, 0);
+                const GLenum target = tex->rec.format == TextureFormat::Depth24Stencil8
+                                          ? GL_DEPTH_STENCIL_ATTACHMENT
+                                          : GL_DEPTH_ATTACHMENT;
+                glFramebufferTexture2D(GL_FRAMEBUFFER, target, GL_TEXTURE_2D, tex->id, 0);
             }
         }
 
-        if (colorIndex > 0) {
-            glDrawBuffers(static_cast<GLsizei>(colorIndex), drawBuffers);
+        if (!drawBuffers.empty()) {
+            glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
+        } else {
+            glDrawBuffer(GL_NONE);
+            glReadBuffer(GL_NONE);
         }
 
         const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -559,10 +732,19 @@ auto OpenGLDevice::destroyPipeline(PipelineHandle h) -> GfxError {
     if (p == nullptr) {
         return GfxError::StaleHandle;
     }
+    if (impl_->lastPipeline_ == p) {
+        impl_->lastPipeline_ = nullptr;
+    }
+    if (impl_->boundPipeline_ == p) {
+        impl_->boundPipeline_ = nullptr;
+    }
     if (p->program != 0) {
         glDeleteProgram(p->program);
     }
     if (p->vao != 0) {
+        if (impl_->glVao_ == p->vao) {
+            impl_->glVao_ = 0;
+        }
         glDeleteVertexArrays(1, &p->vao);
     }
     impl_->pipelines.destroy(h);
@@ -645,23 +827,29 @@ auto OpenGLDevice::createBufferUpload(const BufferDesc& desc, std::span<const st
 }
 
 auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
-    // Reset per-submit state machine and GL state cache.
+    // Reset command-validation state. The GL state cache persists across submits
+    // because the corresponding driver state persists too.
     impl_->lastSubmitError_ = GfxError::None;
     impl_->renderPassActive_ = false;
     impl_->boundPipeline_ = nullptr;
     impl_->boundIndexBuffer_ = 0;
     impl_->boundFramebuffer_ = nullptr;
-    impl_->lastPipeline_ = nullptr;
-    impl_->glDepthTest_ = false;
-    impl_->glCullFace_ = false;
-    impl_->glBlend_ = false;
-    impl_->glDepthFunc_ = GL_LESS;
-    impl_->glDepthMask_ = GL_TRUE;
-    impl_->glProgram_ = 0;
-    impl_->glVao_ = 0;
 
     for (const Command& command : cb.commands()) {
         switch (command.kind) {
+        case CommandKind::ResourceBarrier:
+            if (command.barrierType == BarrierResourceType::Texture) {
+                if (!impl_->textures.contains(command.texture)) {
+                    impl_->lastSubmitError_ = GfxError::InvalidHandle;
+                    return GfxError::InvalidHandle;
+                }
+            } else if (!impl_->buffers.contains(command.buffer)) {
+                impl_->lastSubmitError_ = GfxError::InvalidHandle;
+                return GfxError::InvalidHandle;
+            }
+            // GL's serial command stream provides the ordering required by the
+            // currently supported graphics operations.
+            break;
         case CommandKind::BeginRenderPass: {
             GlFramebuffer* fb = impl_->framebuffers.get(command.framebuffer);
             if (fb == nullptr) {
@@ -669,27 +857,58 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 return GfxError::InvalidHandle;
             }
             glBindFramebuffer(GL_FRAMEBUFFER, fb->fbo);
+            // Scissor is dynamic per pass. Reset it before clears so state from
+            // an earlier pass cannot clip this pass's attachments.
+            if (impl_->glScissorTest_) {
+                glDisable(GL_SCISSOR_TEST);
+                impl_->glScissorTest_ = false;
+            }
             glViewport(0, 0, static_cast<GLsizei>(fb->rec.extent.width),
                        static_cast<GLsizei>(fb->rec.extent.height));
 
-            // Build the clear mask from actual attachment flags — only clear
-            // attachments whose load operation is clearOnLoad.
-            GLbitfield clearBits = 0;
+            bool clearDepth = false;
+            std::size_t colorIndex = 0;
             for (const auto& att : fb->rec.attachments) {
-                if (!att.clearOnLoad) {
-                    continue;
-                }
                 if (att.type == AttachmentType::Color) {
-                    glClearColor(att.clear.color[0], att.clear.color[1],
-                                 att.clear.color[2], att.clear.color[3]);
-                    clearBits |= GL_COLOR_BUFFER_BIT;
-                } else if (att.type == AttachmentType::Depth) {
-                    glClearDepth(static_cast<GLclampd>(att.clear.depth));
-                    clearBits |= GL_DEPTH_BUFFER_BIT;
+                    if (att.clearOnLoad) {
+                        const std::uint32_t restoreMask =
+                            impl_->glColorStates_[colorIndex].writeMask;
+                        if (restoreMask != ColorWriteMask::All) {
+                            glColorMaski(static_cast<GLuint>(colorIndex), GL_TRUE, GL_TRUE,
+                                         GL_TRUE, GL_TRUE);
+                        }
+                        glClearBufferfv(GL_COLOR, static_cast<GLint>(colorIndex), att.clear.color);
+                        if (restoreMask != ColorWriteMask::All) {
+                            glColorMaski(static_cast<GLuint>(colorIndex),
+                                         (restoreMask & ColorWriteMask::R) != 0,
+                                         (restoreMask & ColorWriteMask::G) != 0,
+                                         (restoreMask & ColorWriteMask::B) != 0,
+                                         (restoreMask & ColorWriteMask::A) != 0);
+                        }
+                    }
+                    ++colorIndex;
+                } else if (att.type == AttachmentType::Depth && att.clearOnLoad) {
+                    clearDepth = true;
                 }
             }
-            if (clearBits != 0) {
-                glClear(clearBits);
+            // Depth clears honor the write mask. Overlay pipelines disable
+            // depth writes, so temporarily enable them around the clear.
+            const bool restoreDepthMask = clearDepth && impl_->glDepthMask_ == GL_FALSE;
+            if (restoreDepthMask) {
+                glDepthMask(GL_TRUE);
+            }
+            if (clearDepth) {
+                float depthValue = 1.0f;
+                for (const auto& att : fb->rec.attachments) {
+                    if (att.type == AttachmentType::Depth && att.clearOnLoad) {
+                        depthValue = att.clear.depth;
+                        break;
+                    }
+                }
+                glClearBufferfv(GL_DEPTH, 0, &depthValue);
+            }
+            if (restoreDepthMask) {
+                glDepthMask(GL_FALSE);
             }
 
             impl_->renderPassActive_ = true;
@@ -699,11 +918,6 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::EndRenderPass: {
             impl_->renderPassActive_ = false;
             impl_->boundFramebuffer_ = nullptr;
-            // Update state cache: EndRenderPass disables depth test.
-            if (impl_->glDepthTest_) {
-                glDisable(GL_DEPTH_TEST);
-                impl_->glDepthTest_ = false;
-            }
             break;
         }
         case CommandKind::BindPipeline: {
@@ -735,6 +949,15 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 if (wantCull) {
                     glCullFace(glCull(p->rec.desc.raster.cullMode));
                 }
+                const bool wantDepthClamp = p->rec.desc.raster.depthClampEnable;
+                if (wantDepthClamp != impl_->glDepthClamp_) {
+                    if (wantDepthClamp) {
+                        glEnable(GL_DEPTH_CLAMP);
+                    } else {
+                        glDisable(GL_DEPTH_CLAMP);
+                    }
+                    impl_->glDepthClamp_ = wantDepthClamp;
+                }
                 // Depth test.
                 const bool wantDepth = p->rec.desc.depthStencil.depthTestEnable;
                 if (wantDepth != impl_->glDepthTest_) {
@@ -757,30 +980,59 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                     glDepthMask(wantMask);
                     impl_->glDepthMask_ = wantMask;
                 }
-                // Blending (first color attachment only — enough for a fixed
-                // overlay; M8 material work can generalize this).
-                const ColorAttachmentState* blend = nullptr;
-                if (!p->rec.desc.colorAttachments.isEmpty()) {
-                    blend = &p->rec.desc.colorAttachments[0];
-                }
-                const bool wantBlend = blend != nullptr && blend->blendEnable;
-                if (wantBlend != impl_->glBlend_) {
-                    if (wantBlend) {
-                        glEnable(GL_BLEND);
-                    } else {
-                        glDisable(GL_BLEND);
+                ColorAttachmentState defaultColor;
+                const std::size_t colorStateCount = p->rec.desc.colorAttachments.isEmpty()
+                                                        ? 1
+                                                        : p->rec.desc.colorAttachments.size();
+                const std::size_t statesToApply =
+                    std::max(colorStateCount, impl_->activeColorStateCount_);
+                for (std::size_t i = 0; i < statesToApply; ++i) {
+                    const ColorAttachmentState& color =
+                        i < colorStateCount
+                            ? (p->rec.desc.colorAttachments.isEmpty()
+                                   ? defaultColor
+                                   : p->rec.desc.colorAttachments[i])
+                            : defaultColor;
+                    GlColorState& cached = impl_->glColorStates_[i];
+                    const GLuint index = static_cast<GLuint>(i);
+                    if (color.blendEnable != cached.blendEnabled) {
+                        if (color.blendEnable) {
+                            glEnablei(GL_BLEND, index);
+                        } else {
+                            glDisablei(GL_BLEND, index);
+                        }
+                        cached.blendEnabled = color.blendEnable;
                     }
-                    impl_->glBlend_ = wantBlend;
-                }
-                if (wantBlend && blend != nullptr) {
-                    const GLenum src = glBlendFactor(blend->srcColor);
-                    const GLenum dst = glBlendFactor(blend->dstColor);
-                    if (src != impl_->glBlendSrc_ || dst != impl_->glBlendDst_) {
-                        glBlendFuncSeparate(src, dst, src, dst);
-                        impl_->glBlendSrc_ = src;
-                        impl_->glBlendDst_ = dst;
+                    if (color.blendEnable) {
+                        const GLenum srcColor = glBlendFactor(color.srcColor);
+                        const GLenum dstColor = glBlendFactor(color.dstColor);
+                        const GLenum srcAlpha = glBlendFactor(color.srcAlpha);
+                        const GLenum dstAlpha = glBlendFactor(color.dstAlpha);
+                        if (srcColor != cached.srcColor || dstColor != cached.dstColor ||
+                            srcAlpha != cached.srcAlpha || dstAlpha != cached.dstAlpha) {
+                            glBlendFuncSeparatei(index, srcColor, dstColor, srcAlpha, dstAlpha);
+                            cached.srcColor = srcColor;
+                            cached.dstColor = dstColor;
+                            cached.srcAlpha = srcAlpha;
+                            cached.dstAlpha = dstAlpha;
+                        }
+                        const GLenum colorOp = glBlendOp(color.colorOp);
+                        const GLenum alphaOp = glBlendOp(color.alphaOp);
+                        if (colorOp != cached.colorOp || alphaOp != cached.alphaOp) {
+                            glBlendEquationSeparatei(index, colorOp, alphaOp);
+                            cached.colorOp = colorOp;
+                            cached.alphaOp = alphaOp;
+                        }
+                    }
+                    if (color.writeMask != cached.writeMask) {
+                        glColorMaski(index, (color.writeMask & ColorWriteMask::R) != 0,
+                                     (color.writeMask & ColorWriteMask::G) != 0,
+                                     (color.writeMask & ColorWriteMask::B) != 0,
+                                     (color.writeMask & ColorWriteMask::A) != 0);
+                        cached.writeMask = color.writeMask;
                     }
                 }
+                impl_->activeColorStateCount_ = colorStateCount;
                 impl_->lastPipeline_ = p;
             }
             impl_->boundPipeline_ = p;
@@ -816,6 +1068,10 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         }
         case CommandKind::SetScissor: {
+            if (!impl_->glScissorTest_) {
+                glEnable(GL_SCISSOR_TEST);
+                impl_->glScissorTest_ = true;
+            }
             glScissor(0, 0, static_cast<GLsizei>(command.scissor.width),
                       static_cast<GLsizei>(command.scissor.height));
             break;
@@ -879,7 +1135,27 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::BindResources: {
             for (std::uint8_t ri = 0; ri < command.resourceCount; ++ri) {
                 const BoundResource& res = command.resources[ri];
+                if (res.bindPoint != 0) {
+                    impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                    return GfxError::BadDescriptor;
+                }
+                if (impl_->boundPipeline_ != nullptr &&
+                    !impl_->boundPipeline_->rec.desc.layout.groups.isEmpty()) {
+                    bool declared = false;
+                    for (const BindingSlot& slot :
+                         impl_->boundPipeline_->rec.desc.layout.groups[0].slots) {
+                        declared = declared || (slot.type == res.type && slot.slot == res.slot);
+                    }
+                    if (!declared) {
+                        impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                        return GfxError::BadDescriptor;
+                    }
+                }
                 if (res.type == BindingType::Texture) {
+                    if (res.slot >= static_cast<std::uint32_t>(impl_->maxTextureUnits_)) {
+                        impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                        return GfxError::BadDescriptor;
+                    }
                     TextureHandle th;
                     th.index = res.handleIndex;
                     th.generation = res.handleGeneration;
@@ -894,12 +1170,20 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                     glBindTexture(GL_TEXTURE_2D, t->id);
                     // Point the fragment sampler uniform at this unit. Sampler
                     // names follow the convention uTex (slot 0) / uTex<N>.
-                    std::string uniformName = res.slot == 0 ? "uTex" : "uTex" + std::to_string(res.slot);
-                    const GLint loc = glGetUniformLocation(impl_->glProgram_, uniformName.c_str());
-                    if (loc >= 0) {
-                        glUniform1i(loc, static_cast<GLint>(res.slot));
+                    if (impl_->glProgram_ != 0) {
+                        const std::string uniformName =
+                            res.slot == 0 ? "uTex" : "uTex" + std::to_string(res.slot);
+                        const GLint loc =
+                            glGetUniformLocation(impl_->glProgram_, uniformName.c_str());
+                        if (loc >= 0) {
+                            glUniform1i(loc, static_cast<GLint>(res.slot));
+                        }
                     }
                 } else if (res.type == BindingType::Sampler) {
+                    if (res.slot >= static_cast<std::uint32_t>(impl_->maxTextureUnits_)) {
+                        impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                        return GfxError::BadDescriptor;
+                    }
                     SamplerHandle sh;
                     sh.index = res.handleIndex;
                     sh.generation = res.handleGeneration;
@@ -918,10 +1202,25 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                         impl_->lastSubmitError_ = GfxError::InvalidHandle;
                         return GfxError::InvalidHandle;
                     }
-                    if (hasUsage(b->rec.usage, BufferUsage::Uniform)) {
+                    if (res.type == BindingType::UniformBuffer &&
+                        hasUsage(b->rec.usage, BufferUsage::Uniform)) {
+                        if (res.slot >=
+                            static_cast<std::uint32_t>(impl_->maxUniformBufferBindings_)) {
+                            impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                            return GfxError::BadDescriptor;
+                        }
                         glBindBufferBase(GL_UNIFORM_BUFFER, res.slot, b->id);
-                    } else if (hasUsage(b->rec.usage, BufferUsage::Storage)) {
+                    } else if (res.type == BindingType::StorageBuffer &&
+                               hasUsage(b->rec.usage, BufferUsage::Storage)) {
+                        if (res.slot >=
+                            static_cast<std::uint32_t>(impl_->maxStorageBufferBindings_)) {
+                            impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                            return GfxError::BadDescriptor;
+                        }
                         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, res.slot, b->id);
+                    } else {
+                        impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                        return GfxError::BadDescriptor;
                     }
                 }
             }
@@ -952,6 +1251,29 @@ auto OpenGLDevice::stats() const -> DeviceStats {
 
 auto OpenGLDevice::resetFrameStats() -> void { impl_->stats_ = DeviceStats{}; }
 
-auto createOpenGLDevice() -> IDevice* { return new OpenGLDevice(); }
+auto createOpenGLDevice() -> IDevice* {
+    GLint major = 0;
+    GLint minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+
+    const bool hasCoreClipControl = major > 4 || (major == 4 && minor >= 5);
+    const bool hasExtensionClipControl = epoxy_has_gl_extension("GL_ARB_clip_control") != 0;
+    if (!hasCoreClipControl && !hasExtensionClipControl) {
+        F4_LOG_ERROR() << "OpenGL backend requires GL_ARB_clip_control for the shared 0..1 "
+                          "clip-depth convention";
+        return nullptr;
+    }
+
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    GLint clipDepthMode = 0;
+    glGetIntegerv(GL_CLIP_DEPTH_MODE, &clipDepthMode);
+    if (clipDepthMode != GL_ZERO_TO_ONE) {
+        F4_LOG_ERROR() << "OpenGL failed to select the shared 0..1 clip-depth convention";
+        return nullptr;
+    }
+
+    return new OpenGLDevice();
+}
 
 } // namespace f4::gfx

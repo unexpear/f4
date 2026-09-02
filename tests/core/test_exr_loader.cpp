@@ -26,10 +26,11 @@ auto floatToHalf(float f) -> std::uint16_t {
     std::uint32_t mantissa = bits & 0x7FFFFFu;
 
     if (exponent > 15) return static_cast<std::uint16_t>(sign | 0x7C00u); // inf
+    if (exponent < -24) return static_cast<std::uint16_t>(sign); // underflows to zero
     if (exponent < -14) {
         // Denorm or zero.
-        mantissa = (mantissa | 0x800000u) >> (1 - exponent - 14);
-        return static_cast<std::uint16_t>(sign | (mantissa >> 13u));
+        mantissa = (mantissa | 0x800000u) >> static_cast<std::uint32_t>(-exponent - 1);
+        return static_cast<std::uint16_t>(sign | mantissa);
     }
     return static_cast<std::uint16_t>(sign |
         (static_cast<std::uint32_t>(exponent + 15) << 10u) |

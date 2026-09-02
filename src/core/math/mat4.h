@@ -8,6 +8,11 @@
 
 namespace f4::math {
 
+// M8 decision: the shared 0..1 projection convention remains forward-Z.
+// Near maps to 0, far maps to 1; reversed-Z is deferred until every backend
+// can switch clear values and depth comparisons as one atomic policy change.
+inline constexpr bool kUsesReversedZ = false;
+
 struct Mat4 {
     Vec4 col[4];
 

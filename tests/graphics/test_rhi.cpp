@@ -701,6 +701,21 @@ TEST_CASE("Texture: writeTexture validates footprint, mip level, and liveness") 
     CHECK(d->writeTexture(stale, 0, std::span(full)) == GfxError::StaleHandle);
 }
 
+TEST_CASE("Texture: mip count cannot exceed the complete chain") {
+    TestDevice t;
+    TextureDesc valid;
+    valid.width = 8;
+    valid.height = 4;
+    valid.mipLevels = 4;
+    CHECK(t.dev->createTexture(valid).hasValue());
+
+    TextureDesc invalid = valid;
+    invalid.mipLevels = 5;
+    const auto result = t.dev->createTexture(invalid);
+    REQUIRE(result.hasError());
+    CHECK(result.error() == GfxError::BadDescriptor);
+}
+
 TEST_CASE("Resources: typed bindResource validates texture/sampler handles") {
     TestDevice t;
     IDevice* d = t.dev;

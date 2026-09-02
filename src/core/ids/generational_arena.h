@@ -37,6 +37,14 @@ public:
     GenerationalArena(const GenerationalArena&) = delete;
     auto operator=(const GenerationalArena&) -> GenerationalArena& = delete;
 
+    ~GenerationalArena() {
+        for (Slot& slot : slots_) {
+            if (slot.live) {
+                slot.object()->~T();
+            }
+        }
+    }
+
     template <typename... Args>
     auto acquire(Args&&... args) -> Id {
         F4_ASSERT(!freeIndices_.isEmpty(), "generational arena exhausted");
