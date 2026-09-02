@@ -497,6 +497,8 @@ template <typename ImplType>
             if (severity == D3D12_MESSAGE_SEVERITY_ERROR ||
                 severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
                 F4_LOG_ERROR() << "DX12 validation: " << message->pDescription;
+            } else if (severity == D3D12_MESSAGE_SEVERITY_WARNING) {
+                F4_LOG_WARNING() << "DX12 validation: " << message->pDescription;
             }
             ++result;
         }
@@ -717,9 +719,23 @@ auto Dx12Device::createTexture(const TextureDesc& desc) -> Result<TextureHandle,
                              ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                              : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const D3D12_HEAP_PROPERTIES properties = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_CLEAR_VALUE optimizedClear{};
+    const D3D12_CLEAR_VALUE* clearValue = nullptr;
+    if (desc.hasOptimizedClear) {
+        optimizedClear.Format = dxgiFormat(desc.format);
+        if (isDepthFormat(desc.format)) {
+            optimizedClear.DepthStencil.Depth = desc.optimizedClear.depth;
+            optimizedClear.DepthStencil.Stencil =
+                static_cast<UINT8>(desc.optimizedClear.stencil);
+        } else {
+            std::memcpy(optimizedClear.Color, desc.optimizedClear.color,
+                        sizeof(optimizedClear.Color));
+        }
+        clearValue = &optimizedClear;
+    }
     const HRESULT result = impl_->device->CreateCommittedResource(
         &properties, D3D12_HEAP_FLAG_NONE, &resourceDesc,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_ID3D12Resource,
+        D3D12_RESOURCE_STATE_COMMON, clearValue, IID_ID3D12Resource,
         record.resource.putVoid());
     if (FAILED(result)) return toGfxError(result);
     const TextureHandle handle = impl_->textures.create(std::move(record));
@@ -1355,7 +1371,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                     desc.AddressV = dxAddress(sampler->rec.addressV);
                     desc.AddressW = dxAddress(sampler->rec.addressW);
                     desc.MaxAnisotropy = static_cast<UINT>(sampler->rec.maxAnisotropy);
-                    desc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+                    desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
                     desc.MinLOD = 0.0f;
                     desc.MaxLOD = sampler->rec.mipFilter == MipFilter::None
                                       ? 0.0f : D3D12_FLOAT32_MAX;

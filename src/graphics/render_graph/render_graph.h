@@ -29,7 +29,8 @@ struct ResourceDesc {
     TextureDesc texture{};
     BufferDesc buffer{};
     FramebufferDesc framebuffer{};
-    // Imported framebuffers are borrowed and are never destroyed by the graph.
+    // Imported handles are borrowed and are never destroyed by the graph.
+    TextureHandle importedTexture{};
     FramebufferHandle importedFramebuffer{};
 };
 
@@ -60,6 +61,7 @@ public:
     using ResourceId = std::uint32_t;
 
     [[nodiscard]] auto declareResource(ResourceDesc desc) -> ResourceId;
+    [[nodiscard]] auto importTexture(String name, TextureHandle texture) -> ResourceId;
     [[nodiscard]] auto importFramebuffer(String name, FramebufferHandle framebuffer) -> ResourceId;
     [[nodiscard]] auto declarePass(PassDesc desc) -> std::uint32_t;
 

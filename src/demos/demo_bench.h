@@ -96,7 +96,7 @@ public:
     void addScene(IDemoScene* scene);
 
     // Run interactively, or visit every scene for a bounded number of frames.
-    int run(std::size_t smokeFramesPerScene = 0);
+    int run(std::size_t smokeFramesPerScene = 0, const char* captureDirectory = nullptr);
 
     // Switch to scene by index. Keyboard shortcuts cover 0-17; Tab covers all.
     bool setScene(std::size_t index);
@@ -139,6 +139,8 @@ private:
     void rebuildFramebuffer();
     void handleEvents();
     void updateMetrics(float dt);
+    [[nodiscard]] bool captureBackbuffer(const char* directory,
+                                         std::size_t frameInScene) const;
 };
 
 } // namespace f4::demo

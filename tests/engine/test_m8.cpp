@@ -115,6 +115,11 @@ TEST_CASE("M8: shader RGBA8 parity is exact and reports pixels") {
     CHECK(report.mismatchPixelCount == 1);
     CHECK(report.firstMismatchPixel == 1);
     CHECK(report.maxChannelDelta == 2);
+    CHECK_FALSE(engine::compareShaderImagesRgba8(reference, changed, 1).matches());
+    const engine::ShaderImageParityReport tolerantReport =
+        engine::compareShaderImagesRgba8(reference, changed, 2);
+    CHECK(tolerantReport.matches());
+    CHECK(tolerantReport.maxChannelDelta == 2);
 
     const std::array<std::uint8_t, 3> malformed{{1, 2, 3}};
     CHECK(engine::compareShaderImagesRgba8(malformed, malformed).status ==

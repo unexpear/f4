@@ -23,7 +23,7 @@ private:
     engine::ConstantRing constRing_;
     bool inited_ = false;
     gfx::IDevice* device_ = nullptr;
-    float angle_ = 0.f;
+    float angle_ = 0.55f;
 };
 
 } // namespace f4::demo

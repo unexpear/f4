@@ -129,11 +129,13 @@ void CommandBuffer::draw(std::uint32_t vertexCount, std::uint32_t instanceCount)
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount) {
+void CommandBuffer::drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount,
+                                std::uint32_t firstIndex) {
     Command cmd;
     cmd.kind = CommandKind::DrawIndexed;
     cmd.indexCount = indexCount;
     cmd.instanceCount = instanceCount;
+    cmd.firstIndex = firstIndex;
     pushCommand(std::move(cmd));
 }
 

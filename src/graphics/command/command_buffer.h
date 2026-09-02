@@ -99,7 +99,8 @@ public:
     void setViewport(Extent viewport);
     void setScissor(Extent scissor);
     void draw(std::uint32_t vertexCount, std::uint32_t instanceCount = 1);
-    void drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount = 1);
+    void drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount = 1,
+                     std::uint32_t firstIndex = 0);
     void beginRenderPass(FramebufferHandle framebuffer);
     void endRenderPass();
 

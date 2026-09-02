@@ -44,9 +44,11 @@ struct ShaderImageParityReport {
     [[nodiscard]] auto matches() const -> bool { return status == ShaderParityStatus::Match; }
 };
 
-// Exact pixel parity gate for tightly packed RGBA8 reference captures.
+// Pixel parity gate for tightly packed RGBA8 reference captures. The default
+// remains exact; native PBR paths may opt into a small quantization tolerance.
 [[nodiscard]] auto compareShaderImagesRgba8(std::span<const std::uint8_t> reference,
-                                            std::span<const std::uint8_t> actual)
+                                            std::span<const std::uint8_t> actual,
+                                            std::uint8_t allowedChannelDelta = 0)
     -> ShaderImageParityReport;
 
 } // namespace f4::engine

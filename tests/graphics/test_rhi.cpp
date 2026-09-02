@@ -501,7 +501,7 @@ TEST_CASE("CommandBuffer: move semantics preserve command content") {
     cb.bindPipeline(pipe.value());
     cb.bindVertexBuffer(0, vb, 12);
     cb.bindIndexBuffer(ib, IndexFormat::U16);
-    cb.drawIndexed(6, 1);
+    cb.drawIndexed(6, 1, 7);
     cb.endRenderPass();
     cb.end();
 
@@ -512,6 +512,7 @@ TEST_CASE("CommandBuffer: move semantics preserve command content") {
     CHECK(cb.commands()[2].kind == CommandKind::BindVertexBuffer);
     CHECK(cb.commands()[3].kind == CommandKind::BindIndexBuffer);
     CHECK(cb.commands()[4].kind == CommandKind::DrawIndexed);
+    CHECK(cb.commands()[4].firstIndex == 7);
     CHECK(cb.commands()[5].kind == CommandKind::EndRenderPass);
     CHECK(cb.commands()[4].indexCount == 6);
 

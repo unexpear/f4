@@ -50,7 +50,8 @@ auto compareShaderFloats(std::span<const float> reference, std::span<const float
 }
 
 auto compareShaderImagesRgba8(std::span<const std::uint8_t> reference,
-                              std::span<const std::uint8_t> actual)
+                              std::span<const std::uint8_t> actual,
+                              std::uint8_t allowedChannelDelta)
     -> ShaderImageParityReport {
     ShaderImageParityReport report;
     if (reference.size() != actual.size() || (reference.size() % 4) != 0) {
@@ -67,7 +68,7 @@ auto compareShaderImagesRgba8(std::span<const std::uint8_t> reference,
                                        static_cast<int>(actual[index]));
             report.maxChannelDelta =
                 std::max(report.maxChannelDelta, static_cast<std::uint8_t>(delta));
-            pixelMismatch = pixelMismatch || delta != 0;
+            pixelMismatch = pixelMismatch || delta > allowedChannelDelta;
         }
         if (pixelMismatch) {
             if (report.mismatchPixelCount == 0) report.firstMismatchPixel = pixel;

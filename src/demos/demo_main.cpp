@@ -14,6 +14,7 @@
 #include <SDL2/SDL.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 #include "demos/demo_bench.h"
@@ -39,19 +40,41 @@ int main(int argc, char** argv) {
     DemoBench bench("f4 Demo Bench", 1280, 720);
     int initialScene = 0;
     std::size_t smokeFrames = 0;
-    if (argc > 1 && std::strcmp(argv[1], "--smoke") == 0) {
-        smokeFrames = 3;
-        if (argc > 2) {
-            const int requestedFrames = std::atoi(argv[2]);
-            if (requestedFrames <= 0) {
-                std::fprintf(stderr, "Smoke frame count must be positive\n");
+    const char* captureDirectory = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--smoke") == 0) {
+            smokeFrames = 3;
+            if (i + 1 < argc) {
+                char* end = nullptr;
+                const long requestedFrames = std::strtol(argv[i + 1], &end, 10);
+                if (end != argv[i + 1] && *end == '\0') {
+                    if (requestedFrames <= 0) {
+                        std::fprintf(stderr, "Smoke frame count must be positive\n");
+                        return 2;
+                    }
+                    smokeFrames = static_cast<std::size_t>(requestedFrames);
+                    ++i;
+                }
+            }
+        } else if (std::strcmp(argv[i], "--capture-dir") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--capture-dir requires a path\n");
                 return 2;
             }
-            smokeFrames = static_cast<std::size_t>(requestedFrames);
+            captureDirectory = argv[++i];
+        } else {
+            char* end = nullptr;
+            const long scene = std::strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || scene < 0) {
+                std::fprintf(stderr,
+                             "Usage: demo_bench [scene] [--smoke [frames]] "
+                             "[--capture-dir path]\n");
+                return 2;
+            }
+            initialScene = static_cast<int>(scene);
         }
-    } else if (argc > 1) {
-        initialScene = std::atoi(argv[1]);
     }
+    if (captureDirectory != nullptr && smokeFrames == 0) smokeFrames = 3;
 
     // Register all available scenes (in order: 0-8, then 9-17 with Shift)
     bench.addScene(new TriangleScene());      // 0 / 9
@@ -80,5 +103,5 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to initialize scene %d\n", initialScene);
         return 1;
     }
-    return bench.run(smokeFrames);
+    return bench.run(smokeFrames, captureDirectory);
 }

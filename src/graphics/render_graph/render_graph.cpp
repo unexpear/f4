@@ -10,6 +10,15 @@ auto RenderGraph::declareResource(ResourceDesc desc) -> ResourceId {
     return id;
 }
 
+auto RenderGraph::importTexture(String name, TextureHandle texture) -> ResourceId {
+    ResourceDesc desc;
+    desc.name = static_cast<String&&>(name);
+    desc.type = ResourceType::Texture;
+    desc.lifetime = ResourceLifetime::Persistent;
+    desc.importedTexture = texture;
+    return declareResource(static_cast<ResourceDesc&&>(desc));
+}
+
 auto RenderGraph::importFramebuffer(String name, FramebufferHandle framebuffer) -> ResourceId {
     ResourceDesc desc;
     desc.name = static_cast<String&&>(name);
@@ -37,10 +46,17 @@ auto RenderGraph::validateResources() const -> GfxError {
     for (const ResourceDesc& resource : resources_) {
         switch (resource.type) {
         case ResourceType::Texture:
-            if (resource.texture.width == 0 || resource.texture.height == 0 ||
-                resource.texture.mipLevels == 0 ||
-                resource.texture.mipLevels >
-                    maxTextureMipLevels(resource.texture.width, resource.texture.height)) {
+            if (!resource.importedTexture.isValid() &&
+                (resource.texture.width == 0 || resource.texture.height == 0 ||
+                 resource.texture.mipLevels == 0 ||
+                 resource.texture.mipLevels >
+                     maxTextureMipLevels(resource.texture.width, resource.texture.height))) {
+                return GfxError::BadDescriptor;
+            }
+            if (resource.importedTexture.isValid() &&
+                (resource.texture.width != 0 || resource.texture.height != 0 ||
+                 resource.texture.mipLevels != 1 ||
+                 resource.lifetime == ResourceLifetime::Transient)) {
                 return GfxError::BadDescriptor;
             }
             break;
@@ -152,13 +168,19 @@ auto RenderGraph::realize(IDevice& dev) -> GfxError {
         switch (r.type) {
         case ResourceType::Texture:
             if (!textures_[i].isValid()) {
-                auto result = dev.createTexture(r.texture);
-                if (result.hasValue()) {
-                    textures_[i] = result.value();
-                    owned_[i] = 1;
+                if (r.importedTexture.isValid()) {
+                    textures_[i] = r.importedTexture;
+                    owned_[i] = 0;
                     created.push(id);
                 } else {
-                    error = result.error();
+                    auto result = dev.createTexture(r.texture);
+                    if (result.hasValue()) {
+                        textures_[i] = result.value();
+                        owned_[i] = 1;
+                        created.push(id);
+                    } else {
+                        error = result.error();
+                    }
                 }
             }
             break;

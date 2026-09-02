@@ -159,6 +159,7 @@ f4_enable_sanitizers(f4_graphics)
 
 add_library(f4_engine STATIC
     engine/world/world_data.cpp
+    engine/rendering/pbr.cpp
     engine/rendering/material.cpp
     engine/rendering/gpu_mesh.cpp
     engine/rendering/render_queue.cpp
@@ -170,6 +171,11 @@ add_library(f4_engine STATIC
 
 target_include_directories(f4_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_engine PUBLIC f4_core f4_graphics)
+target_compile_definitions(f4_engine PRIVATE
+    F4_PBR_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_opengl.vert"
+    F4_PBR_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_opengl.frag"
+    F4_SHADOW_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.vert"
+    F4_SHADOW_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.frag")
 f4_set_warnings(f4_engine)
 f4_set_float_precision(f4_engine)
 f4_enable_sanitizers(f4_engine)
@@ -242,6 +248,42 @@ if(Vulkan_FOUND)
             $<$<CONFIG:Debug>:F4_VULKAN_VALIDATION=1>)
     endif()
 
+    if(TARGET Vulkan::glslangValidator)
+        set(F4_PBR_VK_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/pbr-vulkan-shaders")
+        set(F4_PBR_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/pbr.vert.spv")
+        set(F4_PBR_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/pbr.frag.spv")
+        set(F4_SHADOW_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/shadow.vert.spv")
+        set(F4_SHADOW_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/shadow.frag.spv")
+        function(f4_compile_pbr_spirv output source stage)
+            add_custom_command(
+                OUTPUT "${output}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_PBR_VK_SHADER_DIR}"
+                COMMAND $<TARGET_FILE:Vulkan::glslangValidator>
+                        -V --target-env vulkan1.3 --target-env spirv1.5
+                        --spirv-val -S "${stage}"
+                        -o "${output}" "${source}"
+                DEPENDS "${source}"
+                VERBATIM)
+        endfunction()
+        f4_compile_pbr_spirv("${F4_PBR_VK_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_vulkan.vert" vert)
+        f4_compile_pbr_spirv("${F4_PBR_VK_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_vulkan.frag" frag)
+        f4_compile_pbr_spirv("${F4_SHADOW_VK_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_vulkan.vert" vert)
+        f4_compile_pbr_spirv("${F4_SHADOW_VK_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_vulkan.frag" frag)
+        add_custom_target(f4_pbr_vk_shaders DEPENDS
+            "${F4_PBR_VK_VERTEX}" "${F4_PBR_VK_FRAGMENT}"
+            "${F4_SHADOW_VK_VERTEX}" "${F4_SHADOW_VK_FRAGMENT}")
+        add_dependencies(f4_engine f4_pbr_vk_shaders)
+        target_compile_definitions(f4_engine PRIVATE
+            F4_PBR_VULKAN_VERTEX="${F4_PBR_VK_VERTEX}"
+            F4_PBR_VULKAN_FRAGMENT="${F4_PBR_VK_FRAGMENT}"
+            F4_SHADOW_VULKAN_VERTEX="${F4_SHADOW_VK_VERTEX}"
+            F4_SHADOW_VULKAN_FRAGMENT="${F4_SHADOW_VK_FRAGMENT}")
+    endif()
+
     if(TARGET f4_platform)
         set(F4_GRAPHICS_HAS_VULKAN_WINDOW ON)
         target_link_libraries(f4_platform PRIVATE Vulkan::Headers)
@@ -300,16 +342,54 @@ if(WIN32)
     target_sources(f4_graphics PRIVATE backends/dx12/dx12_device.cpp)
     target_link_libraries(f4_graphics PRIVATE d3d12 dxgi dxguid)
     target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_DX12=1)
+
+    find_program(F4_DXC_EXECUTABLE NAMES dxc dxc.exe
+        HINTS "$ENV{VULKAN_SDK}/Bin"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22000.0/x64")
+    if(F4_DXC_EXECUTABLE)
+        set(F4_PBR_DX12_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/pbr-dx12-shaders")
+        set(F4_PBR_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/pbr.vert.dxil")
+        set(F4_PBR_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/pbr.frag.dxil")
+        set(F4_SHADOW_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/shadow.vert.dxil")
+        set(F4_SHADOW_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/shadow.frag.dxil")
+        function(f4_compile_pbr_dxil output source profile entry)
+            add_custom_command(
+                OUTPUT "${output}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_PBR_DX12_SHADER_DIR}"
+                COMMAND "${F4_DXC_EXECUTABLE}" -T "${profile}" -E "${entry}"
+                        -Ges -WX -Fo "${output}" "${source}"
+                DEPENDS "${source}"
+                VERBATIM)
+        endfunction()
+        f4_compile_pbr_dxil("${F4_PBR_DX12_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_dx12.hlsl"
+            vs_6_0 VSMain)
+        f4_compile_pbr_dxil("${F4_PBR_DX12_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_dx12.hlsl"
+            ps_6_0 PSMain)
+        f4_compile_pbr_dxil("${F4_SHADOW_DX12_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_dx12.hlsl"
+            vs_6_0 VSMain)
+        f4_compile_pbr_dxil("${F4_SHADOW_DX12_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_dx12.hlsl"
+            ps_6_0 PSMain)
+        add_custom_target(f4_pbr_dx12_shaders DEPENDS
+            "${F4_PBR_DX12_VERTEX}" "${F4_PBR_DX12_FRAGMENT}"
+            "${F4_SHADOW_DX12_VERTEX}" "${F4_SHADOW_DX12_FRAGMENT}")
+        add_dependencies(f4_engine f4_pbr_dx12_shaders)
+        target_compile_definitions(f4_engine PRIVATE
+            F4_PBR_DX12_VERTEX="${F4_PBR_DX12_VERTEX}"
+            F4_PBR_DX12_FRAGMENT="${F4_PBR_DX12_FRAGMENT}"
+            F4_SHADOW_DX12_VERTEX="${F4_SHADOW_DX12_VERTEX}"
+            F4_SHADOW_DX12_FRAGMENT="${F4_SHADOW_DX12_FRAGMENT}")
+    endif()
     if(TARGET f4_platform)
         set(F4_GRAPHICS_HAS_DX12_WINDOW ON)
         target_compile_definitions(f4_graphics PRIVATE F4_DX12_HAS_PLATFORM=1)
         target_compile_definitions(f4_graphics PUBLIC F4_GRAPHICS_HAS_DX12_WINDOW=1)
         target_link_libraries(f4_graphics PRIVATE f4_platform)
 
-        find_program(F4_DXC_EXECUTABLE NAMES dxc dxc.exe
-            HINTS "$ENV{VULKAN_SDK}/Bin"
-                  "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
-                  "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22000.0/x64")
         if(F4_DXC_EXECUTABLE)
             set(F4_DX12_APP_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/dx12-app-shaders")
             set(F4_DX12_APP_VERTEX_DXIL "${F4_DX12_APP_SHADER_DIR}/dx12_triangle.vert.dxil")

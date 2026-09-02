@@ -168,7 +168,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M8 Renderer + render graph v1 | ✅ Complete | `Renderer::render()` executes through the graph and graph lifetimes/rollback are covered. The constant ring grows geometrically instead of silently stopping at 64 slots; direct 130-slot and 65-object renderer regressions verify the former boundary. Cross-backend parity remains an M9/M10 acceptance item rather than an M8 requirement. |
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
-| M11 PBR | ⚠ Prototype only | Demo GLSL covers GGX metallic/roughness and normal-map orientation. Engine material integration, IBL, shadows, tone mapping, HLSL, and backend parity are absent. |
+| M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
 | M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo and pipeline-key sorting exist. Frustum/occlusion culling, draw batching, jobs, multithreaded recording, SIMD paths, graph scheduling, and async compute are absent. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
@@ -508,10 +508,23 @@ Completed delivery and acceptance gates:
    captures are byte-identical, and the factory-selected DX12 smoke capture is
    visually complete with no missing or stale geometry.
 
-### Milestone 11 — PBR
-- BRDF (GGX), IBL, normal mapping, metallic/roughness workflow
-- Shadow filtering; tone mapping
-- Implemented natively in both GLSL and HLSL under §7 parity rules
+### Milestone 11 — PBR ✅
+- ✅ Core glTF 2.0 metallic-roughness factors and all five core texture slots
+  map explicitly into renderer-owned materials; unsupported UV sets and invalid
+  texture mappings fail instead of silently sampling the wrong data.
+- ✅ GGX direct lighting, equirectangular prefiltered-mip IBL, derivative TBN
+  normal mapping, occlusion/emissive inputs, alpha mask/blend, double-sided and
+  unlit modes, and ACES tone mapping run through the engine renderer.
+- ✅ A graph-routed directional shadow pass writes a persistent R16F depth map
+  with a D32 depth attachment and applies manual 3x3 PCF in the main pass.
+- ✅ Native OpenGL GLSL, Vulkan GLSL-to-SPIR-V, and DX12 HLSL-to-DXIL paths use
+  one binding/constant contract. Full 64x64 opaque captures agree within two
+  8-bit channel levels; filtered-shadow differences are confined to 67 edge
+  pixels (1.64%) with a bounded 45-level maximum. Vulkan and DX12 validation
+  report zero warnings and errors.
+- ✅ Renderer-generated normal/UV/color fallback streams make position-only
+  meshes valid on every backend without depending on API-specific missing-input
+  behavior. Single-sided front faces remain visible in all three native paths.
 
 ### Milestone 12 — Optimization
 - Frustum culling, occlusion culling
@@ -767,8 +780,9 @@ constant allocation grows beyond the former 64-draw boundary. M9 adds a Vulkan
 presentation/capture demo plus 10 focused cases / 211 assertions covering device
 setup, resources, descriptors, barriers, retirement, rendering, swapchain
 recreation, and OpenGL/Vulkan parity. Its Windows and Linux captures differ by at
-most one 8-bit channel value. The newly supplied zipped texture assets were not
-needed for these deterministic or generated-fixture tests and were not extracted.
+most one 8-bit channel value. The supplied texture archives were extracted in
+place under `assets free to use but ziped/` and remain untracked; deterministic
+generated fixtures are still used for milestone gates.
 
 M10 and M14 completed on 2026-09-02. M10's native DX12 path passes hardware/WARP,
 resource, binding, 130-draw, barrier, swapchain-recreation, pixel-stability, and
@@ -777,14 +791,25 @@ complete. M14 adds 10 focused cases / 411 assertions. Its fixed generated-data
 and padding-free delta-stream digests match GCC, MSVC, and Clang, and the full
 Linux Clang ASan+UBSan suite passes under Xvfb.
 
+M11 completed on 2026-09-02. The production renderer now owns the complete
+metallic-roughness material path, semantic fallback textures and vertex inputs,
+IBL, filtered directional shadows, tone mapping, and native shaders for all
+three backends. Eleven focused M11 cases / 254 assertions cover CPU reference
+math, glTF mapping, resource ownership, graph execution, complete-frame parity,
+missing vertex channels, front-face visibility, and clean Vulkan/DX12 validation.
+The demo bench also gained repeatable back-buffer capture; three captured frames
+from each of all 20 scenes were inspected, with no blinking or missing cube
+faces and all seven rendering-validation scenes intact.
+
 ### Current next work (2026-09-02 audit)
 
-1. Complete M11 with engine material integration, IBL, shadows, tone mapping,
-   native GLSL/HLSL shader paths, and three-backend visual/parity coverage.
+1. Begin M15 with policy-specific voxel, height-tile, and hex-prism meshers plus
+   border invalidation/remeshing, feeding their output through the completed M11
+   material path.
 2. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
    pipelines make CPU-reference versus GPU-sampled parity testable.
-3. Begin M15 policy meshers once the M11 material path can consume terrain
-   materials consistently across all three backends.
+3. Continue M12 from profiling evidence: culling and batching first, then jobs,
+   multithreaded recording, graph scheduling, and async compute where measured.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

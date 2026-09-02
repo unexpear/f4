@@ -46,6 +46,7 @@ add_executable(f4_tests
     core/test_frustum.cpp
     graphics/test_rhi.cpp
     engine/test_m8.cpp
+    engine/test_m11.cpp
     engine/test_m14.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

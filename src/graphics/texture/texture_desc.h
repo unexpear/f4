@@ -11,6 +11,10 @@ struct TextureDesc {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t mipLevels = 1;
+    // Optional backend allocation hint. It does not define render-pass clear
+    // behavior; attachment clearOnLoad remains authoritative.
+    bool hasOptimizedClear = false;
+    ClearValue optimizedClear{};
 };
 
 [[nodiscard]] constexpr auto maxTextureMipLevels(std::uint32_t width,

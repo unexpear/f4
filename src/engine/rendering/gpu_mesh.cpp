@@ -1,6 +1,7 @@
 #include "engine/rendering/gpu_mesh.h"
 
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "core/assert.h"
@@ -38,14 +39,38 @@ auto createGpuMesh(gfx::IDevice& dev, const resources::Mesh& mesh) -> Result<Gpu
     if (mesh.streams.isEmpty()) {
         return gfx::GfxError::BadDescriptor;
     }
+    if (mesh.indices.size() > std::numeric_limits<std::uint32_t>::max() ||
+        mesh.indices.size() % resources::indexFormatSize(mesh.indexFormat) != 0) {
+        return gfx::GfxError::BadDescriptor;
+    }
+    const resources::VertexAttribute* position =
+        mesh.attributeFor(resources::VertexSemantic::Position);
+    if (position == nullptr || position->stream >= mesh.streams.size()) {
+        return gfx::GfxError::BadDescriptor;
+    }
+    const std::uint64_t vertexCount = mesh.vertexCount(position->stream);
+    if (vertexCount == 0 || vertexCount > std::numeric_limits<std::uint32_t>::max() ||
+        mesh.indexCount() > std::numeric_limits<std::uint32_t>::max()) {
+        return gfx::GfxError::BadDescriptor;
+    }
     // Validate attributes reference valid streams and offsets.
+    for (const auto& stream : mesh.streams) {
+        if (stream.strideBytes == 0 || stream.data.isEmpty() ||
+            stream.data.size() % stream.strideBytes != 0) {
+            return gfx::GfxError::BadDescriptor;
+        }
+    }
     for (const auto& attr : mesh.attributes) {
         if (attr.stream >= mesh.streams.size()) {
             return gfx::GfxError::BadDescriptor;
         }
         const auto& stream = mesh.streams[attr.stream];
         const std::uint32_t sz = resources::vertexFormatSize(attr.format);
-        if (attr.offsetBytes + sz > stream.strideBytes) {
+        if (attr.offsetBytes > stream.strideBytes ||
+            sz > stream.strideBytes - attr.offsetBytes) {
+            return gfx::GfxError::BadDescriptor;
+        }
+        if (mesh.vertexCount(attr.stream) < vertexCount) {
             return gfx::GfxError::BadDescriptor;
         }
         if (attr.format == resources::VertexFormat::F32_1) {
@@ -61,7 +86,7 @@ auto createGpuMesh(gfx::IDevice& dev, const resources::Mesh& mesh) -> Result<Gpu
                           ? gfx::IndexFormat::U16
                           : gfx::IndexFormat::U32;
     out.indexCount = static_cast<std::uint32_t>(mesh.indexCount());
-    out.vertexCount = static_cast<std::uint32_t>(mesh.vertexCount(0));
+    out.vertexCount = static_cast<std::uint32_t>(vertexCount);
 
     // Build vertex input layout from mesh attributes.
     // One binding per stream (stream index == binding index).
@@ -84,6 +109,10 @@ auto createGpuMesh(gfx::IDevice& dev, const resources::Mesh& mesh) -> Result<Gpu
 
     // Create vertex buffers.
     for (const auto& s : mesh.streams) {
+        if (s.data.size() > std::numeric_limits<std::uint32_t>::max()) {
+            for (auto h : out.vertexBuffers) dev.destroyBuffer(h);
+            return gfx::GfxError::BadDescriptor;
+        }
         gfx::BufferDesc d;
         d.sizeBytes = static_cast<std::uint32_t>(s.data.size());
         d.usage = gfx::BufferUsage::Vertex;
