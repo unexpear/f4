@@ -95,7 +95,8 @@ auto RenderGraph::validatePasses() const -> GfxError {
                                         PipelineStageMask::Transfer |
                                         PipelineStageMask::Host |
                                         PipelineStageMask::AllGraphics |
-                                        PipelineStageMask::AllCommands;
+                                        PipelineStageMask::AllCommands |
+                                        PipelineStageMask::ComputeShader;
     constexpr std::uint32_t allAccess = ResourceAccessMask::VertexRead |
                                         ResourceAccessMask::IndexRead |
                                         ResourceAccessMask::UniformRead |

@@ -29,6 +29,7 @@ enum class BindingType : std::uint8_t {
     UniformBuffer,
     Texture,
     Sampler,
+    // Read/write in compute pipelines; read-only in current graphics pipelines.
     StorageBuffer,
 };
 
@@ -127,6 +128,8 @@ struct PipelineStateDesc {
     PrimitiveTopology topology = PrimitiveTopology::TriangleList;
     ShaderHandle vertexShader{};
     ShaderHandle fragmentShader{};
+    // A pipeline is either graphics (vertex + fragment) or compute, never both.
+    ShaderHandle computeShader{};
     RasterState raster;
     DepthStencilState depthStencil;
     Array<ColorAttachmentState> colorAttachments; // empty -> single default

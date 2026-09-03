@@ -42,6 +42,8 @@ public:
 
     auto writeBuffer(BufferHandle, std::uint64_t, std::span<const std::byte>)
         -> GfxError override;
+    auto readBuffer(BufferHandle, std::uint64_t, std::span<std::byte>)
+        -> GfxError override;
     auto writeTexture(TextureHandle, std::uint32_t, std::span<const std::byte>)
         -> GfxError override;
     auto submit(CommandBuffer&) -> GfxError override;

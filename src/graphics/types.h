@@ -118,6 +118,7 @@ struct PipelineStageMask {
     static constexpr std::uint32_t Host = 1u << 6;
     static constexpr std::uint32_t AllGraphics = 1u << 7;
     static constexpr std::uint32_t AllCommands = 1u << 8;
+    static constexpr std::uint32_t ComputeShader = 1u << 9;
 };
 
 struct ResourceAccessMask {

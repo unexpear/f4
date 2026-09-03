@@ -56,6 +56,18 @@ PipelineStateDesc makePipelineDesc(ShaderHandle vs, ShaderHandle fs) {
     return desc;
 }
 
+PipelineStateDesc makeComputePipelineDesc(ShaderHandle cs) {
+    PipelineStateDesc desc;
+    desc.computeShader = cs;
+    BindGroup group;
+    BindingSlot storage;
+    storage.type = BindingType::StorageBuffer;
+    storage.stageMask = shaderStageBit(ShaderStage::Compute);
+    group.slots.push(storage);
+    desc.layout.groups.push(group);
+    return desc;
+}
+
 BufferHandle makeBuffer(IDevice* dev, std::uint64_t size, BufferUsage usage) {
     BufferDesc desc;
     desc.sizeBytes = size;
@@ -276,7 +288,11 @@ TEST_CASE("CommandBuffer: draw outside a render pass fails submit") {
     vdesc.stage = ShaderStage::Vertex;
     auto vs = d->createShader(vdesc);
     REQUIRE(vs.hasValue());
-    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), vs.value()));
+    ShaderDesc fdesc;
+    fdesc.stage = ShaderStage::Fragment;
+    auto fs = d->createShader(fdesc);
+    REQUIRE(fs.hasValue());
+    auto pipe = d->createPipeline(makePipelineDesc(vs.value(), fs.value()));
     REQUIRE(pipe.hasValue());
 
     CommandBuffer cb;
@@ -700,6 +716,91 @@ TEST_CASE("Texture: writeTexture validates footprint, mip level, and liveness") 
     TextureHandle stale = tex.value();
     stale.index = stale.index + 1;
     CHECK(d->writeTexture(stale, 0, std::span(full)) == GfxError::StaleHandle);
+}
+
+TEST_CASE("RHI: buffer readback preserves initial data and writes") {
+    TestDevice t;
+    BufferDesc desc;
+    desc.sizeBytes = 8;
+    desc.usage = BufferUsage::Storage;
+    const std::array<std::byte, 4> initial = {
+        std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    auto buffer = t.dev->createBuffer(desc, initial);
+    REQUIRE(buffer.hasValue());
+    const std::array<std::byte, 2> patch = {std::byte{9}, std::byte{8}};
+    REQUIRE(t.dev->writeBuffer(buffer.value(), 4, patch) == GfxError::None);
+    std::array<std::byte, 6> output{};
+    REQUIRE(t.dev->readBuffer(buffer.value(), 0, output) == GfxError::None);
+    const std::array<std::byte, 6> expected = {
+        std::byte{1}, std::byte{2}, std::byte{3},
+        std::byte{4}, std::byte{9}, std::byte{8}};
+    CHECK(output == expected);
+    CHECK(t.dev->readBuffer(buffer.value(), 3, output) == GfxError::BadDescriptor);
+    REQUIRE(t.dev->destroyBuffer(buffer.value()) == GfxError::None);
+    CHECK(t.dev->readBuffer(buffer.value(), 0, output) == GfxError::StaleHandle);
+}
+
+TEST_CASE("RHI: compute pipelines dispatch outside render passes") {
+    TestDevice t;
+    ShaderDesc shaderDesc;
+    shaderDesc.stage = ShaderStage::Compute;
+    auto shader = t.dev->createShader(shaderDesc);
+    REQUIRE(shader.hasValue());
+    auto pipeline = t.dev->createPipeline(makeComputePipelineDesc(shader.value()));
+    REQUIRE(pipeline.hasValue());
+    const BufferHandle output = makeBuffer(t.dev, 64, BufferUsage::Storage);
+
+    CommandBuffer commands;
+    commands.begin();
+    commands.bindPipeline(pipeline.value());
+    commands.bindResource(0, BindingType::StorageBuffer, output.index, output.generation);
+    commands.dispatch(3, 2, 1);
+    commands.bufferBarrier(
+        output,
+        {PipelineStageMask::ComputeShader, ResourceAccessMask::ShaderWrite},
+        {PipelineStageMask::Host, ResourceAccessMask::HostRead});
+    commands.end();
+    REQUIRE(commands.commandCount() == 4);
+    CHECK(commands.commands()[2].kind == CommandKind::Dispatch);
+    CHECK(commands.commands()[2].groupCountX == 3);
+    CHECK(commands.commands()[2].groupCountY == 2);
+    CHECK(t.dev->submit(commands) == GfxError::None);
+    CHECK(t.dev->stats().dispatchCalls == 1);
+
+    CommandBuffer invalidDraw;
+    invalidDraw.begin();
+    invalidDraw.bindPipeline(pipeline.value());
+    FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {8, 8};
+    auto framebuffer = t.dev->createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+    invalidDraw.beginRenderPass(framebuffer.value());
+    invalidDraw.draw(3);
+    invalidDraw.endRenderPass();
+    invalidDraw.end();
+    CHECK(t.dev->submit(invalidDraw) == GfxError::BadDescriptor);
+}
+
+TEST_CASE("RHI: graphics and compute shader stages cannot be mixed") {
+    TestDevice t;
+    ShaderDesc shaderDesc;
+    shaderDesc.stage = ShaderStage::Vertex;
+    auto vertex = t.dev->createShader(shaderDesc);
+    shaderDesc.stage = ShaderStage::Fragment;
+    auto fragment = t.dev->createShader(shaderDesc);
+    shaderDesc.stage = ShaderStage::Compute;
+    auto compute = t.dev->createShader(shaderDesc);
+    REQUIRE(vertex.hasValue());
+    REQUIRE(fragment.hasValue());
+    REQUIRE(compute.hasValue());
+
+    PipelineStateDesc mixed = makePipelineDesc(vertex.value(), fragment.value());
+    mixed.computeShader = compute.value();
+    CHECK(t.dev->createPipeline(mixed).error() == GfxError::BadDescriptor);
+
+    PipelineStateDesc wrongStage;
+    wrongStage.computeShader = vertex.value();
+    CHECK(t.dev->createPipeline(wrongStage).error() == GfxError::BadDescriptor);
 }
 
 TEST_CASE("RHI: unimplemented resource arrays and push constants are rejected") {

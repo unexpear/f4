@@ -30,6 +30,7 @@ enum class CommandKind : std::uint8_t {
     SetScissor,
     Draw,
     DrawIndexed,
+    Dispatch,
     BeginRenderPass,
     EndRenderPass,
 };
@@ -66,6 +67,9 @@ struct Command {
     std::uint32_t instanceCount = 1;
     std::uint32_t indexCount = 0;
     std::uint32_t firstIndex = 0;
+    std::uint32_t groupCountX = 0;
+    std::uint32_t groupCountY = 0;
+    std::uint32_t groupCountZ = 0;
 
     // Inline resource storage — zero heap allocation for ≤8 resources.
     static constexpr std::uint8_t kInlineCapacity = 8;
@@ -101,6 +105,8 @@ public:
     void draw(std::uint32_t vertexCount, std::uint32_t instanceCount = 1);
     void drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount = 1,
                      std::uint32_t firstIndex = 0);
+    void dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY = 1,
+                  std::uint32_t groupCountZ = 1);
     void beginRenderPass(FramebufferHandle framebuffer);
     void endRenderPass();
 

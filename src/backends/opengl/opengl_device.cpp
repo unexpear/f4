@@ -454,12 +454,23 @@ auto OpenGLDevice::createSampler(const SamplerDesc& desc) -> Result<SamplerHandl
 }
 
 auto OpenGLDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, GfxError> {
-    if (desc.stage != ShaderStage::Vertex && desc.stage != ShaderStage::Fragment) {
-        // Compute/geometry/tess not yet wired in M7.
-        return GfxError::BadDescriptor;
+    GLenum type = 0;
+    const char* stageName = nullptr;
+    switch (desc.stage) {
+    case ShaderStage::Vertex:
+        type = GL_VERTEX_SHADER;
+        stageName = "vertex";
+        break;
+    case ShaderStage::Fragment:
+        type = GL_FRAGMENT_SHADER;
+        stageName = "fragment";
+        break;
+    case ShaderStage::Compute:
+        type = GL_COMPUTE_SHADER;
+        stageName = "compute";
+        break;
+    default: return GfxError::BadDescriptor;
     }
-    const GLenum type = desc.stage == ShaderStage::Vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
-    const char* stageName = desc.stage == ShaderStage::Vertex ? "vertex" : "fragment";
     std::string source(reinterpret_cast<const char*>(desc.blob.data()), desc.blob.size());
     std::string log;
     const GLuint shader = compileShader(type, source, log);
@@ -481,9 +492,22 @@ auto OpenGLDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, 
 
 auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
     -> Result<PipelineHandle, GfxError> {
+    const bool compute = desc.computeShader.isValid();
+    const bool hasVertex = desc.vertexShader.isValid();
+    const bool hasFragment = desc.fragmentShader.isValid();
+    if ((compute && (hasVertex || hasFragment)) ||
+        (!compute && (!hasVertex || !hasFragment))) {
+        return GfxError::BadDescriptor;
+    }
+    if (compute && (!desc.vertexInput.bindings.isEmpty() ||
+                    !desc.vertexInput.attributes.isEmpty() ||
+                    !desc.colorAttachments.isEmpty() ||
+                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+        return GfxError::BadDescriptor;
+    }
     const std::size_t colorStateCount =
-        desc.colorAttachments.isEmpty() ? 1 : desc.colorAttachments.size();
-    if (colorStateCount > static_cast<std::size_t>(impl_->maxDrawBuffers_) ||
+        compute ? 0 : (desc.colorAttachments.isEmpty() ? 1 : desc.colorAttachments.size());
+    if ((!compute && colorStateCount > static_cast<std::size_t>(impl_->maxDrawBuffers_)) ||
         desc.layout.pushConstantSizeBytes != 0 || desc.layout.groups.size() > 1) {
         return GfxError::BadDescriptor;
     }
@@ -493,8 +517,9 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
         }
     }
 
-    constexpr std::uint32_t graphicsStageMask =
-        shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
+    const std::uint32_t allowedStageMask = compute
+        ? shaderStageBit(ShaderStage::Compute)
+        : shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
     if (!desc.layout.groups.isEmpty()) {
         const BindGroup& group = desc.layout.groups[0];
         if (group.bindPoint != 0) {
@@ -516,7 +541,7 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
                 break;
             }
             if (slot.count != 1 || slot.slot >= static_cast<std::uint32_t>(bindingLimit) ||
-                (slot.stageMask != 0 && (slot.stageMask & ~graphicsStageMask) != 0)) {
+                (slot.stageMask != 0 && (slot.stageMask & ~allowedStageMask) != 0)) {
                 return GfxError::BadDescriptor;
             }
             for (std::size_t j = 0; j < i; ++j) {
@@ -527,18 +552,25 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
         }
     }
 
-    GlShader* vs = impl_->shaders.get(desc.vertexShader);
-    GlShader* fs = impl_->shaders.get(desc.fragmentShader);
-    if (vs == nullptr || fs == nullptr) {
+    GlShader* vs = compute ? nullptr : impl_->shaders.get(desc.vertexShader);
+    GlShader* fs = compute ? nullptr : impl_->shaders.get(desc.fragmentShader);
+    GlShader* cs = compute ? impl_->shaders.get(desc.computeShader) : nullptr;
+    if ((compute && cs == nullptr) || (!compute && (vs == nullptr || fs == nullptr))) {
         return GfxError::InvalidHandle;
     }
-    if (vs->rec.stage != ShaderStage::Vertex || fs->rec.stage != ShaderStage::Fragment) {
+    if ((compute && cs->rec.stage != ShaderStage::Compute) ||
+        (!compute && (vs->rec.stage != ShaderStage::Vertex ||
+                      fs->rec.stage != ShaderStage::Fragment))) {
         return GfxError::BadDescriptor;
     }
 
     const GLuint program = glCreateProgram();
-    glAttachShader(program, vs->id);
-    glAttachShader(program, fs->id);
+    if (compute) {
+        glAttachShader(program, cs->id);
+    } else {
+        glAttachShader(program, vs->id);
+        glAttachShader(program, fs->id);
+    }
     glLinkProgram(program);
 
     GLint ok = GL_FALSE;
@@ -548,26 +580,27 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
         return GfxError::BadDescriptor;
     }
 
-    // Build the VAO from the vertex input layout using the 4.3 vertex-attrib
-    // binding API (bindings carry stride; attributes carry binding + offset).
     GLuint vao = 0;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-    for (const auto& binding : desc.vertexInput.bindings) {
-        glBindVertexBuffer(binding.binding, 0, 0, static_cast<GLsizei>(binding.strideBytes));
-        glVertexBindingDivisor(binding.binding, static_cast<GLuint>(binding.divisor));
+    if (!compute) {
+        // Build the VAO from the vertex input layout using the 4.3
+        // vertex-attrib binding API.
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        for (const auto& binding : desc.vertexInput.bindings) {
+            glBindVertexBuffer(binding.binding, 0, 0, static_cast<GLsizei>(binding.strideBytes));
+            glVertexBindingDivisor(binding.binding, static_cast<GLuint>(binding.divisor));
+        }
+        for (const auto& attribute : desc.vertexInput.attributes) {
+            const GLboolean normalized = glVertexFormatNormalized(attribute.format);
+            glEnableVertexAttribArray(attribute.location);
+            glVertexAttribFormat(attribute.location,
+                                 glVertexFormatComponents(attribute.format),
+                                 glVertexFormatType(attribute.format), normalized,
+                                 static_cast<GLuint>(attribute.offsetBytes));
+            glVertexAttribBinding(attribute.location, attribute.binding);
+        }
+        glBindVertexArray(0);
     }
-    for (const auto& attribute : desc.vertexInput.attributes) {
-        const GLboolean normalized = glVertexFormatNormalized(attribute.format);
-        glEnableVertexAttribArray(attribute.location);
-        glVertexAttribFormat(attribute.location,
-                             glVertexFormatComponents(attribute.format),
-                             glVertexFormatType(attribute.format),
-                             normalized,
-                             static_cast<GLuint>(attribute.offsetBytes));
-        glVertexAttribBinding(attribute.location, attribute.binding);
-    }
-    glBindVertexArray(0);
     // Pipeline construction changes the real VAO binding outside submit().
     // Invalidate the fast-path guard so the next bind restores its full state.
     impl_->glVao_ = 0;
@@ -797,6 +830,23 @@ auto OpenGLDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
     return GfxError::None;
 }
 
+auto OpenGLDevice::readBuffer(BufferHandle h, std::uint64_t offset,
+                              std::span<std::byte> destination) -> GfxError {
+    GlBuffer* buffer = impl_->buffers.get(h);
+    if (buffer == nullptr) return GfxError::StaleHandle;
+    if (offset > buffer->rec.sizeBytes ||
+        destination.size() > buffer->rec.sizeBytes - offset) {
+        return GfxError::BadDescriptor;
+    }
+    if (destination.empty()) return GfxError::None;
+    glFinish();
+    while (glGetError() != GL_NO_ERROR) {}
+    glBindBuffer(buffer->target, buffer->id);
+    glGetBufferSubData(buffer->target, static_cast<GLintptr>(offset),
+                       static_cast<GLsizeiptr>(destination.size()), destination.data());
+    return glGetError() == GL_NO_ERROR ? GfxError::None : GfxError::DeviceLost;
+}
+
 auto OpenGLDevice::writeTexture(TextureHandle h, std::uint32_t mipLevel,
                                 std::span<const std::byte> data) -> GfxError {
     GlTexture* t = impl_->textures.get(h);
@@ -852,8 +902,16 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 impl_->lastSubmitError_ = GfxError::InvalidHandle;
                 return GfxError::InvalidHandle;
             }
-            // GL's serial command stream provides the ordering required by the
-            // currently supported graphics operations.
+            if ((command.before.access & ResourceAccessMask::ShaderWrite) != 0) {
+                GLbitfield barriers = GL_SHADER_STORAGE_BARRIER_BIT;
+                if ((command.after.access & (ResourceAccessMask::HostRead |
+                                             ResourceAccessMask::HostWrite |
+                                             ResourceAccessMask::TransferRead |
+                                             ResourceAccessMask::TransferWrite)) != 0) {
+                    barriers |= GL_BUFFER_UPDATE_BARRIER_BIT;
+                }
+                glMemoryBarrier(barriers);
+            }
             break;
         case CommandKind::BeginRenderPass: {
             GlFramebuffer* fb = impl_->framebuffers.get(command.framebuffer);
@@ -931,113 +989,118 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 impl_->lastSubmitError_ = GfxError::InvalidHandle;
                 return GfxError::InvalidHandle;
             }
+            const bool computePipeline = p->rec.desc.computeShader.isValid();
+            if (impl_->renderPassActive_ && computePipeline) {
+                impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                return GfxError::BadDescriptor;
+            }
             // State cache: skip redundant state changes for same-pipeline binds.
             if (p != impl_->lastPipeline_) {
                 if (p->program != impl_->glProgram_) {
                     glUseProgram(p->program);
                     impl_->glProgram_ = p->program;
                 }
-                if (p->vao != impl_->glVao_) {
+                if (!computePipeline && p->vao != impl_->glVao_) {
                     glBindVertexArray(p->vao);
                     impl_->glVao_ = p->vao;
                 }
-                // Cull face.
-                const bool wantCull = (p->rec.desc.raster.cullMode != CullMode::None);
-                if (wantCull != impl_->glCullFace_) {
-                    if (wantCull) {
-                        glEnable(GL_CULL_FACE);
-                    } else {
-                        glDisable(GL_CULL_FACE);
-                    }
-                    impl_->glCullFace_ = wantCull;
-                }
-                if (wantCull) {
-                    glCullFace(glCull(p->rec.desc.raster.cullMode));
-                }
-                const bool wantDepthClamp = p->rec.desc.raster.depthClampEnable;
-                if (wantDepthClamp != impl_->glDepthClamp_) {
-                    if (wantDepthClamp) {
-                        glEnable(GL_DEPTH_CLAMP);
-                    } else {
-                        glDisable(GL_DEPTH_CLAMP);
-                    }
-                    impl_->glDepthClamp_ = wantDepthClamp;
-                }
-                // Depth test.
-                const bool wantDepth = p->rec.desc.depthStencil.depthTestEnable;
-                if (wantDepth != impl_->glDepthTest_) {
-                    if (wantDepth) {
-                        glEnable(GL_DEPTH_TEST);
-                    } else {
-                        glDisable(GL_DEPTH_TEST);
-                    }
-                    impl_->glDepthTest_ = wantDepth;
-                }
-                const GLenum wantFunc = glCompare(p->rec.desc.depthStencil.depthCompare);
-                if (wantFunc != impl_->glDepthFunc_) {
-                    glDepthFunc(wantFunc);
-                    impl_->glDepthFunc_ = wantFunc;
-                }
-                const GLboolean wantMask = p->rec.desc.depthStencil.depthWriteEnable
-                                               ? GL_TRUE
-                                               : GL_FALSE;
-                if (wantMask != impl_->glDepthMask_) {
-                    glDepthMask(wantMask);
-                    impl_->glDepthMask_ = wantMask;
-                }
-                ColorAttachmentState defaultColor;
-                const std::size_t colorStateCount = p->rec.desc.colorAttachments.isEmpty()
-                                                        ? 1
-                                                        : p->rec.desc.colorAttachments.size();
-                const std::size_t statesToApply =
-                    std::max(colorStateCount, impl_->activeColorStateCount_);
-                for (std::size_t i = 0; i < statesToApply; ++i) {
-                    const ColorAttachmentState& color =
-                        i < colorStateCount
-                            ? (p->rec.desc.colorAttachments.isEmpty()
-                                   ? defaultColor
-                                   : p->rec.desc.colorAttachments[i])
-                            : defaultColor;
-                    GlColorState& cached = impl_->glColorStates_[i];
-                    const GLuint index = static_cast<GLuint>(i);
-                    if (color.blendEnable != cached.blendEnabled) {
-                        if (color.blendEnable) {
-                            glEnablei(GL_BLEND, index);
+                if (!computePipeline) {
+                    // Cull face.
+                    const bool wantCull = (p->rec.desc.raster.cullMode != CullMode::None);
+                    if (wantCull != impl_->glCullFace_) {
+                        if (wantCull) {
+                            glEnable(GL_CULL_FACE);
                         } else {
-                            glDisablei(GL_BLEND, index);
+                            glDisable(GL_CULL_FACE);
                         }
-                        cached.blendEnabled = color.blendEnable;
+                        impl_->glCullFace_ = wantCull;
                     }
-                    if (color.blendEnable) {
-                        const GLenum srcColor = glBlendFactor(color.srcColor);
-                        const GLenum dstColor = glBlendFactor(color.dstColor);
-                        const GLenum srcAlpha = glBlendFactor(color.srcAlpha);
-                        const GLenum dstAlpha = glBlendFactor(color.dstAlpha);
-                        if (srcColor != cached.srcColor || dstColor != cached.dstColor ||
-                            srcAlpha != cached.srcAlpha || dstAlpha != cached.dstAlpha) {
-                            glBlendFuncSeparatei(index, srcColor, dstColor, srcAlpha, dstAlpha);
-                            cached.srcColor = srcColor;
-                            cached.dstColor = dstColor;
-                            cached.srcAlpha = srcAlpha;
-                            cached.dstAlpha = dstAlpha;
+                    if (wantCull) {
+                        glCullFace(glCull(p->rec.desc.raster.cullMode));
+                    }
+                    const bool wantDepthClamp = p->rec.desc.raster.depthClampEnable;
+                    if (wantDepthClamp != impl_->glDepthClamp_) {
+                        if (wantDepthClamp) {
+                            glEnable(GL_DEPTH_CLAMP);
+                        } else {
+                            glDisable(GL_DEPTH_CLAMP);
                         }
-                        const GLenum colorOp = glBlendOp(color.colorOp);
-                        const GLenum alphaOp = glBlendOp(color.alphaOp);
-                        if (colorOp != cached.colorOp || alphaOp != cached.alphaOp) {
-                            glBlendEquationSeparatei(index, colorOp, alphaOp);
-                            cached.colorOp = colorOp;
-                            cached.alphaOp = alphaOp;
+                        impl_->glDepthClamp_ = wantDepthClamp;
+                    }
+                    // Depth test.
+                    const bool wantDepth = p->rec.desc.depthStencil.depthTestEnable;
+                    if (wantDepth != impl_->glDepthTest_) {
+                        if (wantDepth) {
+                            glEnable(GL_DEPTH_TEST);
+                        } else {
+                            glDisable(GL_DEPTH_TEST);
+                        }
+                        impl_->glDepthTest_ = wantDepth;
+                    }
+                    const GLenum wantFunc = glCompare(p->rec.desc.depthStencil.depthCompare);
+                    if (wantFunc != impl_->glDepthFunc_) {
+                        glDepthFunc(wantFunc);
+                        impl_->glDepthFunc_ = wantFunc;
+                    }
+                    const GLboolean wantMask =
+                        p->rec.desc.depthStencil.depthWriteEnable ? GL_TRUE : GL_FALSE;
+                    if (wantMask != impl_->glDepthMask_) {
+                        glDepthMask(wantMask);
+                        impl_->glDepthMask_ = wantMask;
+                    }
+                    ColorAttachmentState defaultColor;
+                    const std::size_t colorStateCount = p->rec.desc.colorAttachments.isEmpty()
+                                                            ? 1
+                                                            : p->rec.desc.colorAttachments.size();
+                    const std::size_t statesToApply =
+                        std::max(colorStateCount, impl_->activeColorStateCount_);
+                    for (std::size_t i = 0; i < statesToApply; ++i) {
+                        const ColorAttachmentState& color =
+                            i < colorStateCount ? (p->rec.desc.colorAttachments.isEmpty()
+                                                       ? defaultColor
+                                                       : p->rec.desc.colorAttachments[i])
+                                                : defaultColor;
+                        GlColorState& cached = impl_->glColorStates_[i];
+                        const GLuint index = static_cast<GLuint>(i);
+                        if (color.blendEnable != cached.blendEnabled) {
+                            if (color.blendEnable) {
+                                glEnablei(GL_BLEND, index);
+                            } else {
+                                glDisablei(GL_BLEND, index);
+                            }
+                            cached.blendEnabled = color.blendEnable;
+                        }
+                        if (color.blendEnable) {
+                            const GLenum srcColor = glBlendFactor(color.srcColor);
+                            const GLenum dstColor = glBlendFactor(color.dstColor);
+                            const GLenum srcAlpha = glBlendFactor(color.srcAlpha);
+                            const GLenum dstAlpha = glBlendFactor(color.dstAlpha);
+                            if (srcColor != cached.srcColor || dstColor != cached.dstColor ||
+                                srcAlpha != cached.srcAlpha || dstAlpha != cached.dstAlpha) {
+                                glBlendFuncSeparatei(index, srcColor, dstColor, srcAlpha, dstAlpha);
+                                cached.srcColor = srcColor;
+                                cached.dstColor = dstColor;
+                                cached.srcAlpha = srcAlpha;
+                                cached.dstAlpha = dstAlpha;
+                            }
+                            const GLenum colorOp = glBlendOp(color.colorOp);
+                            const GLenum alphaOp = glBlendOp(color.alphaOp);
+                            if (colorOp != cached.colorOp || alphaOp != cached.alphaOp) {
+                                glBlendEquationSeparatei(index, colorOp, alphaOp);
+                                cached.colorOp = colorOp;
+                                cached.alphaOp = alphaOp;
+                            }
+                        }
+                        if (color.writeMask != cached.writeMask) {
+                            glColorMaski(index, (color.writeMask & ColorWriteMask::R) != 0,
+                                         (color.writeMask & ColorWriteMask::G) != 0,
+                                         (color.writeMask & ColorWriteMask::B) != 0,
+                                         (color.writeMask & ColorWriteMask::A) != 0);
+                            cached.writeMask = color.writeMask;
                         }
                     }
-                    if (color.writeMask != cached.writeMask) {
-                        glColorMaski(index, (color.writeMask & ColorWriteMask::R) != 0,
-                                     (color.writeMask & ColorWriteMask::G) != 0,
-                                     (color.writeMask & ColorWriteMask::B) != 0,
-                                     (color.writeMask & ColorWriteMask::A) != 0);
-                        cached.writeMask = color.writeMask;
-                    }
+                    impl_->activeColorStateCount_ = colorStateCount;
                 }
-                impl_->activeColorStateCount_ = colorStateCount;
                 impl_->lastPipeline_ = p;
             }
             impl_->boundPipeline_ = p;
@@ -1082,7 +1145,8 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         }
         case CommandKind::Draw: {
-            if (impl_->boundPipeline_ == nullptr) {
+            if (impl_->boundPipeline_ == nullptr ||
+                impl_->boundPipeline_->rec.desc.computeShader.isValid()) {
                 impl_->lastSubmitError_ = GfxError::BadDescriptor;
                 return GfxError::BadDescriptor;
             }
@@ -1108,7 +1172,9 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         }
         case CommandKind::DrawIndexed: {
-            if (impl_->boundPipeline_ == nullptr || impl_->boundIndexBuffer_ == 0) {
+            if (impl_->boundPipeline_ == nullptr ||
+                impl_->boundPipeline_->rec.desc.computeShader.isValid() ||
+                impl_->boundIndexBuffer_ == 0) {
                 impl_->lastSubmitError_ = GfxError::BadDescriptor;
                 return GfxError::BadDescriptor;
             }
@@ -1137,6 +1203,18 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 countPrimitives(impl_->boundTopology_, command.indexCount) * command.instanceCount;
             break;
         }
+        case CommandKind::Dispatch:
+            if (impl_->renderPassActive_ || impl_->boundPipeline_ == nullptr ||
+                !impl_->boundPipeline_->rec.desc.computeShader.isValid() ||
+                command.groupCountX == 0 || command.groupCountY == 0 ||
+                command.groupCountZ == 0) {
+                impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                return GfxError::BadDescriptor;
+            }
+            glDispatchCompute(command.groupCountX, command.groupCountY,
+                              command.groupCountZ);
+            ++impl_->stats_.dispatchCalls;
+            break;
         case CommandKind::BindResources: {
             for (std::uint8_t ri = 0; ri < command.resourceCount; ++ri) {
                 const BoundResource& res = command.resources[ri];

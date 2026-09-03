@@ -163,14 +163,14 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M3 ECS | ✅ Complete | Registry, sparse component storage, views, ordered systems, stale-handle checks, and lifetime stress tests are present. |
 | M4 Transform | ✅ Complete | ECS local/parent/world transforms, dirty propagation, reparent/orphan/cycle handling, and churn tests are present. |
 | M5 Resources & asset IO | ✅ Complete | M5.0–M5.9 records, cache, typed `getOrLoad`, file/container IO, scoped format loaders, and tests exist. `THIRD_PARTY_NOTICES.md` records every FetchContent dependency's declared ref, resolved commit, upstream source, and applicable license text/notices. |
-| M6 Graphics abstraction | ✅ Complete | API-neutral handles/descriptors, command recording, `IDevice`, NullDevice, validation, texture uploads, and headless tests are present. |
+| M6 Graphics abstraction | ✅ Complete | API-neutral handles/descriptors, graphics and compute command recording, `IDevice`, NullDevice, validation, texture uploads, storage-buffer readback, and headless tests are present. |
 | M7 OpenGL backend | ✅ Complete | SDL/OpenGL rendering, resources, framebuffers, draw/instancing, zero-to-one clipping, diagnostics, and pixel tests work. Scissor/depth-clamp state, independent attachment blend/write state, clear-mask handling, depth-only/depth-stencil framebuffers, and device-limit/layout validation now conform to the advertised RHI and have focused tests. |
 | M8 Renderer + render graph v1 | ✅ Complete | `Renderer::render()` executes through the graph and graph lifetimes/rollback are covered. The constant ring grows geometrically instead of silently stopping at 64 slots; direct 130-slot and 65-object renderer regressions verify the former boundary. Cross-backend parity remains an M9/M10 acceptance item rather than an M8 requirement. |
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
 | M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
-| M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
+| M13 Deterministic noise | ✅ Complete | Seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback now run equivalent GLSL/SPIR-V and HLSL/DXIL kernels on OpenGL, Vulkan, and DX12. All CPU/GPU and cross-backend probes pass the centralized float tolerance with at least a 4x margin. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
 | M16 World streaming | ✅ Complete | Policy-aware camera rings use distance/stage-priority workers and bounded main-thread topology/publication. Versioned layout/cell/mesh results reject unloaded or edited work; sparse edits survive unload, including absent shared height neighbors. Resident voxel DDA and height sampling provide collision hooks. M16 also closes the deferred shared-resource reference contract and stores normal voxel bases in deterministic 4-bit/8-bit palettes. |
@@ -538,13 +538,20 @@ Completed delivery and acceptance gates:
 - SIMD math paths
 - Render graph scheduling, async compute
 
-### Milestone 13 — Deterministic Noise Library (procgen track) ⚠
-- Value/Perlin/Simplex noise, FBM, domain warping — every function takes an
-  explicit seed; no hidden global state
-- GCC/MSVC/Clang CPU golden vectors are bit-identical under the locked FP flags
-  on the Windows/Linux gate. CPU-reference versus GPU-sampled parity remains
-  required before claiming identical output on every backend
-- Pure CPU + headless-testable; can execute immediately after M4
+### Milestone 13 — Deterministic Noise Library (procgen track) ✅
+- ✅ Value/Perlin/Simplex noise, FBM, and domain warping; every function takes
+  an explicit seed with no hidden global state
+- ✅ GCC/MSVC/Clang CPU golden vectors are bit-identical under the locked FP
+  flags on the Windows/Linux gate
+- ✅ API-neutral compute pipeline/dispatch, compute-stage barriers,
+  storage-buffer binding, and readback are implemented by Null, OpenGL,
+  Vulkan, and DX12 backends
+- ✅ Equivalent GLSL/SPIR-V and HLSL/DXIL kernels preserve the 64-bit integer
+  hash through portable 32-bit pairs and cover every public M13 sampler
+- ✅ Five focused cases / 109 assertions compare CPU/OpenGL/Vulkan/DX12 and
+  OpenGL/Vulkan plus Vulkan/DX12 pairs. The largest measured absolute error is
+  `1.78814e-7`; the gate requires measured error x4 to remain within the
+  centralized `1e-5` absolute tolerance
 
 ### Milestone 14 — World Data Model (procgen track) ✅
 - **All three cell styles are first-class by design decision** (voxel blocks,
@@ -853,13 +860,23 @@ instanced output. All 60 captures from the 20-scene OpenGL bench were inspected
 across three frames, including the cube and seven rendering-validation scenes,
 with no missing or blinking faces.
 
+M13 completed on 2026-09-03. The RHI now represents compute-only pipelines,
+dispatch commands, compute synchronization, storage buffers, and deterministic
+readback without leaking native APIs. OpenGL, Vulkan, and DX12 execute equivalent
+noise kernels covering value, Perlin, simplex, FBM, and domain warp probes. Five
+focused cases / 109 assertions pass with a maximum measured absolute error of
+`1.78814e-7`, more than the required 4x margin inside the shared `1e-5`
+tolerance. Windows GCC Debug/Release and MSVC Debug/Release/ASan configurations
+pass all six CTest targets; Linux Clang Debug, determinism, Vulkan presentation,
+and ASan+UBSan gates also pass. A fresh 60-frame OpenGL demo capture review
+found no missing or blinking faces and no regressions in the seven validation
+scenes.
+
 ### Current next work (2026-09-03 audit)
 
-1. Add the API-neutral compute pipeline/command model and backend implementations
-   needed to finish M13's CPU-reference versus GPU-sampled noise parity gate.
-2. Profile representative dense and occluded scenes before choosing an M12
+1. Profile representative dense and occluded scenes before choosing an M12
    occlusion strategy; add occlusion only with a measured acceptance threshold.
-3. Continue M12's multithreaded command recording, SIMD paths, render-graph
+2. Continue M12's multithreaded command recording, SIMD paths, render-graph
    scheduling, and async compute only where profiling demonstrates value.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
@@ -981,9 +998,10 @@ chosen simple and safe; each carries a documented upgrade path.
 
 ### 11.6 Determinism & float parity
 
-M13 noise must produce BIT-IDENTICAL output across GCC/MSVC/Clang and
-eventually GPU samplers (extends the M1.5 contract from fixtures to worlds).
-Two rules make that achievable:
+M13 CPU noise must produce BIT-IDENTICAL output across GCC/MSVC/Clang. GPU
+kernels must reproduce the integer hash exactly and match CPU floating-point
+samples within the calibrated parity tolerance (extends the M1.5 contract from
+fixtures to worlds). Two rules enforce that contract:
 
 1. **Compile discipline**: `-ffp-contract=off` (GCC/Clang) and `/fp:precise`
    (MSVC) on every current engine/test target via `cmake/FloatPrecision.cmake`.
@@ -991,9 +1009,10 @@ Two rules make that achievable:
    the GCC/MSVC/Clang Windows/Linux execution matrix now passes as recorded in
    §8.
 2. **Kernel discipline**: hot-path noise avoids transcendental functions;
-   gradient/permutation tables come from integer hashes, not sin/cos. Where
-   exactness vs GPU sampling is impossible, comparison tolerance is
-   calibrated exactly like M8: measured delta × 4, recorded in the test.
+   gradient/permutation tables come from integer hashes, not sin/cos. GPU
+   kernels implement the 64-bit hash with portable 32-bit pairs. Float parity
+   is calibrated exactly like M8: the `1.78814e-7` maximum measured delta x4
+   remains inside the centralized `1e-5` tolerance and is enforced by M13 tests.
 
 ### 11.7 M14 delivery order
 

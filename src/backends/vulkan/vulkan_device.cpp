@@ -235,14 +235,18 @@ struct QueueSelection {
     return VK_SHADER_STAGE_ALL;
 }
 
-[[nodiscard]] auto vkShaderStages(std::uint32_t stageMask) -> VkShaderStageFlags {
-    if (stageMask == 0) return VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+[[nodiscard]] auto vkShaderStages(std::uint32_t stageMask,
+                                  VkShaderStageFlags defaultStages) -> VkShaderStageFlags {
+    if (stageMask == 0) return defaultStages;
     VkShaderStageFlags result = 0;
     if ((stageMask & shaderStageBit(ShaderStage::Vertex)) != 0) {
         result |= VK_SHADER_STAGE_VERTEX_BIT;
     }
     if ((stageMask & shaderStageBit(ShaderStage::Fragment)) != 0) {
         result |= VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    if ((stageMask & shaderStageBit(ShaderStage::Compute)) != 0) {
+        result |= VK_SHADER_STAGE_COMPUTE_BIT;
     }
     return result;
 }
@@ -383,6 +387,7 @@ struct VkPipelineRecord {
     std::vector<VkDescriptorSetLayout> setLayouts;
     std::vector<VkFormat> colorFormats;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    bool compute = false;
 };
 
 struct VkFramebufferRecord {
@@ -626,6 +631,9 @@ struct LayoutAccess {
     }
     if ((stages & PipelineStageMask::FragmentShader) != 0) {
         result |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    }
+    if ((stages & PipelineStageMask::ComputeShader) != 0) {
+        result |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     }
     if ((stages & PipelineStageMask::ColorAttachment) != 0) {
         result |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1287,10 +1295,23 @@ auto VulkanDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, 
 }
 auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     -> Result<PipelineHandle, GfxError> {
-    VkShaderRecord* vertex = impl_->shaders.get(desc.vertexShader);
-    VkShaderRecord* fragment = impl_->shaders.get(desc.fragmentShader);
-    if (vertex == nullptr || fragment == nullptr) return GfxError::InvalidHandle;
-    if (vertex->rec.stage != ShaderStage::Vertex || fragment->rec.stage != ShaderStage::Fragment) {
+    const bool compute = desc.computeShader.isValid();
+    const bool hasVertex = desc.vertexShader.isValid();
+    const bool hasFragment = desc.fragmentShader.isValid();
+    if ((compute && (hasVertex || hasFragment)) ||
+        (!compute && (!hasVertex || !hasFragment))) {
+        return GfxError::BadDescriptor;
+    }
+    VkShaderRecord* vertex = compute ? nullptr : impl_->shaders.get(desc.vertexShader);
+    VkShaderRecord* fragment = compute ? nullptr : impl_->shaders.get(desc.fragmentShader);
+    VkShaderRecord* computeShader = compute ? impl_->shaders.get(desc.computeShader) : nullptr;
+    if ((compute && computeShader == nullptr) ||
+        (!compute && (vertex == nullptr || fragment == nullptr))) {
+        return GfxError::InvalidHandle;
+    }
+    if ((compute && computeShader->rec.stage != ShaderStage::Compute) ||
+        (!compute && (vertex->rec.stage != ShaderStage::Vertex ||
+                      fragment->rec.stage != ShaderStage::Fragment))) {
         return GfxError::BadDescriptor;
     }
     VkPhysicalDeviceProperties deviceProperties{};
@@ -1298,8 +1319,14 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     if (desc.layout.pushConstantSizeBytes != 0) {
         return GfxError::BadDescriptor;
     }
-    if (desc.raster.depthClampEnable && !impl_->depthClamp) {
+    if (!compute && desc.raster.depthClampEnable && !impl_->depthClamp) {
         return GfxError::BackendUnavailable;
+    }
+    if (compute && (!desc.vertexInput.bindings.isEmpty() ||
+                    !desc.vertexInput.attributes.isEmpty() ||
+                    !desc.colorAttachments.isEmpty() ||
+                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+        return GfxError::BadDescriptor;
     }
 
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -1333,9 +1360,11 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
              attribute.offsetBytes});
     }
 
-    const std::size_t colorCount = desc.colorAttachments.isEmpty()
-                                       ? 1
-                                       : desc.colorAttachments.size();
+    const std::size_t colorCount = compute
+                                       ? 0
+                                       : (desc.colorAttachments.isEmpty()
+                                              ? 1
+                                              : desc.colorAttachments.size());
     if (colorCount > deviceProperties.limits.maxColorAttachments) {
         return GfxError::BadDescriptor;
     }
@@ -1360,6 +1389,7 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
 
     VkPipelineRecord record;
     record.rec.desc = desc;
+    record.compute = compute;
     std::vector<const BindGroup*> groups;
     if (!desc.layout.groups.isEmpty()) {
         std::uint32_t maxBindPoint = 0;
@@ -1382,15 +1412,19 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
         }
         record.setLayouts.clear();
     };
-    constexpr std::uint32_t graphicsStageMask =
-        shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
+    const std::uint32_t allowedStageMask = compute
+        ? shaderStageBit(ShaderStage::Compute)
+        : shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
+    const VkShaderStageFlags defaultShaderStages = compute
+        ? VK_SHADER_STAGE_COMPUTE_BIT
+        : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     for (const BindGroup* group : groups) {
         std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
         if (group != nullptr) {
             layoutBindings.reserve(group->slots.size());
             for (const BindingSlot& slot : group->slots) {
                 if (slot.count != 1 || slot.slot > (std::numeric_limits<std::uint32_t>::max() - 3u) / 4u ||
-                    (slot.stageMask & ~graphicsStageMask) != 0) {
+                    (slot.stageMask & ~allowedStageMask) != 0) {
                     destroySetLayouts();
                     return GfxError::BadDescriptor;
                 }
@@ -1403,7 +1437,8 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
                     return GfxError::BadDescriptor;
                 }
                 layoutBindings.push_back({binding, vkDescriptorType(slot.type), slot.count,
-                                          vkShaderStages(slot.stageMask), nullptr});
+                                          vkShaderStages(slot.stageMask, defaultShaderStages),
+                                          nullptr});
             }
         }
         VkDescriptorSetLayoutCreateInfo setInfo{};
@@ -1428,6 +1463,22 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     if (result != VK_SUCCESS) {
         destroySetLayouts();
         return toGfxError(result);
+    }
+
+    if (compute) {
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                              VK_SHADER_STAGE_COMPUTE_BIT, computeShader->module, "main", nullptr};
+        pipelineInfo.layout = record.layout;
+        result = vkCreateComputePipelines(
+            impl_->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &record.pipeline);
+        if (result != VK_SUCCESS) {
+            vkDestroyPipelineLayout(impl_->device, record.layout, nullptr);
+            destroySetLayouts();
+            return toGfxError(result);
+        }
+        return impl_->pipelines.create(std::move(record));
     }
 
     const VkPipelineShaderStageCreateInfo shaderStages[] = {
@@ -1814,9 +1865,30 @@ auto VulkanDevice::writeBuffer(BufferHandle handle, std::uint64_t offset,
     }
     if (data.empty()) return GfxError::None;
     void* mapped = nullptr;
-    const VkResult result = vkMapMemory(impl_->device, record->memory, offset, data.size(), 0, &mapped);
+    const VkResult result = vkMapMemory(
+        impl_->device, record->memory, 0, VK_WHOLE_SIZE, 0, &mapped);
     if (result != VK_SUCCESS) return toGfxError(result);
-    std::memcpy(mapped, data.data(), data.size());
+    std::memcpy(static_cast<std::byte*>(mapped) + offset, data.data(), data.size());
+    vkUnmapMemory(impl_->device, record->memory);
+    return GfxError::None;
+}
+
+auto VulkanDevice::readBuffer(BufferHandle handle, std::uint64_t offset,
+                              std::span<std::byte> destination) -> GfxError {
+    VkBufferRecord* record = impl_->buffers.get(handle);
+    if (record == nullptr) return GfxError::StaleHandle;
+    if (offset > record->rec.sizeBytes ||
+        destination.size() > record->rec.sizeBytes - offset) {
+        return GfxError::BadDescriptor;
+    }
+    if (destination.empty()) return GfxError::None;
+    waitIdle();
+    void* mapped = nullptr;
+    const VkResult result = vkMapMemory(
+        impl_->device, record->memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (result != VK_SUCCESS) return toGfxError(result);
+    std::memcpy(destination.data(), static_cast<const std::byte*>(mapped) + offset,
+                destination.size());
     vkUnmapMemory(impl_->device, record->memory);
     return GfxError::None;
 }
@@ -2010,7 +2082,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             }
             transitionTexture(vkCommands, *texture, 0,
                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                              VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         }
         if (error != GfxError::None) break;
@@ -2104,7 +2176,9 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             vkUpdateDescriptorSets(impl_->device, static_cast<std::uint32_t>(writes.size()),
                                    writes.data(), 0, nullptr);
         }
-        vkCmdBindDescriptorSets(vkCommands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        vkCmdBindDescriptorSets(vkCommands,
+                                pipeline.compute ? VK_PIPELINE_BIND_POINT_COMPUTE
+                                                 : VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 pipeline.layout, 0, static_cast<std::uint32_t>(sets.size()),
                                 sets.data(), 0, nullptr);
         return GfxError::None;
@@ -2308,6 +2382,8 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             boundPipeline = impl_->pipelines.get(command.pipeline);
             if (boundPipeline == nullptr) {
                 error = GfxError::InvalidHandle;
+            } else if (rendering && boundPipeline->compute) {
+                error = GfxError::BadDescriptor;
             } else if (rendering &&
                        (activeFramebuffer == nullptr ||
                         boundPipeline->colorFormats != activeFramebuffer->colorFormats ||
@@ -2315,7 +2391,9 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
                          boundPipeline->depthFormat != activeFramebuffer->depthFormat))) {
                 error = GfxError::BadDescriptor;
             } else {
-                vkCmdBindPipeline(vkCommands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                vkCmdBindPipeline(vkCommands,
+                                  boundPipeline->compute ? VK_PIPELINE_BIND_POINT_COMPUTE
+                                                         : VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   boundPipeline->pipeline);
                 error = bindDescriptorSets(*boundPipeline);
             }
@@ -2399,7 +2477,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             break;
         }
         case CommandKind::Draw:
-            if (!rendering || boundPipeline == nullptr) {
+            if (!rendering || boundPipeline == nullptr || boundPipeline->compute) {
                 error = GfxError::BadDescriptor;
             } else {
                 vkCmdDraw(vkCommands, command.vertexCount, command.instanceCount, 0, 0);
@@ -2414,7 +2492,8 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             }
             break;
         case CommandKind::DrawIndexed:
-            if (!rendering || boundPipeline == nullptr || !indexBound) {
+            if (!rendering || boundPipeline == nullptr || boundPipeline->compute ||
+                !indexBound) {
                 error = GfxError::BadDescriptor;
             } else {
                 vkCmdDrawIndexed(vkCommands, command.indexCount, command.instanceCount,
@@ -2427,6 +2506,17 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
                 delta.primitives += countPrimitives(boundPipeline->rec.desc.topology,
                                                     command.indexCount) *
                                     command.instanceCount;
+            }
+            break;
+        case CommandKind::Dispatch:
+            if (rendering || boundPipeline == nullptr || !boundPipeline->compute ||
+                command.groupCountX == 0 || command.groupCountY == 0 ||
+                command.groupCountZ == 0) {
+                error = GfxError::BadDescriptor;
+            } else {
+                vkCmdDispatch(vkCommands, command.groupCountX, command.groupCountY,
+                              command.groupCountZ);
+                ++delta.dispatchCalls;
             }
             break;
         }
@@ -2477,6 +2567,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     }
     impl_->stats.drawCalls += delta.drawCalls;
     impl_->stats.drawIndexedCalls += delta.drawIndexedCalls;
+    impl_->stats.dispatchCalls += delta.dispatchCalls;
     impl_->stats.batches += delta.batches;
     impl_->stats.instances += delta.instances;
     impl_->stats.primitives += delta.primitives;

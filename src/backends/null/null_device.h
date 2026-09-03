@@ -39,6 +39,8 @@ public:
 
     auto writeBuffer(BufferHandle, std::uint64_t offset, std::span<const std::byte> data)
         -> GfxError override;
+    auto readBuffer(BufferHandle, std::uint64_t offset, std::span<std::byte> destination)
+        -> GfxError override;
     auto writeTexture(TextureHandle, std::uint32_t mipLevel, std::span<const std::byte> data)
         -> GfxError override;
     auto submit(CommandBuffer&) -> GfxError override;
@@ -51,6 +53,7 @@ public:
     [[nodiscard]] auto lastSubmissionError() const -> GfxError { return lastError_; }
     [[nodiscard]] auto drawCount() const -> std::uint64_t { return stats_.drawCalls; }
     [[nodiscard]] auto drawIndexedCount() const -> std::uint64_t { return stats_.drawIndexedCalls; }
+    [[nodiscard]] auto dispatchCount() const -> std::uint64_t { return stats_.dispatchCalls; }
     [[nodiscard]] auto bufferBytes() const -> std::uint64_t { return bufferBytes_; }
     [[nodiscard]] auto liveBuffers() const -> std::size_t;
 

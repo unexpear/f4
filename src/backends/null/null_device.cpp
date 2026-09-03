@@ -1,5 +1,6 @@
 #include "backends/null/null_device.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -9,8 +10,17 @@
 
 namespace f4::gfx {
 
+namespace {
+
+struct NullBuffer {
+    GpuBuffer rec;
+    std::vector<std::byte> data;
+};
+
+} // namespace
+
 struct NullDevice::Impl {
-    ObjectStore<GpuBuffer, GpuBufferTag> buffers;
+    ObjectStore<NullBuffer, GpuBufferTag> buffers;
     ObjectStore<GpuTexture, GpuTextureTag> textures;
     ObjectStore<GpuSampler, GpuSamplerTag> samplers;
     ObjectStore<GpuShader, GpuShaderTag> shaders;
@@ -47,9 +57,13 @@ auto NullDevice::createBuffer(const BufferDesc& desc, std::span<const std::byte>
     if (initialData.size() > desc.sizeBytes) {
         return GfxError::BadDescriptor; // initial data must fit the buffer
     }
-    GpuBuffer record;
-    record.sizeBytes = desc.sizeBytes;
-    record.usage = desc.usage;
+    NullBuffer record;
+    record.rec.sizeBytes = desc.sizeBytes;
+    record.rec.usage = desc.usage;
+    record.data.resize(static_cast<std::size_t>(desc.sizeBytes));
+    if (!initialData.empty()) {
+        std::copy(initialData.begin(), initialData.end(), record.data.begin());
+    }
     const BufferHandle handle = impl_->buffers.create(record);
     // Track bytes for the accounting surface.
     bufferBytes_ += desc.sizeBytes;
@@ -93,9 +107,27 @@ auto NullDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, Gf
 
 auto NullDevice::createPipeline(const PipelineStateDesc& desc) -> Result<PipelineHandle, GfxError> {
     if (desc.layout.pushConstantSizeBytes != 0) return GfxError::BadDescriptor;
+    const bool compute = desc.computeShader.isValid();
+    const bool hasVertex = desc.vertexShader.isValid();
+    const bool hasFragment = desc.fragmentShader.isValid();
+    if ((compute && (hasVertex || hasFragment)) ||
+        (!compute && (!hasVertex || !hasFragment))) {
+        return GfxError::BadDescriptor;
+    }
+    if (compute && (!desc.vertexInput.bindings.isEmpty() ||
+                    !desc.vertexInput.attributes.isEmpty() ||
+                    !desc.colorAttachments.isEmpty() ||
+                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+        return GfxError::BadDescriptor;
+    }
+    const std::uint32_t allowedStages = compute
+        ? shaderStageBit(ShaderStage::Compute)
+        : shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
     for (const BindGroup& group : desc.layout.groups) {
         for (const BindingSlot& slot : group.slots) {
-            if (slot.count != 1) return GfxError::BadDescriptor;
+            if (slot.count != 1 || (slot.stageMask & ~allowedStages) != 0) {
+                return GfxError::BadDescriptor;
+            }
         }
     }
     // Validate that referenced shader handles are live.
@@ -104,6 +136,17 @@ auto NullDevice::createPipeline(const PipelineStateDesc& desc) -> Result<Pipelin
     }
     if (desc.fragmentShader.isValid() && !impl_->shaders.contains(desc.fragmentShader)) {
         return GfxError::InvalidHandle;
+    }
+    if (desc.computeShader.isValid() && !impl_->shaders.contains(desc.computeShader)) {
+        return GfxError::InvalidHandle;
+    }
+    const GpuShader* vertex = impl_->shaders.get(desc.vertexShader);
+    const GpuShader* fragment = impl_->shaders.get(desc.fragmentShader);
+    const GpuShader* computeShader = impl_->shaders.get(desc.computeShader);
+    if ((vertex != nullptr && vertex->stage != ShaderStage::Vertex) ||
+        (fragment != nullptr && fragment->stage != ShaderStage::Fragment) ||
+        (computeShader != nullptr && computeShader->stage != ShaderStage::Compute)) {
+        return GfxError::BadDescriptor;
     }
     GpuPipeline record;
     record.desc = desc;
@@ -193,13 +236,26 @@ auto NullDevice::destroyFramebuffer(FramebufferHandle h) -> GfxError {
 
 auto NullDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
                              std::span<const std::byte> data) -> GfxError {
-    GpuBuffer* buf = impl_->buffers.get(h);
+    NullBuffer* buf = impl_->buffers.get(h);
     if (buf == nullptr) {
         return GfxError::StaleHandle;
     }
-    if (offset + data.size() > buf->sizeBytes) {
+    if (offset > buf->rec.sizeBytes || data.size() > buf->rec.sizeBytes - offset) {
         return GfxError::BadDescriptor; // out of bounds
     }
+    std::copy(data.begin(), data.end(), buf->data.begin() + static_cast<std::size_t>(offset));
+    return GfxError::None;
+}
+
+auto NullDevice::readBuffer(BufferHandle h, std::uint64_t offset,
+                            std::span<std::byte> destination) -> GfxError {
+    const NullBuffer* buf = impl_->buffers.get(h);
+    if (buf == nullptr) return GfxError::StaleHandle;
+    if (offset > buf->rec.sizeBytes || destination.size() > buf->rec.sizeBytes - offset) {
+        return GfxError::BadDescriptor;
+    }
+    std::copy_n(buf->data.begin() + static_cast<std::size_t>(offset), destination.size(),
+                destination.begin());
     return GfxError::None;
 }
 
@@ -234,6 +290,7 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
 
     bool renderPassActive = false;
     bool pipelineBound = false;
+    bool computePipeline = false;
     bool indexBound = false;
     PrimitiveTopology topology = PrimitiveTopology::TriangleList;
 
@@ -264,6 +321,8 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
                 GpuPipeline* p = impl_->pipelines.get(cmd.pipeline);
                 if (p != nullptr) {
                     topology = p->desc.topology;
+                    computePipeline = p->desc.computeShader.isValid();
+                    if (renderPassActive && computePipeline) err = GfxError::BadDescriptor;
                 }
             }
             break;
@@ -315,7 +374,7 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::Draw: {
             if (!renderPassActive) {
                 err = GfxError::BadDescriptor; // draw outside a render pass
-            } else if (!pipelineBound) {
+            } else if (!pipelineBound || computePipeline) {
                 err = GfxError::BadDescriptor; // no pipeline bound
             } else {
                 ++stats_.drawCalls;
@@ -329,7 +388,7 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::DrawIndexed: {
             if (!renderPassActive) {
                 err = GfxError::BadDescriptor;
-            } else if (!pipelineBound) {
+            } else if (!pipelineBound || computePipeline) {
                 err = GfxError::BadDescriptor;
             } else if (!indexBound) {
                 err = GfxError::BadDescriptor;
@@ -342,6 +401,14 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
             }
             break;
         }
+        case CommandKind::Dispatch:
+            if (renderPassActive || !pipelineBound || !computePipeline ||
+                cmd.groupCountX == 0 || cmd.groupCountY == 0 || cmd.groupCountZ == 0) {
+                err = GfxError::BadDescriptor;
+            } else {
+                ++stats_.dispatchCalls;
+            }
+            break;
         }
         if (err != GfxError::None) {
             break;
@@ -356,7 +423,7 @@ auto NullDevice::stats() const -> DeviceStats {
     DeviceStats s = stats_;
     s.bufferCount = impl_->buffers.liveCount();
     s.bufferBytes = 0;
-    impl_->buffers.forEach([&](const GpuBuffer* b) { s.bufferBytes += b->sizeBytes; });
+    impl_->buffers.forEach([&](const NullBuffer* b) { s.bufferBytes += b->rec.sizeBytes; });
     s.textureCount = impl_->textures.liveCount();
     s.textureBytes = 0;
     impl_->textures.forEach([&](const GpuTexture* t) { s.textureBytes += textureBytes(*t); });

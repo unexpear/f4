@@ -48,6 +48,7 @@ add_executable(f4_tests
     engine/test_m8.cpp
     engine/test_m11.cpp
     engine/test_m12.cpp
+    engine/test_m13.cpp
     engine/test_m14.cpp
     engine/test_m15.cpp
     engine/test_m16.cpp
@@ -71,6 +72,8 @@ if(F4_GRAPHICS_HAS_OPENGL AND TARGET SDL2::SDL2)
     target_sources(f4_tests PRIVATE graphics/test_gl_device.cpp)
     target_link_libraries(f4_tests PRIVATE f4_epoxy SDL2::SDL2)
     target_compile_definitions(f4_tests PRIVATE F4_GRAPHICS_HAS_OPENGL=1)
+    target_compile_definitions(f4_tests PRIVATE
+        F4_M13_OPENGL_SHADER_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp")
 endif()
 
 add_executable(f4_tests_stripped
@@ -125,6 +128,7 @@ if(F4_GRAPHICS_HAS_DX12)
         set(F4_DX12_TEST_PARITY_VERTEX_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_parity.vert.dxil")
         set(F4_DX12_TEST_PARITY_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_parity.frag.dxil")
         set(F4_DX12_TEST_IMAGE_FRAGMENT_DXIL "${F4_DX12_TEST_SHADER_DIR}/m10_image.frag.dxil")
+        set(F4_M13_DX12_COMPUTE_DXIL "${F4_DX12_TEST_SHADER_DIR}/m13_noise.comp.dxil")
         f4_compile_dxil("${F4_DX12_TEST_VERTEX_DXIL}"
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_triangle.vert.hlsl" vs_6_0 VSMain)
         f4_compile_dxil("${F4_DX12_TEST_FRAGMENT_DXIL}"
@@ -139,6 +143,15 @@ if(F4_GRAPHICS_HAS_DX12)
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_parity.frag.hlsl" ps_6_0 PSMain)
         f4_compile_dxil("${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}"
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m10_image.frag.hlsl" ps_6_0 PSMain)
+        add_custom_command(
+            OUTPUT "${F4_M13_DX12_COMPUTE_DXIL}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_DX12_TEST_SHADER_DIR}"
+            COMMAND "${F4_DXC_EXECUTABLE}"
+                    -T cs_6_0 -E CSMain -Ges -Gis -WX
+                    -Fo "${F4_M13_DX12_COMPUTE_DXIL}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp.hlsl"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp.hlsl"
+            VERBATIM)
         add_custom_target(f4_dx12_test_shaders DEPENDS
             "${F4_DX12_TEST_VERTEX_DXIL}"
             "${F4_DX12_TEST_FRAGMENT_DXIL}"
@@ -146,7 +159,8 @@ if(F4_GRAPHICS_HAS_DX12)
             "${F4_DX12_TEST_BIND_FRAGMENT_DXIL}"
             "${F4_DX12_TEST_PARITY_VERTEX_DXIL}"
             "${F4_DX12_TEST_PARITY_FRAGMENT_DXIL}"
-            "${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}")
+            "${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}"
+            "${F4_M13_DX12_COMPUTE_DXIL}")
         add_dependencies(f4_tests f4_dx12_test_shaders)
         target_compile_definitions(f4_tests PRIVATE
             F4_DX12_TEST_VERTEX_DXIL="${F4_DX12_TEST_VERTEX_DXIL}"
@@ -155,7 +169,8 @@ if(F4_GRAPHICS_HAS_DX12)
             F4_DX12_TEST_BIND_FRAGMENT_DXIL="${F4_DX12_TEST_BIND_FRAGMENT_DXIL}"
             F4_DX12_TEST_PARITY_VERTEX_DXIL="${F4_DX12_TEST_PARITY_VERTEX_DXIL}"
             F4_DX12_TEST_PARITY_FRAGMENT_DXIL="${F4_DX12_TEST_PARITY_FRAGMENT_DXIL}"
-            F4_DX12_TEST_IMAGE_FRAGMENT_DXIL="${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}")
+            F4_DX12_TEST_IMAGE_FRAGMENT_DXIL="${F4_DX12_TEST_IMAGE_FRAGMENT_DXIL}"
+            F4_M13_DX12_COMPUTE_DXIL="${F4_M13_DX12_COMPUTE_DXIL}")
     endif()
 endif()
 add_test(NAME core_stripped COMMAND f4_tests_stripped)
@@ -193,6 +208,7 @@ if(F4_GRAPHICS_HAS_VULKAN)
         set(F4_VK_TEST_PARITY_VERTEX_SPV "${F4_VK_TEST_SHADER_DIR}/m9_parity.vert.spv")
         set(F4_VK_TEST_PARITY_FRAGMENT_SPV "${F4_VK_TEST_SHADER_DIR}/m9_parity.frag.spv")
         set(F4_VK_TEST_IMAGE_FRAGMENT_SPV "${F4_VK_TEST_SHADER_DIR}/m9_image.frag.spv")
+        set(F4_M13_VK_COMPUTE_SPV "${F4_VK_TEST_SHADER_DIR}/m13_noise.comp.spv")
         add_custom_command(
             OUTPUT "${F4_VK_TEST_VERTEX_SPV}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_VK_TEST_SHADER_DIR}"
@@ -256,6 +272,16 @@ if(F4_GRAPHICS_HAS_VULKAN)
                     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m9_image.frag"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m9_image.frag"
             VERBATIM)
+        add_custom_command(
+            OUTPUT "${F4_M13_VK_COMPUTE_SPV}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_VK_TEST_SHADER_DIR}"
+            COMMAND $<TARGET_FILE:Vulkan::glslangValidator>
+                    -V --target-env vulkan1.3 --spirv-val -S comp
+                    -DF4_VULKAN=1
+                    -o "${F4_M13_VK_COMPUTE_SPV}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp"
+            VERBATIM)
         add_custom_target(f4_vk_test_shaders
             DEPENDS
                 "${F4_VK_TEST_VERTEX_SPV}"
@@ -264,7 +290,8 @@ if(F4_GRAPHICS_HAS_VULKAN)
                 "${F4_VK_TEST_BIND_FRAGMENT_SPV}"
                 "${F4_VK_TEST_PARITY_VERTEX_SPV}"
                 "${F4_VK_TEST_PARITY_FRAGMENT_SPV}"
-                "${F4_VK_TEST_IMAGE_FRAGMENT_SPV}")
+                "${F4_VK_TEST_IMAGE_FRAGMENT_SPV}"
+                "${F4_M13_VK_COMPUTE_SPV}")
         add_dependencies(f4_tests f4_vk_test_shaders)
         target_compile_definitions(f4_tests PRIVATE
             F4_VK_TEST_VERTEX_SPV="${F4_VK_TEST_VERTEX_SPV}"
@@ -273,6 +300,7 @@ if(F4_GRAPHICS_HAS_VULKAN)
             F4_VK_TEST_BIND_FRAGMENT_SPV="${F4_VK_TEST_BIND_FRAGMENT_SPV}"
             F4_VK_TEST_PARITY_VERTEX_SPV="${F4_VK_TEST_PARITY_VERTEX_SPV}"
             F4_VK_TEST_PARITY_FRAGMENT_SPV="${F4_VK_TEST_PARITY_FRAGMENT_SPV}"
-            F4_VK_TEST_IMAGE_FRAGMENT_SPV="${F4_VK_TEST_IMAGE_FRAGMENT_SPV}")
+            F4_VK_TEST_IMAGE_FRAGMENT_SPV="${F4_VK_TEST_IMAGE_FRAGMENT_SPV}"
+            F4_M13_VK_COMPUTE_SPV="${F4_M13_VK_COMPUTE_SPV}")
     endif()
 endif()

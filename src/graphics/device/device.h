@@ -51,6 +51,11 @@ public:
     virtual auto writeBuffer(BufferHandle, std::uint64_t offset, std::span<const std::byte> data)
         -> GfxError = 0;
 
+    // Synchronous buffer readback. The range is bounds-checked; callers must
+    // still declare device-write ordering with a command-buffer barrier.
+    virtual auto readBuffer(BufferHandle, std::uint64_t offset, std::span<std::byte> destination)
+        -> GfxError = 0;
+
     // Upload CPU texel data to an existing texture's mip level. The data size
     // must exactly match the level's footprint (bounds-checked by the backend);
     // this is how CPU bitmaps (e.g. a glyph atlas) reach the GPU.
@@ -67,8 +72,8 @@ public:
     // submits and are cleared by resetFrameStats() (call once per frame).
     [[nodiscard]] virtual auto stats() const -> DeviceStats = 0;
 
-    // Clears the per-frame render counters (draw/instance/primitive/vertex/
-    // batch). Resource accounting is unaffected.
+    // Clears per-frame draw, dispatch, instance, primitive, vertex, and batch
+    // counters. Resource accounting is unaffected.
     virtual auto resetFrameStats() -> void = 0;
 };
 

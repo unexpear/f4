@@ -47,6 +47,7 @@ struct DeviceStats {
     // ── Per-frame render counters ──────────────────────────────────────
     std::uint64_t drawCalls = 0;        // distinct Draw (non-indexed) commands
     std::uint64_t drawIndexedCalls = 0; // distinct DrawIndexed commands
+    std::uint64_t dispatchCalls = 0;    // distinct compute Dispatch commands
     std::uint64_t batches = 0;          // total draw commands (indexed + non)
     std::uint64_t instances = 0;        // summed instance counts across draws
     std::uint64_t primitives = 0;       // summed primitives (triangles) across draws

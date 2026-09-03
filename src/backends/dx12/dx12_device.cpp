@@ -301,6 +301,7 @@ struct DxPipelineRecord {
     std::vector<RootTable> tables;
     std::vector<DXGI_FORMAT> colorFormats;
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
+    bool compute = false;
 };
 
 struct DxFramebufferRecord {
@@ -761,7 +762,8 @@ auto Dx12Device::createSampler(const SamplerDesc& desc) -> Result<SamplerHandle,
 auto Dx12Device::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, GfxError> {
     if (!ready() || desc.blob.size() < 4 ||
         std::memcmp(desc.blob.data(), "DXBC", 4) != 0 ||
-        (desc.stage != ShaderStage::Vertex && desc.stage != ShaderStage::Fragment)) {
+        (desc.stage != ShaderStage::Vertex && desc.stage != ShaderStage::Fragment &&
+         desc.stage != ShaderStage::Compute)) {
         if (ready()) ++impl_->stats.shaderFailed;
         return GfxError::BadDescriptor;
     }
@@ -776,20 +778,39 @@ auto Dx12Device::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, Gf
 
 auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
     -> Result<PipelineHandle, GfxError> {
-    if (!ready() || !desc.vertexShader.isValid() || !desc.fragmentShader.isValid() ||
+    const bool compute = desc.computeShader.isValid();
+    const bool hasVertex = desc.vertexShader.isValid();
+    const bool hasFragment = desc.fragmentShader.isValid();
+    if (!ready() || (compute && (hasVertex || hasFragment)) ||
+        (!compute && (!hasVertex || !hasFragment)) ||
         desc.layout.pushConstantSizeBytes != 0 || desc.colorAttachments.size() > 8) {
         return GfxError::BadDescriptor;
     }
-    DxShaderRecord* vertex = impl_->shaders.get(desc.vertexShader);
-    DxShaderRecord* fragment = impl_->shaders.get(desc.fragmentShader);
-    if (vertex == nullptr || fragment == nullptr) return GfxError::InvalidHandle;
-    if (vertex->rec.stage != ShaderStage::Vertex ||
-        fragment->rec.stage != ShaderStage::Fragment) {
+    if (compute && (!desc.vertexInput.bindings.isEmpty() ||
+                    !desc.vertexInput.attributes.isEmpty() ||
+                    !desc.colorAttachments.isEmpty() ||
+                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+        return GfxError::BadDescriptor;
+    }
+    DxShaderRecord* vertex = compute ? nullptr : impl_->shaders.get(desc.vertexShader);
+    DxShaderRecord* fragment = compute ? nullptr : impl_->shaders.get(desc.fragmentShader);
+    DxShaderRecord* computeShader = compute ? impl_->shaders.get(desc.computeShader) : nullptr;
+    if ((compute && computeShader == nullptr) ||
+        (!compute && (vertex == nullptr || fragment == nullptr))) {
+        return GfxError::InvalidHandle;
+    }
+    if ((compute && computeShader->rec.stage != ShaderStage::Compute) ||
+        (!compute && (vertex->rec.stage != ShaderStage::Vertex ||
+                      fragment->rec.stage != ShaderStage::Fragment))) {
         return GfxError::BadDescriptor;
     }
 
     DxPipelineRecord record;
     record.rec.desc = desc;
+    record.compute = compute;
+    const std::uint32_t allowedStageMask = compute
+        ? shaderStageBit(ShaderStage::Compute)
+        : shaderStageBit(ShaderStage::Vertex) | shaderStageBit(ShaderStage::Fragment);
     std::vector<std::vector<D3D12_DESCRIPTOR_RANGE>> rangeStorage;
     rangeStorage.reserve(desc.layout.groups.size() * 2u);
     std::vector<D3D12_ROOT_PARAMETER> parameters;
@@ -809,7 +830,9 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
             table.samplers = samplerTable;
             for (std::size_t slotIndex = 0; slotIndex < group.slots.size(); ++slotIndex) {
                 const BindingSlot& slot = group.slots[slotIndex];
-                if (slot.count != 1 || slot.slot > D3D12_COMMONSHADER_INPUT_RESOURCE_REGISTER_COUNT) {
+                if (slot.count != 1 ||
+                    slot.slot > D3D12_COMMONSHADER_INPUT_RESOURCE_REGISTER_COUNT ||
+                    (slot.stageMask & ~allowedStageMask) != 0) {
                     return GfxError::BadDescriptor;
                 }
                 for (std::size_t previous = 0; previous < slotIndex; ++previous) {
@@ -824,6 +847,8 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
                     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
                 } else if (slot.type == BindingType::UniformBuffer) {
                     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+                } else if (compute && slot.type == BindingType::StorageBuffer) {
+                    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
                 } else {
                     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
                 }
@@ -852,10 +877,15 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
     D3D12_ROOT_SIGNATURE_DESC rootDesc{};
     rootDesc.NumParameters = static_cast<UINT>(parameters.size());
     rootDesc.pParameters = parameters.data();
-    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
-                     D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
                      D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
                      D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+    if (compute) {
+        rootDesc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
+                          D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+    } else {
+        rootDesc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    }
     ComPtr<ID3DBlob> serialized;
     ComPtr<ID3DBlob> errors;
     HRESULT result = D3D12SerializeRootSignature(
@@ -871,6 +901,22 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
         0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
         IID_ID3D12RootSignature, record.rootSignature.putVoid());
     if (FAILED(result)) return toGfxError(result);
+
+    if (compute) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
+        pipelineDesc.pRootSignature = record.rootSignature.get();
+        pipelineDesc.CS = {computeShader->blob.data(), computeShader->blob.size()};
+        result = impl_->device->CreateComputePipelineState(
+            &pipelineDesc, IID_ID3D12PipelineState, record.pipeline.putVoid());
+        if (FAILED(result)) {
+            F4_LOG_ERROR() << "DX12 CreateComputePipelineState failed: "
+                           << static_cast<long>(result);
+            return GfxError::BadDescriptor;
+        }
+        const PipelineHandle handle = impl_->pipelines.create(std::move(record));
+        ++impl_->stats.pipelineCount;
+        return handle;
+    }
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
     inputElements.reserve(desc.vertexInput.attributes.size());
@@ -1164,6 +1210,54 @@ auto Dx12Device::writeBuffer(BufferHandle handle, std::uint64_t offset,
     return toGfxError(result);
 }
 
+auto Dx12Device::readBuffer(BufferHandle handle, std::uint64_t offset,
+                            std::span<std::byte> destination) -> GfxError {
+    DxBufferRecord* record = impl_->buffers.get(handle);
+    if (record == nullptr) return GfxError::StaleHandle;
+    if (offset > record->rec.sizeBytes ||
+        destination.size() > record->rec.sizeBytes - offset) {
+        return GfxError::BadDescriptor;
+    }
+    if (destination.empty()) return GfxError::None;
+    if (record->upload) {
+        waitIdle();
+        void* mapped = nullptr;
+        const D3D12_RANGE readRange{static_cast<SIZE_T>(offset),
+                                    static_cast<SIZE_T>(offset + destination.size())};
+        const HRESULT result = record->resource->Map(0, &readRange, &mapped);
+        if (FAILED(result)) return toGfxError(result);
+        std::memcpy(destination.data(), static_cast<const std::byte*>(mapped) + offset,
+                    destination.size());
+        const D3D12_RANGE writtenRange{0, 0};
+        record->resource->Unmap(0, &writtenRange);
+        return GfxError::None;
+    }
+
+    ComPtr<ID3D12Resource> readback;
+    const D3D12_HEAP_PROPERTIES properties = heapProperties(D3D12_HEAP_TYPE_READBACK);
+    D3D12_RESOURCE_DESC readbackDesc = bufferResourceDesc(destination.size());
+    HRESULT result = impl_->device->CreateCommittedResource(
+        &properties, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_ID3D12Resource,
+        readback.putVoid());
+    if (FAILED(result)) return toGfxError(result);
+    result = impl_->executeImmediate([&](ID3D12GraphicsCommandList* list) {
+        transition(list, record->resource.get(), record->state,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.get(), 0, record->resource.get(), offset,
+                               destination.size());
+    });
+    if (FAILED(result)) return toGfxError(result);
+    void* mapped = nullptr;
+    const D3D12_RANGE readRange{0, destination.size()};
+    result = readback->Map(0, &readRange, &mapped);
+    if (FAILED(result)) return toGfxError(result);
+    std::memcpy(destination.data(), mapped, destination.size());
+    const D3D12_RANGE writtenRange{0, 0};
+    readback->Unmap(0, &writtenRange);
+    return GfxError::None;
+}
+
 auto Dx12Device::writeTexture(TextureHandle handle, std::uint32_t mipLevel,
                               std::span<const std::byte> data) -> GfxError {
     DxTextureRecord* texture = impl_->textures.get(handle);
@@ -1241,7 +1335,8 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             scanPipeline = impl_->pipelines.get(command.pipeline);
             if (scanPipeline == nullptr) return GfxError::InvalidHandle;
         } else if (command.kind == CommandKind::Draw ||
-                   command.kind == CommandKind::DrawIndexed) {
+                   command.kind == CommandKind::DrawIndexed ||
+                   command.kind == CommandKind::Dispatch) {
             if (scanPipeline != nullptr) {
                 for (const RootTable& table : scanPipeline->tables) {
                     if (table.samplers) samplerDescriptorCount += table.slots.size();
@@ -1410,24 +1505,42 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                         if (buffer->rec.sizeBytes < 4 || (buffer->rec.sizeBytes % 4) != 0) {
                             return GfxError::BadDescriptor;
                         }
-                        if (!buffer->upload) {
+                        if (!buffer->upload && pipeline.compute) {
+                            transition(list, buffer->resource.get(), buffer->state,
+                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        } else if (!buffer->upload) {
                             transition(list, buffer->resource.get(), buffer->state,
                                        static_cast<D3D12_RESOURCE_STATES>(
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                         }
-                        D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-                        desc.Format = DXGI_FORMAT_R32_TYPELESS;
-                        desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                        desc.Buffer.NumElements = static_cast<UINT>(buffer->rec.sizeBytes / 4);
-                        desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-                        impl_->device->CreateShaderResourceView(buffer->resource.get(), &desc, cpu);
+                        if (pipeline.compute) {
+                            D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+                            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                            desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                            desc.Buffer.NumElements = static_cast<UINT>(buffer->rec.sizeBytes / 4);
+                            desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                            impl_->device->CreateUnorderedAccessView(
+                                buffer->resource.get(), nullptr, &desc, cpu);
+                        } else {
+                            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                            desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                            desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                            desc.Buffer.NumElements = static_cast<UINT>(buffer->rec.sizeBytes / 4);
+                            desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                            impl_->device->CreateShaderResourceView(
+                                buffer->resource.get(), &desc, cpu);
+                        }
                     }
                 }
                 cpu.ptr += increment;
             }
-            list->SetGraphicsRootDescriptorTable(table.rootIndex, gpu);
+            if (pipeline.compute) {
+                list->SetComputeRootDescriptorTable(table.rootIndex, gpu);
+            } else {
+                list->SetGraphicsRootDescriptorTable(table.rootIndex, gpu);
+            }
             if (table.samplers) samplerOffset += static_cast<UINT>(table.slots.size());
             else resourceOffset += static_cast<UINT>(table.slots.size());
         }
@@ -1471,8 +1584,22 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                     break;
                 }
                 if (!buffer->upload) {
-                    transition(list, buffer->resource.get(), buffer->state,
-                               dxResourceState(command.after, false));
+                    const D3D12_RESOURCE_STATES target =
+                        dxResourceState(command.after, false);
+                    const bool ordersUavAccess =
+                        buffer->state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
+                        target == D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
+                        (command.before.access & ResourceAccessMask::ShaderWrite) != 0 &&
+                        (command.after.access & (ResourceAccessMask::ShaderRead |
+                                                 ResourceAccessMask::ShaderWrite)) != 0;
+                    if (ordersUavAccess) {
+                        D3D12_RESOURCE_BARRIER barrier{};
+                        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        barrier.UAV.pResource = buffer->resource.get();
+                        list->ResourceBarrier(1, &barrier);
+                    } else {
+                        transition(list, buffer->resource.get(), buffer->state, target);
+                    }
                 }
             }
             break;
@@ -1594,6 +1721,8 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             boundPipeline = impl_->pipelines.get(command.pipeline);
             if (boundPipeline == nullptr) {
                 error = GfxError::InvalidHandle;
+            } else if (rendering && boundPipeline->compute) {
+                error = GfxError::BadDescriptor;
             } else if (rendering &&
                        (activeFramebuffer == nullptr ||
                         boundPipeline->colorFormats != activeFramebuffer->colorFormats ||
@@ -1602,8 +1731,12 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 error = GfxError::BadDescriptor;
             } else {
                 list->SetPipelineState(boundPipeline->pipeline.get());
-                list->SetGraphicsRootSignature(boundPipeline->rootSignature.get());
-                list->IASetPrimitiveTopology(dxTopology(boundPipeline->rec.desc.topology));
+                if (boundPipeline->compute) {
+                    list->SetComputeRootSignature(boundPipeline->rootSignature.get());
+                } else {
+                    list->SetGraphicsRootSignature(boundPipeline->rootSignature.get());
+                    list->IASetPrimitiveTopology(dxTopology(boundPipeline->rec.desc.topology));
+                }
             }
             break;
         case CommandKind::BindVertexBuffer: {
@@ -1684,7 +1817,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             break;
         }
         case CommandKind::Draw:
-            if (!rendering || boundPipeline == nullptr) {
+            if (!rendering || boundPipeline == nullptr || boundPipeline->compute) {
                 error = GfxError::BadDescriptor;
             } else if ((error = bindTables(*boundPipeline)) == GfxError::None) {
                 list->DrawInstanced(command.vertexCount, command.instanceCount, 0, 0);
@@ -1699,7 +1832,8 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             }
             break;
         case CommandKind::DrawIndexed:
-            if (!rendering || boundPipeline == nullptr || !indexBound) {
+            if (!rendering || boundPipeline == nullptr || boundPipeline->compute ||
+                !indexBound) {
                 error = GfxError::BadDescriptor;
             } else if ((error = bindTables(*boundPipeline)) == GfxError::None) {
                 list->DrawIndexedInstanced(command.indexCount, command.instanceCount,
@@ -1712,6 +1846,17 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 delta.primitives += countPrimitives(boundPipeline->rec.desc.topology,
                                                      command.indexCount) *
                                     command.instanceCount;
+            }
+            break;
+        case CommandKind::Dispatch:
+            if (rendering || boundPipeline == nullptr || !boundPipeline->compute ||
+                command.groupCountX == 0 || command.groupCountY == 0 ||
+                command.groupCountZ == 0) {
+                error = GfxError::BadDescriptor;
+            } else if ((error = bindTables(*boundPipeline)) == GfxError::None) {
+                list->Dispatch(command.groupCountX, command.groupCountY,
+                               command.groupCountZ);
+                ++delta.dispatchCalls;
             }
             break;
         }
@@ -1743,6 +1888,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     if (FAILED(presentResult)) return toGfxError(presentResult);
     impl_->stats.drawCalls += delta.drawCalls;
     impl_->stats.drawIndexedCalls += delta.drawIndexedCalls;
+    impl_->stats.dispatchCalls += delta.dispatchCalls;
     impl_->stats.batches += delta.batches;
     impl_->stats.instances += delta.instances;
     impl_->stats.primitives += delta.primitives;
@@ -1820,6 +1966,7 @@ auto Dx12Device::stats() const -> DeviceStats { return impl_->stats; }
 auto Dx12Device::resetFrameStats() -> void {
     impl_->stats.drawCalls = 0;
     impl_->stats.drawIndexedCalls = 0;
+    impl_->stats.dispatchCalls = 0;
     impl_->stats.batches = 0;
     impl_->stats.instances = 0;
     impl_->stats.primitives = 0;

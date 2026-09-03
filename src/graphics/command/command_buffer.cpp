@@ -139,6 +139,18 @@ void CommandBuffer::drawIndexed(std::uint32_t indexCount, std::uint32_t instance
     pushCommand(std::move(cmd));
 }
 
+void CommandBuffer::dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY,
+                             std::uint32_t groupCountZ) {
+    F4_ASSERT(groupCountX > 0 && groupCountY > 0 && groupCountZ > 0,
+              "dispatch with a zero group count");
+    Command cmd;
+    cmd.kind = CommandKind::Dispatch;
+    cmd.groupCountX = groupCountX;
+    cmd.groupCountY = groupCountY;
+    cmd.groupCountZ = groupCountZ;
+    pushCommand(std::move(cmd));
+}
+
 void CommandBuffer::beginRenderPass(FramebufferHandle framebuffer) {
     F4_ASSERT(framebuffer.isValid(), "beginRenderPass with invalid handle");
     Command cmd;
