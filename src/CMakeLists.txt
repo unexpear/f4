@@ -1,5 +1,8 @@
 include(FetchContent)
 
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
 # Backend compiled into this build. 'null' is a software RHI device with no
 # window/GPU dependency (the M6 headless workhorse and conformance reference);
 # opengl/vulkan/dx12 activate in M7/M9/M10.
@@ -95,6 +98,7 @@ FetchContent_Declare(tinyusdz
 FetchContent_MakeAvailable(tinyusdz)
 
 add_library(f4_core STATIC
+    core/jobs/job_system.cpp
     core/logging/logger.cpp
     core/math/math.cpp
     core/memory/memory.cpp
@@ -132,7 +136,8 @@ target_include_directories(f4_core SYSTEM PUBLIC ${basis_universal_SOURCE_DIR}/t
 target_include_directories(f4_core SYSTEM PUBLIC ${ufbx_SOURCE_DIR})
 target_include_directories(f4_core SYSTEM PUBLIC ${tinyusdz_SOURCE_DIR}/src)
 
-target_link_libraries(f4_core PUBLIC zlibstatic Alembic::Alembic tinyusdz::tinyusdz_static)
+target_link_libraries(f4_core PUBLIC
+    Threads::Threads zlibstatic Alembic::Alembic tinyusdz::tinyusdz_static)
 target_include_directories(f4_core SYSTEM PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 
 target_compile_definitions(f4_core PUBLIC BASISU_DISABLE_ANDROID_ASTC_DECOMP=1)
@@ -160,6 +165,7 @@ f4_enable_sanitizers(f4_graphics)
 add_library(f4_engine STATIC
     engine/world/world_data.cpp
     engine/world/terrain_meshing.cpp
+    engine/world/world_streaming.cpp
     engine/rendering/pbr.cpp
     engine/rendering/material.cpp
     engine/rendering/gpu_mesh.cpp

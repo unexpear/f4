@@ -94,6 +94,80 @@ auto isVoxelEmpty(const VoxelCells& cells) -> bool {
                        [](std::uint16_t value) { return value == 0; });
 }
 
+auto packedVoxelValue(const PackedVoxelCells& cells, std::uint32_t index)
+    -> std::optional<std::uint16_t> {
+    if (index >= kVoxelCellCount || cells.palette.isEmpty() || cells.palette.size() > 256) {
+        return std::nullopt;
+    }
+    std::uint32_t paletteIndex = 0;
+    if (cells.bitsPerIndex == 0) {
+        if (cells.palette.size() != 1 || !cells.indices.isEmpty()) return std::nullopt;
+    } else if (cells.bitsPerIndex == 4) {
+        if (cells.palette.size() > 16 ||
+            cells.indices.size() != (kVoxelCellCount + 1u) / 2u) {
+            return std::nullopt;
+        }
+        const std::uint8_t packed = cells.indices[index / 2u];
+        paletteIndex = index % 2u == 0 ? packed & 0x0fu : packed >> 4u;
+    } else if (cells.bitsPerIndex == 8) {
+        if (cells.indices.size() != kVoxelCellCount) return std::nullopt;
+        paletteIndex = cells.indices[index];
+    } else {
+        return std::nullopt;
+    }
+    return paletteIndex < cells.palette.size()
+        ? std::optional<std::uint16_t>(cells.palette[paletteIndex])
+        : std::nullopt;
+}
+
+auto packVoxelCells(const VoxelCells& cells) -> std::optional<PackedVoxelCells> {
+    if (cells.values.size() != kVoxelCellCount) return std::nullopt;
+    PackedVoxelCells output;
+    containers::Array<std::uint8_t> unpackedIndices;
+    unpackedIndices.resize(kVoxelCellCount);
+    for (std::uint32_t index = 0; index < kVoxelCellCount; ++index) {
+        const std::uint16_t value = cells.values[index];
+        std::size_t paletteIndex = 0;
+        while (paletteIndex < output.palette.size() &&
+               output.palette[paletteIndex] != value) {
+            ++paletteIndex;
+        }
+        if (paletteIndex == output.palette.size()) {
+            if (output.palette.size() == 256) return std::nullopt;
+            output.palette.push(value);
+        }
+        unpackedIndices[index] = static_cast<std::uint8_t>(paletteIndex);
+    }
+    if (output.palette.size() == 1) return output;
+    if (output.palette.size() <= 16) {
+        output.bitsPerIndex = 4;
+        output.indices.resize((kVoxelCellCount + 1u) / 2u);
+        for (std::uint32_t index = 0; index < kVoxelCellCount; index += 2) {
+            output.indices[index / 2u] = static_cast<std::uint8_t>(
+                unpackedIndices[index] | (unpackedIndices[index + 1u] << 4u));
+        }
+    } else {
+        output.bitsPerIndex = 8;
+        output.indices = std::move(unpackedIndices);
+    }
+    return output;
+}
+
+auto unpackVoxelCells(const PackedVoxelCells& cells) -> std::optional<VoxelCells> {
+    VoxelCells output;
+    output.values.resize(kVoxelCellCount);
+    for (std::uint32_t index = 0; index < kVoxelCellCount; ++index) {
+        const std::optional<std::uint16_t> value = packedVoxelValue(cells, index);
+        if (!value.has_value()) return std::nullopt;
+        output.values[index] = *value;
+    }
+    return output;
+}
+
+auto packedVoxelStorageBytes(const PackedVoxelCells& cells) -> std::size_t {
+    return cells.palette.size() * sizeof(std::uint16_t) + cells.indices.size();
+}
+
 auto generateVoxelCells(std::uint64_t worldSeed, ChunkCoord coord,
                          const VoxelPolicyParams& params) -> VoxelCells {
     VoxelCells output;
@@ -669,49 +743,109 @@ auto ChunkStore::queue(ChunkHandle handle) -> bool {
     return true;
 }
 
-auto ChunkStore::generate(ChunkHandle handle) -> bool {
+auto ChunkStore::beginGeneration(ChunkHandle handle)
+    -> std::optional<ChunkGenerationRequest> {
     ChunkRecord* chunk = chunks_.get(handle);
-    if (chunk == nullptr) return false;
-    ChunkCoord coord;
-    std::uint64_t worldSeed = 0;
-    PolicyKind policy = PolicyKind::Voxel;
-    PolicyParams params;
-    {
-        std::lock_guard lock(chunk->mutex);
-        if (chunk->state != ChunkState::Queued) return false;
-        chunk->state = ChunkState::LayoutDone;
-        coord = chunk->coord;
-        worldSeed = chunk->worldSeed;
-        policy = chunk->policy;
-        params = chunk->params;
-    }
+    if (chunk == nullptr) return std::nullopt;
+    std::lock_guard lock(chunk->mutex);
+    if (chunk->state != ChunkState::Queued) return std::nullopt;
+    chunk->state = ChunkState::LayoutDone;
+    return ChunkGenerationRequest{
+        chunk->coord, chunk->worldSeed, chunk->policy, chunk->params, chunk->version};
+}
+
+auto generateChunkBase(const ChunkGenerationRequest& request)
+    -> std::optional<ChunkBase> {
     ChunkBase generated;
-    bool valid = false;
-    switch (policy) {
-    case PolicyKind::Voxel:
-        generated = VoxelPolicy::generate(worldSeed, coord, params.voxel);
-        valid = std::get<VoxelCells>(generated).values.size() == kVoxelCellCount;
+    switch (request.policy) {
+    case PolicyKind::Voxel: {
+        VoxelCells cells =
+            VoxelPolicy::generate(request.worldSeed, request.coord, request.params.voxel);
+        if (cells.values.size() != kVoxelCellCount) return std::nullopt;
+        std::optional<PackedVoxelCells> packed = packVoxelCells(cells);
+        generated = packed.has_value() ? ChunkBase(std::move(*packed))
+                                       : ChunkBase(std::move(cells));
         break;
+    }
     case PolicyKind::Height:
-        generated = HeightPolicy::generate(worldSeed, coord, params.height);
-        valid = std::get<HeightTile>(generated).samples.size() == kHeightSampleCount;
+        generated = HeightPolicy::generate(request.worldSeed, request.coord,
+                                           request.params.height);
+        if (std::get<HeightTile>(generated).samples.size() != kHeightSampleCount) {
+            return std::nullopt;
+        }
         break;
     case PolicyKind::Hex:
-        generated = HexPolicy::generate(worldSeed, coord, params.hex);
-        valid = !std::get<HexTile>(generated).cells.isEmpty();
+        generated = HexPolicy::generate(request.worldSeed, request.coord, request.params.hex);
+        if (std::get<HexTile>(generated).cells.isEmpty()) return std::nullopt;
         break;
     }
-    {
-        std::lock_guard lock(chunk->mutex);
-        if (!valid) {
-            chunk->state = ChunkState::Queued;
-            return false;
+    return generated;
+}
+
+namespace {
+
+[[nodiscard]] auto validGeneratedBase(PolicyKind policy, const ChunkBase& generated) -> bool {
+    switch (policy) {
+    case PolicyKind::Voxel: {
+        const VoxelCells* cells = std::get_if<VoxelCells>(&generated);
+        if (cells != nullptr) return cells->values.size() == kVoxelCellCount;
+        const PackedVoxelCells* packed = std::get_if<PackedVoxelCells>(&generated);
+        if (packed == nullptr) return false;
+        for (std::uint32_t index = 0; index < kVoxelCellCount; ++index) {
+            if (!packedVoxelValue(*packed, index).has_value()) return false;
         }
-        chunk->base = std::move(generated);
-        chunk->state = ChunkState::CellsReady;
-        chunk->dirty = {false, true, true};
+        return true;
     }
+    case PolicyKind::Height: {
+        const HeightTile* tile = std::get_if<HeightTile>(&generated);
+        return tile != nullptr && tile->samples.size() == kHeightSampleCount;
+    }
+    case PolicyKind::Hex: {
+        const HexTile* tile = std::get_if<HexTile>(&generated);
+        return tile != nullptr && !tile->cells.isEmpty();
+    }
+    }
+    return false;
+}
+
+} // namespace
+
+auto ChunkStore::publishGenerated(ChunkHandle handle,
+                                  const ChunkGenerationRequest& request,
+                                  ChunkBase generated) -> bool {
+    if (!validGeneratedBase(request.policy, generated)) return false;
+    ChunkRecord* chunk = chunks_.get(handle);
+    if (chunk == nullptr) return false;
+    std::lock_guard lock(chunk->mutex);
+    if (chunk->state != ChunkState::LayoutDone || chunk->version != request.sourceVersion ||
+        chunk->coord != request.coord || chunk->worldSeed != request.worldSeed ||
+        chunk->policy != request.policy || chunk->params != request.params) {
+        return false;
+    }
+    chunk->base = std::move(generated);
+    chunk->state = ChunkState::CellsReady;
+    chunk->dirty = {false, true, true};
     return true;
+}
+
+auto ChunkStore::generate(ChunkHandle handle) -> bool {
+    const std::optional<ChunkGenerationRequest> request = beginGeneration(handle);
+    if (!request.has_value()) return false;
+    std::optional<ChunkBase> generated = generateChunkBase(*request);
+    if (!generated.has_value()) {
+        ChunkRecord* chunk = chunks_.get(handle);
+        if (chunk != nullptr) {
+            std::lock_guard lock(chunk->mutex);
+            if (chunk->state == ChunkState::LayoutDone &&
+                chunk->version == request->sourceVersion && chunk->coord == request->coord &&
+                chunk->worldSeed == request->worldSeed && chunk->policy == request->policy &&
+                chunk->params == request->params) {
+                chunk->state = ChunkState::Queued;
+            }
+        }
+        return false;
+    }
+    return publishGenerated(handle, *request, std::move(*generated));
 }
 
 auto ChunkStore::regenerate(ChunkHandle handle) -> bool {
@@ -720,7 +854,10 @@ auto ChunkStore::regenerate(ChunkHandle handle) -> bool {
     {
         std::lock_guard lock(chunk->mutex);
         if (chunk->state < ChunkState::CellsReady) return false;
+        if (chunk->version == std::numeric_limits<std::uint64_t>::max()) return false;
+        ++chunk->version;
         chunk->state = ChunkState::Queued;
+        chunk->dirty = {true, true, true};
     }
     return generate(handle);
 }
@@ -874,8 +1011,14 @@ auto ChunkStore::cell(ChunkHandle handle, std::uint32_t index) const
     switch (chunk->policy) {
     case PolicyKind::Voxel: {
         const VoxelCells* cells = std::get_if<VoxelCells>(&chunk->base);
-        if (cells == nullptr || index >= cells->values.size()) return std::nullopt;
-        return CellValue::voxelValue(cells->values[index]);
+        if (cells != nullptr && index < cells->values.size()) {
+            return CellValue::voxelValue(cells->values[index]);
+        }
+        const PackedVoxelCells* packed = std::get_if<PackedVoxelCells>(&chunk->base);
+        if (packed == nullptr) return std::nullopt;
+        const std::optional<std::uint16_t> value = packedVoxelValue(*packed, index);
+        return value.has_value() ? std::optional<CellValue>(CellValue::voxelValue(*value))
+                                 : std::nullopt;
     }
     case PolicyKind::Height: {
         const HeightTile* tile = std::get_if<HeightTile>(&chunk->base);

@@ -169,11 +169,11 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
-| M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo and pipeline-key sorting exist. Frustum/occlusion culling, draw batching, jobs, multithreaded recording, SIMD paths, graph scheduling, and async compute are absent. |
+| M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo, pipeline-key sorting, and M16's first-class distance-priority job system exist. Frustum/occlusion culling, draw batching, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
-| M16 World streaming | ❌ Not started | No chunk residency, streaming queues, worker scheduling, generation staging, or terrain collision layer exists. |
+| M16 World streaming | ✅ Complete | Policy-aware camera rings use distance/stage-priority workers and bounded main-thread topology/publication. Versioned layout/cell/mesh results reject unloaded or edited work; sparse edits survive unload, including absent shared height neighbors. Resident voxel DDA and height sampling provide collision hooks. M16 also closes the deferred shared-resource reference contract and stores normal voxel bases in deterministic 4-bit/8-bit palettes. |
 
 ### Milestone 0 — Infrastructure ✅
 - `git init`; CMake presets (MSVC + GCC/Clang); warnings-as-errors
@@ -333,8 +333,9 @@ M5.0 core (ships before any codec):
 - Texture record: format enum incl. block-compressed (BCn/ASTC), mip chain,
   decoded-RGBA vs GPU-native payload distinction ("support" ≠ "decode")
 - Buffer/Pipeline: desc structs only — device owns instances from M6
-- Lifetime v1: explicit destroy(handle); refcount/streaming contract deferred
-  to M16 (documented)
+- Lifetime: M16 adds typed retain/release counts; repeated `getOrLoad` calls
+  acquire shared ownership and final release removes the record/path while
+  preserving stale-handle safety. `destroy` remains a release-compatible name.
 - Reflection-based serialization NOT started here — M14 saves keep using
   explicit chunk writes; reflection waits for editor era
 
@@ -600,13 +601,32 @@ Completed delivery and acceptance gates:
   across all three toolchains. Three back-face-culled gallery captures are
   pixel-identical with no missing faces, seam gaps, z-fighting, or blinking.
 
-### Milestone 16 — World Streaming (procgen track)
-- Ring load/unload of chunks around the camera on worker threads — pulls the
-  job system forward from M12 into first-class status
-- Priority queues by distance, per-frame time budget so spikes never stall
-  the frame, generation staged: layout → cells → meshes
-- Collision hooks for terrain (voxel DDA raycast for the Minecraft case,
-  heightfield sampling for the Ark/Valheim case)
+### Milestone 16 — World Streaming (procgen track) ✅
+- ✅ Camera-centered rings select voxel/height/hex residency through RegionMap.
+  Chunk topology stays main-thread-owned; pure cell generation and immutable
+  snapshot meshing run on the pulled-forward first-class job system.
+- ✅ Distance then stage priority, deterministic tie ordering, frame-time and
+  operation caps, and `layout → cells → meshes` publication prevent generation
+  or meshing spikes from becoming unbounded main-thread work.
+- ✅ Handle generation plus monotonic chunk versions reject completions after
+  unload/reuse, regeneration, border invalidation, or edits. Shutdown drains
+  workers before result storage is destroyed.
+- ✅ Sparse overlays persist across unload/reload. Height edge/corner edits are
+  recorded for mirrored neighbors even while those chunks are absent.
+- ✅ Resident terrain queries expose cross-chunk solid-block DDA and the same
+  bilinear height/material sampler used by generation and rendering.
+- ✅ Generated voxel bases with at most 16 ids store 4-bit indices; 17–256 ids
+  use 8-bit indices; more diverse chunks retain the dense u16 representation.
+  Packing order and round trips are deterministic.
+- ✅ M5's deferred cache lifetime contract is closed with typed shared
+  retain/release ownership and final-release path eviction.
+
+Ten focused M16 cases cover 126 assertions on scheduling, stage/version gates,
+palette packing, ring movement and caps, stale unloads, edit persistence,
+collision, shared resource lifetime, and deterministic regional convergence.
+GCC Debug/Release, MSVC Debug/Release/ASan, and Linux Clang Debug/ASan+UBSan
+pass all six CTest targets. The 20-scene OpenGL bench completed 60 inspected captures
+without missing/blinking faces or regressions in the seven validation scenes.
 
 Recommended interleave: M13 right after M4 (no renderer required), M14 after
 M5 (resources), M15 as soon as M7 draws its first mesh, M16 alongside M12.
@@ -820,14 +840,13 @@ faces and all seven rendering-validation scenes intact.
 
 ### Current next work (2026-09-03 audit)
 
-1. Begin M16 with camera-centered chunk residency, distance-priority generation
-   queues, staged cell/mesh work, per-frame budgets, and publication through
-   M15's snapshot/version gate. Streaming must route shared height-edge edits
-   through persistence when a mirrored neighbor is not resident.
-2. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
-   pipelines make CPU-reference versus GPU-sampled parity testable.
-3. Continue M12 from profiling evidence: culling and batching first, then jobs,
-   multithreaded recording, graph scheduling, and async compute where measured.
+1. Continue M12 from profiling evidence: frustum/occlusion culling and draw
+   batching first, using M16's completed job system where measurements justify
+   parallel work.
+2. Add the API-neutral compute pipeline/command model and backend implementations
+   needed to finish M13's CPU-reference versus GPU-sampled noise parity gate.
+3. Return to M12's multithreaded command recording, SIMD paths, render-graph
+   scheduling, and async compute only where profiling demonstrates value.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -842,8 +861,9 @@ chosen simple and safe; each carries a documented upgrade path.
   world-space origin = coord * chunkExtent(policy-specific).
 - **Lifecycle** (state byte written only by the main thread):
   `Invalid → Queued → LayoutDone → CellsReady → Meshed`, plus dirty bits
-  (`cellsDirty`, `meshDirty`, `bordersDirty`). Workers advance stages; they
-  never mutate shared buffers in place (see 11.5).
+  (`cellsDirty`, `meshDirty`, `bordersDirty`). Workers compute immutable stage
+  results; the main thread advances stages after version validation and never
+  exposes an in-place worker mutation (see 11.5).
 - **Purity rule**: layout AND cells are pure functions of
   `(worldSeed, coord, policyParams)`. Player edits live ONLY in a sparse
   delta overlay:
@@ -865,10 +885,10 @@ chosen simple and safe; each carries a documented upgrade path.
   1024.
 - **Storage v1**: flat `Array<u16>` = 64 KiB/chunk. Air = 0 (memset-able;
   "trivially empty" check = scan first words for all-zero).
-- **Storage v2 (upgrade path, M16)**: per-chunk palette + bit-packed
+- **Storage v2 (completed in M16)**: per-chunk palette + bit-packed
   indices — ≤256 distinct blocks pack to 8-bit indices (32 KiB), typical
-  terrain palettes ≤16 blocks pack to 4-bit (16 KiB). Palette lives in the
-  chunk header; serialization versioning already allows both layouts.
+  terrain palettes ≤16 blocks pack to 4-bit (16 KiB). Chunks with more than
+  256 ids retain dense u16 storage; sparse delta serialization is unchanged.
 - **Block registry**: u16 id → `{solid, opaque, textureLayer, hardness}`.
   ids 0..255 engine-reserved (0 air, 1 bedrock, …); games own ≥256.
 - **Meshing input**: padded fetch window of 34³ built once per remesh from
@@ -940,9 +960,10 @@ chosen simple and safe; each carries a documented upgrade path.
   the delta overlay under a per-chunk lock and bump a version counter;
   remesh workers snapshot `(base, deltas@version)` so a running mesher never
   observes torn state. The main thread swaps in finished meshes.
-- Until M16's job system exists, the same state machine runs synchronously
-  on the main thread — swapping workers in later touches scheduling only,
-  not the data model.
+- M16's scheduler runs pure cell generation and snapshot meshing on fixed
+  workers. Chunk-map mutation, overlay replay, dirty propagation, and
+  version-checked mesh publication remain on the main thread, so cancellation
+  is stale-result rejection rather than shared-buffer mutation.
 
 ### 11.6 Determinism & float parity
 

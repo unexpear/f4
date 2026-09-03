@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <typeindex>
 #include <utility>
@@ -50,12 +51,14 @@ public:
 
     HashMap<String, Handle<Tag>> byPath;
     HashMap<std::uint64_t, String> pathOf;
+    HashMap<std::uint64_t, std::uint32_t> references;
     GenerationalArena<typename ResourceTrait<Tag>::type, Tag> arena;
 
     void destroyAll() override {
         arena.clear();
         byPath.clear();
         pathOf.clear();
+        references.clear();
     }
 };
 
@@ -66,7 +69,11 @@ public:
     // Creates an untracked record. Exhaustion asserts (arena contract).
     template <typename Tag, typename... Args>
     auto create(Args&&... args) -> Handle<Tag> {
-        return family<Tag>().arena.acquire(static_cast<Args&&>(args)...);
+        ResourceFamily<Tag>& f = family<Tag>();
+        const Handle<Tag> handle = f.arena.acquire(static_cast<Args&&>(args)...);
+        const bool inserted = f.references.insert(handleKey(handle), 1);
+        F4_ASSERT(inserted, "resource reference bookkeeping invariant broken");
+        return handle;
     }
 
     // Creates AND registers a canonical path. Returns a null handle if the
@@ -82,7 +89,9 @@ public:
         const Handle<Tag> handle = f.arena.acquire(static_cast<Args&&>(args)...);
         const bool insertedPath = f.byPath.insert(owned, handle);
         const bool insertedReverse = f.pathOf.insert(handleKey(handle), static_cast<String&&>(owned));
-        F4_ASSERT(insertedPath && insertedReverse, "path bookkeeping invariant broken");
+        const bool insertedReference = f.references.insert(handleKey(handle), 1);
+        F4_ASSERT(insertedPath && insertedReverse && insertedReference,
+                  "path bookkeeping invariant broken");
         return handle;
     }
 
@@ -94,6 +103,8 @@ public:
         -> Result<Handle<Tag>, decltype(std::declval<Loader&&>()().error())> {
         const String ownedPath(path);
         if (const Handle<Tag> existing = find<Tag>(ownedPath.view()); existing.isValid()) {
+            const bool retained = retain(existing);
+            F4_ASSERT(retained, "resource reference bookkeeping invariant broken");
             return existing;
         }
 
@@ -110,6 +121,8 @@ public:
 
         const Handle<Tag> existing = find<Tag>(ownedPath.view());
         F4_ASSERT(existing.isValid(), "resource path bookkeeping invariant broken");
+        const bool retained = retain(existing);
+        F4_ASSERT(retained, "resource reference bookkeeping invariant broken");
         return existing;
     }
 
@@ -133,20 +146,49 @@ public:
         return found == nullptr ? Handle<Tag>{} : *found;
     }
 
-    // Destroys the record and unregisters its path. Returns false on a stale
-    // or invalid handle (idempotent).
     template <typename Tag>
-    auto destroy(Handle<Tag> handle) -> bool {
+    auto retain(Handle<Tag> handle) -> bool {
         ResourceFamily<Tag>& f = family<Tag>();
-        if (!f.arena.contains(handle)) {
+        std::uint32_t* count = f.references.find(handleKey(handle));
+        if (!f.arena.contains(handle) || count == nullptr ||
+            *count == std::numeric_limits<std::uint32_t>::max()) {
             return false;
+        }
+        ++*count;
+        return true;
+    }
+
+    template <typename Tag>
+    [[nodiscard]] auto referenceCount(Handle<Tag> handle) -> std::uint32_t {
+        ResourceFamily<Tag>& f = family<Tag>();
+        const std::uint32_t* count = f.references.find(handleKey(handle));
+        return f.arena.contains(handle) && count != nullptr ? *count : 0;
+    }
+
+    // Drops one ownership reference. The record and canonical path are
+    // removed only when the final reference is released.
+    template <typename Tag>
+    auto release(Handle<Tag> handle) -> bool {
+        ResourceFamily<Tag>& f = family<Tag>();
+        std::uint32_t* count = f.references.find(handleKey(handle));
+        if (!f.arena.contains(handle) || count == nullptr || *count == 0) return false;
+        if (*count > 1) {
+            --*count;
+            return true;
         }
         if (const String* path = f.pathOf.find(handleKey(handle))) {
             f.byPath.erase(*path);
             f.pathOf.erase(handleKey(handle));
         }
+        f.references.erase(handleKey(handle));
         f.arena.release(handle);
         return true;
+    }
+
+    // Backward-compatible name for releasing an ownership reference.
+    template <typename Tag>
+    auto destroy(Handle<Tag> handle) -> bool {
+        return release(handle);
     }
 
     template <typename Tag>

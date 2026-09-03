@@ -49,6 +49,7 @@ add_executable(f4_tests
     engine/test_m11.cpp
     engine/test_m14.cpp
     engine/test_m15.cpp
+    engine/test_m16.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::doctest)
@@ -162,12 +163,15 @@ add_test(NAME world_determinism COMMAND f4_tests
     "--test-case=M14: generated policy outputs match cross-toolchain golden digests")
 add_test(NAME terrain_determinism COMMAND f4_tests
     "--test-case=M15: policy mesh dumps retain deterministic golden digests")
-set_tests_properties(determinism world_determinism terrain_determinism
+add_test(NAME streaming_determinism COMMAND f4_tests
+    "--test-case=M16: regional policies and asynchronous meshes converge deterministically")
+set_tests_properties(determinism world_determinism terrain_determinism streaming_determinism
     PROPERTIES LABELS determinism)
 
 if(F4_ENABLE_SANITIZERS AND MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
     get_filename_component(F4_ASAN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     set_tests_properties(core core_stripped determinism world_determinism terrain_determinism
+                         streaming_determinism
         PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${F4_ASAN_BIN_DIR}")
 endif()

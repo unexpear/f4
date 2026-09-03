@@ -143,7 +143,20 @@ struct VoxelCells {
     friend auto operator==(const VoxelCells& a, const VoxelCells& b) -> bool;
 };
 
+struct PackedVoxelCells {
+    containers::Array<std::uint16_t> palette;
+    containers::Array<std::uint8_t> indices;
+    std::uint8_t bitsPerIndex = 0;
+};
+
 [[nodiscard]] auto isVoxelEmpty(const VoxelCells& cells) -> bool;
+[[nodiscard]] auto packVoxelCells(const VoxelCells& cells)
+    -> std::optional<PackedVoxelCells>;
+[[nodiscard]] auto unpackVoxelCells(const PackedVoxelCells& cells)
+    -> std::optional<VoxelCells>;
+[[nodiscard]] auto packedVoxelValue(const PackedVoxelCells& cells, std::uint32_t index)
+    -> std::optional<std::uint16_t>;
+[[nodiscard]] auto packedVoxelStorageBytes(const PackedVoxelCells& cells) -> std::size_t;
 struct VoxelRayHit {
     std::int32_t x = 0;
     std::int32_t y = 0;
@@ -284,7 +297,8 @@ struct ChunkDelta {
     friend constexpr auto operator==(const ChunkDelta&, const ChunkDelta&) -> bool = default;
 };
 
-using ChunkBase = std::variant<std::monostate, VoxelCells, HeightTile, HexTile>;
+using ChunkBase =
+    std::variant<std::monostate, VoxelCells, PackedVoxelCells, HeightTile, HexTile>;
 
 struct ChunkSnapshot {
     ChunkCoord coord;
@@ -297,6 +311,19 @@ struct ChunkSnapshot {
     ChunkBase base;
     containers::Array<ChunkDelta> deltas;
 };
+
+// Immutable metadata copied at the layout boundary. Workers can generate the
+// base cells without touching ChunkStore; publication validates this version.
+struct ChunkGenerationRequest {
+    ChunkCoord coord;
+    std::uint64_t worldSeed = 0;
+    PolicyKind policy = PolicyKind::Voxel;
+    PolicyParams params;
+    std::uint64_t sourceVersion = 0;
+};
+
+[[nodiscard]] auto generateChunkBase(const ChunkGenerationRequest& request)
+    -> std::optional<ChunkBase>;
 
 class RegionMap {
 public:
@@ -330,6 +357,10 @@ public:
     [[nodiscard]] auto liveCount() const -> std::size_t;
 
     auto queue(ChunkHandle handle) -> bool;
+    [[nodiscard]] auto beginGeneration(ChunkHandle handle)
+        -> std::optional<ChunkGenerationRequest>;
+    auto publishGenerated(ChunkHandle handle, const ChunkGenerationRequest& request,
+                          ChunkBase generated) -> bool;
     auto generate(ChunkHandle handle) -> bool;
     auto regenerate(ChunkHandle handle) -> bool;
     auto edit(ChunkHandle handle, std::uint32_t index, const CellValue& value) -> bool;

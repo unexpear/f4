@@ -716,10 +716,17 @@ auto meshChunkSnapshot(const ChunkSnapshot& snapshot,
     case PolicyKind::Voxel: {
         if (context.blocks == nullptr) return TerrainMeshError::MissingBlockRegistry;
         const VoxelCells* base = std::get_if<VoxelCells>(&snapshot.base);
-        if (base == nullptr || base->values.size() != kVoxelCellCount) {
-            return TerrainMeshError::InvalidData;
+        VoxelCells cells;
+        if (base != nullptr) {
+            if (base->values.size() != kVoxelCellCount) return TerrainMeshError::InvalidData;
+            cells = *base;
+        } else {
+            const PackedVoxelCells* packed = std::get_if<PackedVoxelCells>(&snapshot.base);
+            if (packed == nullptr) return TerrainMeshError::InvalidData;
+            std::optional<VoxelCells> unpacked = unpackVoxelCells(*packed);
+            if (!unpacked.has_value()) return TerrainMeshError::InvalidData;
+            cells = std::move(*unpacked);
         }
-        VoxelCells cells = *base;
         for (const ChunkDelta& delta : snapshot.deltas) {
             if (delta.value.kind != PolicyKind::Voxel || delta.index >= kVoxelCellCount) {
                 return TerrainMeshError::InvalidData;

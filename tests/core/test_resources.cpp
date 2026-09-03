@@ -161,6 +161,31 @@ TEST_CASE("getOrLoad caches successes and preserves loader errors") {
     CHECK(cache.liveCount<resources::MeshTag>() == 1u);
 }
 
+TEST_CASE("M16: shared resource references keep streamed records alive until final release") {
+    resources::ResourceCache cache;
+    const auto first = cache.getOrLoad<resources::MeshTag>(
+        "meshes/shared.mesh", []() -> Result<Mesh, resources::LoadError> {
+            return quadMesh();
+        });
+    REQUIRE(first.hasValue());
+    const auto second = cache.getOrLoad<resources::MeshTag>(
+        "meshes/shared.mesh", []() -> Result<Mesh, resources::LoadError> {
+            return resources::LoadError::BadSignature;
+        });
+    REQUIRE(second.hasValue());
+    CHECK(second.value() == first.value());
+    CHECK(cache.referenceCount(first.value()) == 2);
+
+    REQUIRE(cache.release(first.value()));
+    CHECK(cache.contains(second.value()));
+    CHECK(cache.referenceCount(second.value()) == 1);
+    CHECK(cache.find<resources::MeshTag>("meshes/shared.mesh") == second.value());
+    REQUIRE(cache.destroy(second.value()));
+    CHECK_FALSE(cache.contains(second.value()));
+    CHECK(cache.referenceCount(second.value()) == 0);
+    CHECK_FALSE(cache.retain(second.value()));
+}
+
 TEST_CASE("clear empties every family and bumps generations") {
     resources::ResourceCache cache;
     const auto mesh = cache.createNamed<resources::MeshTag>(
