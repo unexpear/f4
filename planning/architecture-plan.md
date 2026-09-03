@@ -172,7 +172,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo and pipeline-key sorting exist. Frustum/occlusion culling, draw batching, jobs, multithreaded recording, SIMD paths, graph scheduling, and async compute are absent. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
-| M15 Terrain meshing | ❌ Not started | Demo terrain is not a policy mesher; no voxel greedy mesher, height-tile stitching, hex-prism mesher, or border-remesh system exists. |
+| M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
 | M16 World streaming | ❌ Not started | No chunk residency, streaming queues, worker scheduling, generation staging, or terrain collision layer exists. |
 
 ### Milestone 0 — Infrastructure ✅
@@ -582,6 +582,23 @@ Completed delivery and acceptance gates:
   edit with dirty flags from M14
 - Executes as soon as M7 proves window→device→draw; headless mesher tests
   run earlier against golden vertex dumps
+- Completed with a common `MeshData` vertex/index/surface record and canonical
+  `resources::Mesh` conversion. Surface ranges preserve per-face material ids
+  while position, normal, UV, and color use the existing M11 vertex contract.
+- Voxel delivery caches the full 34³ input window, owns only center-chunk faces,
+  greedily merges equal material/normal/AO masks, flips non-coplanar AO
+  diagonals, and assigns unlike transparent interfaces to one block id so
+  neighboring chunks cannot emit coplanar duplicates.
+- Height delivery emits 65×65 top vertices, fixed-winding quads, neighbor-fed
+  edge normals, four material weights plus their blended display color, and
+  four skirts with an optional constant policy-transition floor. Live shared
+  edge edits mirror into resident cardinal/diagonal tiles before remeshing.
+- Hex delivery uses the M14 pointy-top axial/corner lattice for colored top,
+  bottom, and exposed side faces; same-policy neighbors suppress shared walls.
+- Twelve focused cases / 16,129 assertions pass on GCC, MSVC, and Clang 18
+  ASan+UBSan. `terrain_determinism` locks quantized vertex/index/surface dumps
+  across all three toolchains. Three back-face-culled gallery captures are
+  pixel-identical with no missing faces, seam gaps, z-fighting, or blinking.
 
 ### Milestone 16 — World Streaming (procgen track)
 - Ring load/unload of chunks around the camera on worker threads — pulls the
@@ -801,11 +818,12 @@ The demo bench also gained repeatable back-buffer capture; three captured frames
 from each of all 20 scenes were inspected, with no blinking or missing cube
 faces and all seven rendering-validation scenes intact.
 
-### Current next work (2026-09-02 audit)
+### Current next work (2026-09-03 audit)
 
-1. Begin M15 with policy-specific voxel, height-tile, and hex-prism meshers plus
-   border invalidation/remeshing, feeding their output through the completed M11
-   material path.
+1. Begin M16 with camera-centered chunk residency, distance-priority generation
+   queues, staged cell/mesh work, per-frame budgets, and publication through
+   M15's snapshot/version gate. Streaming must route shared height-edge edits
+   through persistence when a mirrored neighbor is not resident.
 2. Keep M13 partially open until compute commands and Vulkan/DX12/OpenGL compute
    pipelines make CPU-reference versus GPU-sampled parity testable.
 3. Continue M12 from profiling evidence: culling and batching first, then jobs,
@@ -854,9 +872,9 @@ chosen simple and safe; each carries a documented upgrade path.
 - **Block registry**: u16 id → `{solid, opaque, textureLayer, hardness}`.
   ids 0..255 engine-reserved (0 air, 1 bedrock, …); games own ≥256.
 - **Meshing input**: padded fetch window of 34³ built once per remesh from
-  the chunk plus the 6 face neighbors' 1-cell edge slabs. Face adjacency is
-  sufficient for face culling; corners become relevant only when baked AO
-  arrives (noted for M15 — window grows to neighbor corners then).
+  the chunk plus one-cell slabs, edge lines, and corners from up to all 26
+  adjacent chunks. Face samples drive culling; edge/corner samples drive the
+  completed M15 baked-AO calculation and its neighbor dirty propagation.
 - **Raycast**: Amanatides–Woo DDA over the cell grid; returns
   `{cell, enteringFaceNormal, t}`. The world-level raycast walks chunk
   boundaries transparently.

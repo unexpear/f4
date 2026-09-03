@@ -1,10 +1,12 @@
 #include "demos/demo_terrain.h"
 
-#include <cmath>
+#include <algorithm>
 #include <cstring>
-#include <vector>
+#include <limits>
+#include <span>
 
-#include "core/math/mat4.h"
+#include "core/resources/mesh.h"
+#include "engine/world/terrain_meshing.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
@@ -13,14 +15,11 @@ namespace f4::demo {
 
 namespace {
 
-// Grid ground plane
-constexpr float kGridMax = 10.f;
-constexpr int kGridLines = 20;
-
 constexpr const char* kVs = R"glsl(
 #version 430 core
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec3 aColor;
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec3 aNormal;
+layout(location = 3) in vec4 aColor;
 layout(std140, binding = 0) uniform Ubo {
     mat4 viewProj;
     mat4 model;
@@ -31,11 +30,11 @@ out vec3 vColor;
 out vec3 vNormal;
 out vec3 vWorldPos;
 void main() {
-    vec4 worldPos = model * vec4(aPos, 1.0);
-    gl_Position = viewProj * worldPos;
-    vColor = aColor;
-    vNormal = vec3(0.0, 1.0, 0.0);
-    vWorldPos = worldPos.xyz;
+    vec4 world = model * vec4(aPosition, 1.0);
+    gl_Position = viewProj * world;
+    vColor = aColor.rgb;
+    vNormal = normalize(mat3(model) * aNormal);
+    vWorldPos = world.xyz;
 }
 )glsl";
 
@@ -52,257 +51,224 @@ layout(std140, binding = 0) uniform Ubo {
 };
 out vec4 fragColor;
 void main() {
-    vec3 N = vNormal;
+    vec3 N = normalize(vNormal);
     vec3 L = normalize(-lightDir);
     vec3 V = normalize(viewPos - vWorldPos);
-
-    float diff = max(dot(N, L), 0.0);
-    vec3 ambient = vec3(0.1);
-    vec3 diffuse = diff * vec3(0.7);
-
-    vec3 R = reflect(-L, N);
-    float spec = pow(max(dot(V, R), 0.0), 16.0);
-    vec3 specular = spec * vec3(0.2);
-
-    vec3 color = vColor * (ambient + diffuse) + specular;
-    fragColor = vec4(color, 1.0);
+    float diffuse = max(dot(N, L), 0.0);
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    vec3 lit = vColor * (0.28 + 0.72 * diffuse) + vec3(0.08, 0.11, 0.14) * rim;
+    fragColor = vec4(lit, 1.0);
 }
 )glsl";
+
+struct TerrainUbo {
+    math::Mat4 viewProj;
+    math::Mat4 model;
+    math::Vec3 lightDir;
+    float lightPadding = 0.0f;
+    math::Vec3 viewPos;
+    float viewPadding = 0.0f;
+};
+
+static_assert(sizeof(TerrainUbo) == 160);
+
+auto makeVoxelDemo(const world::BlockRegistry& blocks)
+    -> Result<world::MeshData, world::TerrainMeshError> {
+    world::VoxelCells cells;
+    cells.values.resize(world::kVoxelCellCount);
+    for (std::uint32_t z = 2; z < 14; ++z) {
+        for (std::uint32_t x = 2; x < 14; ++x) {
+            const std::uint32_t height = 2u + ((x / 3u + z / 3u) % 4u);
+            for (std::uint32_t y = 0; y < height; ++y) {
+                cells.values[world::voxelIndex(x, y, z)] =
+                    y + 1u == height ? (height >= 4u ? 3u : 2u) : 1u;
+            }
+        }
+    }
+    auto result = world::meshVoxelChunk(cells, blocks);
+    if (!result) return result.error();
+    static constexpr std::array<std::array<std::uint8_t, 3>, 3> colors{{
+        {{102, 111, 121}}, {{104, 151, 76}}, {{194, 137, 78}}}};
+    for (world::TerrainVertex& vertex : result.value().vertices) {
+        const auto& base = colors[std::min<std::size_t>(vertex.material, colors.size() - 1u)];
+        const std::uint32_t shade = vertex.color[0];
+        vertex.color = {{
+            static_cast<std::uint8_t>((base[0] * shade) / 255u),
+            static_cast<std::uint8_t>((base[1] * shade) / 255u),
+            static_cast<std::uint8_t>((base[2] * shade) / 255u), 255}};
+    }
+    return static_cast<world::MeshData&&>(result.value());
+}
 
 } // namespace
 
 bool TerrainScene::init(gfx::IDevice* dev, platform::Window*) {
     if (inited_) return true;
+    if (dev == nullptr) return false;
     device_ = dev;
-
-    // Build grid geometry (lines as quads for ground)
-    std::vector<float> gridVerts;
-    std::vector<std::uint16_t> gridIndices;
-    gridVerts.reserve((kGridLines + 1) * (kGridLines + 1) * 6);
-    gridIndices.reserve(kGridLines * kGridLines * 6);
-
-    for (int z = 0; z <= kGridLines; ++z) {
-        for (int x = 0; x <= kGridLines; ++x) {
-            float wx = (x - kGridLines * 0.5f) * (2.f * kGridMax / kGridLines);
-            float wz = (z - kGridLines * 0.5f) * (2.f * kGridMax / kGridLines);
-            float c = ((x + z) % 2 == 0) ? 0.35f : 0.25f;
-            gridVerts.push_back(wx); gridVerts.push_back(0.f); gridVerts.push_back(wz);
-            gridVerts.push_back(c); gridVerts.push_back(c); gridVerts.push_back(c);
-        }
-    }
-    for (int gz = 0; gz < kGridLines; ++gz) {
-        for (int gx = 0; gx < kGridLines; ++gx) {
-            int a = gz * (kGridLines + 1) + gx;
-            int b = a + 1;
-            int c = a + (kGridLines + 1);
-            int d = c + 1;
-            gridIndices.push_back(a); gridIndices.push_back(b); gridIndices.push_back(d);
-            gridIndices.push_back(d); gridIndices.push_back(c); gridIndices.push_back(a);
-        }
-    }
-
-    // Grid vertex buffer
-    gfx::BufferDesc vbd;
-    vbd.sizeBytes = static_cast<std::uint32_t>(gridVerts.size() * sizeof(float));
-    vbd.usage = gfx::BufferUsage::Vertex;
-    auto vb = dev->createBuffer(vbd, std::span(reinterpret_cast<const std::byte*>(gridVerts.data()), gridVerts.size() * sizeof(float)));
-    if (!vb.hasValue()) return false;
-    vbGrid_ = vb.value();
-
-    // Grid index buffer
-    gfx::BufferDesc ibd;
-    ibd.sizeBytes = static_cast<std::uint32_t>(gridIndices.size() * sizeof(std::uint16_t));
-    ibd.usage = gfx::BufferUsage::Index;
-    auto ib = dev->createBuffer(ibd, std::span(reinterpret_cast<const std::byte*>(gridIndices.data()), gridIndices.size() * sizeof(std::uint16_t)));
-    if (!ib.hasValue()) return false;
-    ibGrid_ = ib.value();
-
-    // Simple cube for objects on terrain (position, color)
-    constexpr float kCube[] = {
-        // Front
-        -0.5f, -0.5f, -0.5f, 1,1,1,
-         0.5f, -0.5f, -0.5f, 1,1,1,
-         0.5f,  0.5f, -0.5f, 1,1,1,
-        -0.5f,  0.5f, -0.5f, 1,1,1,
-        // Back
-        -0.5f, -0.5f,  0.5f, 1,1,1,
-         0.5f, -0.5f,  0.5f, 1,1,1,
-         0.5f,  0.5f,  0.5f, 1,1,1,
-        -0.5f,  0.5f,  0.5f, 1,1,1,
-        // Left
-        -0.5f, -0.5f, -0.5f, 1,1,1,
-        -0.5f, -0.5f,  0.5f, 1,1,1,
-        -0.5f,  0.5f,  0.5f, 1,1,1,
-        -0.5f,  0.5f, -0.5f, 1,1,1,
-        // Right
-         0.5f, -0.5f, -0.5f, 1,1,1,
-         0.5f, -0.5f,  0.5f, 1,1,1,
-         0.5f,  0.5f,  0.5f, 1,1,1,
-         0.5f,  0.5f, -0.5f, 1,1,1,
-        // Top
-        -0.5f,  0.5f, -0.5f, 1,1,1,
-         0.5f,  0.5f, -0.5f, 1,1,1,
-         0.5f,  0.5f,  0.5f, 1,1,1,
-        -0.5f,  0.5f,  0.5f, 1,1,1,
-        // Bottom
-        -0.5f, -0.5f, -0.5f, 1,1,1,
-         0.5f, -0.5f, -0.5f, 1,1,1,
-         0.5f, -0.5f,  0.5f, 1,1,1,
-        -0.5f, -0.5f,  0.5f, 1,1,1,
-    };
-    constexpr std::uint16_t kCubeIdx[] = {
-        0,1,2, 2,3,0, 4,5,6, 6,7,4, 8,9,10, 10,11,8,
-        12,13,14, 14,15,12, 16,17,18, 18,19,16, 20,21,22, 22,23,20
-    };
-
-    gfx::BufferDesc cvbd;
-    cvbd.sizeBytes = sizeof(kCube);
-    cvbd.usage = gfx::BufferUsage::Vertex;
-    auto cvb = dev->createBuffer(cvbd, std::span(reinterpret_cast<const std::byte*>(kCube), sizeof(kCube)));
-    if (!cvb.hasValue()) return false;
-    vbCube_ = cvb.value();
-
-    gfx::BufferDesc cibd;
-    cibd.sizeBytes = sizeof(kCubeIdx);
-    cibd.usage = gfx::BufferUsage::Index;
-    auto cib = dev->createBuffer(cibd, std::span(reinterpret_cast<const std::byte*>(kCubeIdx), sizeof(kCubeIdx)));
-    if (!cib.hasValue()) return false;
-    ibCube_ = cib.value();
-
-    // Per-object constant ring (std140: mat4 + mat4 + vec4 + vec3 + padding = 144, pad to 160)
-    if (constRing_.create(*dev, 160, 16) != gfx::GfxError::None) return false;
-
-    // Shaders
-    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
-        gfx::ShaderDesc d;
-        d.stage = stage;
-        d.blob.resize(std::strlen(src));
-        std::memcpy(d.blob.data(), src, d.blob.size());
-        return dev->createShader(d);
-    };
-    auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
-    auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
-    if (!vs.hasValue() || !fs.hasValue()) return false;
-    vs_ = vs.value();
-    fs_ = fs.value();
-
-    // Pipeline
-    gfx::PipelineStateDesc pd;
-    pd.vertexShader = vs_;
-    pd.fragmentShader = fs_;
-    pd.topology = gfx::PrimitiveTopology::TriangleList;
-    pd.raster.cullMode = gfx::CullMode::None;
-    pd.depthStencil.depthTestEnable = true;
-    pd.depthStencil.depthWriteEnable = true;
-    pd.depthStencil.depthCompare = gfx::CompareOp::Less;
-    {
-        gfx::VertexInputLayout::VertexBinding b;
-        b.binding = 0;
-        b.strideBytes = 24;
-        pd.vertexInput.bindings.push(b);
-        gfx::VertexInputLayout::VertexAttribute pa;
-        pa.binding = 0; pa.location = 0; pa.format = gfx::VertexFormat::Float32x3; pa.offsetBytes = 0;
-        pd.vertexInput.attributes.push(pa);
-        gfx::VertexInputLayout::VertexAttribute ca;
-        ca.binding = 0; ca.location = 1; ca.format = gfx::VertexFormat::Float32x3; ca.offsetBytes = 12;
-        pd.vertexInput.attributes.push(ca);
-    }
-    auto pipe = dev->createPipeline(pd);
-    if (!pipe.hasValue()) return false;
-    pipeline_ = pipe.value();
-
     inited_ = true;
+    const auto fail = [&] {
+        shutdown(dev);
+        return false;
+    };
+
+    world::BlockRegistry blocks;
+    if (!blocks.setEngineBlock(3, {true, true, 2, 1.5f})) return fail();
+    auto voxel = makeVoxelDemo(blocks);
+    world::HeightTile heightTile = world::generateHeightTile(0x4d3135u, {}, {});
+    for (std::uint32_t z = 0; z < world::kHeightSamples; ++z) {
+        for (std::uint32_t x = 0; x < world::kHeightSamples; ++x) {
+            world::HeightSample& sample =
+                heightTile.samples[world::heightSampleIndex(x, z)];
+            const std::uint32_t band = std::min(x / 16u, 3u);
+            const std::uint32_t nextBand = std::min(band + 1u, 3u);
+            const std::uint8_t blend = static_cast<std::uint8_t>((x % 16u) * 12u);
+            sample.materialWeights = {{0, 0, 0, 0}};
+            sample.materialWeights[band] = static_cast<std::uint8_t>(255u - blend);
+            sample.materialWeights[nextBand] = static_cast<std::uint8_t>(
+                sample.materialWeights[nextBand] + blend);
+            sample.biomeId = static_cast<std::uint16_t>(band);
+        }
+    }
+    world::HeightMeshingOptions heightOptions;
+    heightOptions.skirtDepth = 6.0f;
+    auto height = world::meshHeightChunk(heightTile, {}, heightOptions);
+    world::HexPolicyParams hexParams;
+    hexParams.radius = 4;
+    world::HexTile hexTile = world::generateHexTile(0x4d3135u, {}, hexParams);
+    const std::int32_t hexRadius = static_cast<std::int32_t>(hexTile.radius);
+    for (std::int32_t r = -hexRadius; r <= hexRadius; ++r) {
+        for (std::int32_t q = -hexRadius; q <= hexRadius; ++q) {
+            const auto index = hexTile.index({q, r});
+            if (index.has_value()) {
+                hexTile.cells[*index].terrainType =
+                    static_cast<std::uint8_t>((q - r + 24) % 3);
+            }
+        }
+    }
+    world::HexMeshingOptions hexOptions;
+    hexOptions.floorHeight = -9.0f;
+    auto hex = world::meshHexChunk(hexTile, {}, hexOptions);
+    if (!voxel || !height || !hex) return fail();
+
+    const std::array<const world::MeshData*, 3> sources{{
+        &voxel.value(), &height.value(), &hex.value()}};
+    meshes_[0].model = math::Mat4::translation({-7.3f, -1.2f, -2.4f}).mul(
+        math::Mat4::scaling({0.32f, 0.32f, 0.32f}));
+    meshes_[1].model = math::Mat4::translation({-2.56f, -1.6f, -2.56f}).mul(
+        math::Mat4::scaling({0.08f, 0.08f, 0.08f}));
+    meshes_[2].model = math::Mat4::translation({5.5f, 0.0f, 0.0f}).mul(
+        math::Mat4::scaling({0.42f, 0.42f, 0.42f}));
+
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const resources::Mesh mesh = world::toResourceMesh(*sources[i]);
+        if (mesh.streams.size() != 1 || mesh.streams[0].data.isEmpty() ||
+            mesh.indices.isEmpty() ||
+            mesh.streams[0].data.size() > std::numeric_limits<std::uint32_t>::max() ||
+            mesh.indices.size() > std::numeric_limits<std::uint32_t>::max() ||
+            mesh.indexCount() > std::numeric_limits<std::uint32_t>::max()) {
+            return fail();
+        }
+        gfx::BufferDesc vertexDesc;
+        vertexDesc.sizeBytes = static_cast<std::uint32_t>(mesh.streams[0].data.size());
+        vertexDesc.usage = gfx::BufferUsage::Vertex;
+        auto vertex = dev->createBuffer(
+            vertexDesc, std::span(mesh.streams[0].data.data(), mesh.streams[0].data.size()));
+        if (!vertex) return fail();
+        meshes_[i].vertexBuffer = vertex.value();
+
+        gfx::BufferDesc indexDesc;
+        indexDesc.sizeBytes = static_cast<std::uint32_t>(mesh.indices.size());
+        indexDesc.usage = gfx::BufferUsage::Index;
+        auto index = dev->createBuffer(
+            indexDesc, std::span(mesh.indices.data(), mesh.indices.size()));
+        if (!index) return fail();
+        meshes_[i].indexBuffer = index.value();
+        meshes_[i].indexFormat = mesh.indexFormat == resources::IndexFormat::U16
+            ? gfx::IndexFormat::U16
+            : gfx::IndexFormat::U32;
+        meshes_[i].indexCount = static_cast<std::uint32_t>(mesh.indexCount());
+    }
+
+    if (constRing_.create(*dev, sizeof(TerrainUbo), 3) != gfx::GfxError::None) {
+        return fail();
+    }
+    const auto makeShader = [&](gfx::ShaderStage stage, const char* source) {
+        gfx::ShaderDesc desc;
+        desc.stage = stage;
+        desc.blob.resize(std::strlen(source));
+        std::memcpy(desc.blob.data(), source, desc.blob.size());
+        return dev->createShader(desc);
+    };
+    auto vertexShader = makeShader(gfx::ShaderStage::Vertex, kVs);
+    auto fragmentShader = makeShader(gfx::ShaderStage::Fragment, kFs);
+    if (!vertexShader || !fragmentShader) return fail();
+    vs_ = vertexShader.value();
+    fs_ = fragmentShader.value();
+
+    gfx::PipelineStateDesc pipeline;
+    pipeline.vertexShader = vs_;
+    pipeline.fragmentShader = fs_;
+    pipeline.topology = gfx::PrimitiveTopology::TriangleList;
+    pipeline.raster.cullMode = gfx::CullMode::Back;
+    pipeline.depthStencil.depthTestEnable = true;
+    pipeline.depthStencil.depthWriteEnable = true;
+    pipeline.depthStencil.depthCompare = gfx::CompareOp::Less;
+    pipeline.vertexInput.bindings.push({0, 36, 0});
+    pipeline.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x3, 0});
+    pipeline.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x3, 12});
+    pipeline.vertexInput.attributes.push({0, 3, gfx::VertexFormat::UNorm8x4, 32});
+    auto createdPipeline = dev->createPipeline(pipeline);
+    if (!createdPipeline) return fail();
+    pipeline_ = createdPipeline.value();
     return true;
 }
 
 void TerrainScene::shutdown(gfx::IDevice* dev) {
     if (!inited_) return;
-    if (pipeline_.isValid()) dev->destroyPipeline(pipeline_);
-    if (fs_.isValid()) dev->destroyShader(fs_);
-    if (vs_.isValid()) dev->destroyShader(vs_);
-    if (ibCube_.isValid()) dev->destroyBuffer(ibCube_);
-    if (vbCube_.isValid()) dev->destroyBuffer(vbCube_);
-    if (ibGrid_.isValid()) dev->destroyBuffer(ibGrid_);
-    if (vbGrid_.isValid()) dev->destroyBuffer(vbGrid_);
+    if (pipeline_.isValid()) (void)dev->destroyPipeline(pipeline_);
+    if (fs_.isValid()) (void)dev->destroyShader(fs_);
+    if (vs_.isValid()) (void)dev->destroyShader(vs_);
+    for (TerrainGpuMesh& mesh : meshes_) {
+        if (mesh.indexBuffer.isValid()) (void)dev->destroyBuffer(mesh.indexBuffer);
+        if (mesh.vertexBuffer.isValid()) (void)dev->destroyBuffer(mesh.vertexBuffer);
+        mesh = {};
+    }
     constRing_.destroy(*dev);
+    pipeline_ = {};
+    fs_ = {};
+    vs_ = {};
+    device_ = nullptr;
     inited_ = false;
 }
 
 void TerrainScene::onResize(std::uint32_t, std::uint32_t) {}
 
-void TerrainScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
-    time_ += dt;
-}
+void TerrainScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {}
 
-void TerrainScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) {
-    if (!inited_) return;
+void TerrainScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
+                          std::uint32_t width, std::uint32_t height) {
+    if (!inited_ || height == 0) return;
     constRing_.beginFrame();
-
-    float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.f;
-    math::Mat4 viewProj = camera.viewProjMatrix(aspect);
-    math::Vec3 lightDir = math::normalized(math::Vec3(0.3f, -1.f, 0.4f));
-    math::Vec3 viewPos = camera.position;
-
-    struct GridUboData {
-        math::Mat4 viewProj;
-        math::Mat4 model;
-        math::Vec3 lightDir;
-        float pad1;
-        math::Vec3 viewPos;
-        float pad2;
-    };
-
-    // Render grid (ground plane)
-    {
-        struct CubeUboData {
-        math::Mat4 viewProj;
-        math::Mat4 model;
-        math::Vec3 lightDir;
-        float pad1;
-        math::Vec3 viewPos;
-        float pad2;
-    };
-        GridUboData ubo;
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    const math::Mat4 viewProj = camera.viewProjMatrix(aspect);
+    const math::Vec3 lightDir = math::normalized({0.45f, -1.0f, 0.3f});
+    cb.bindPipeline(pipeline_);
+    for (const TerrainGpuMesh& mesh : meshes_) {
+        TerrainUbo ubo;
         ubo.viewProj = viewProj;
-        ubo.model = math::Mat4::identity();
-        ubo.lightDir = lightDir; ubo.pad1 = 0;
-        ubo.viewPos = viewPos; ubo.pad2 = 0;
-        auto slot = constRing_.writeAndBind(*device_, cb, std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
+        ubo.model = mesh.model;
+        ubo.lightDir = lightDir;
+        ubo.viewPos = camera.position;
+        const auto slot = constRing_.writeAndBind(
+            *device_, cb,
+            std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
         if (!slot.valid) return;
-        cb.bindPipeline(pipeline_);
-        cb.bindVertexBuffer(0, vbGrid_, 24);
-        cb.bindIndexBuffer(ibGrid_, gfx::IndexFormat::U16);
-        cb.bindResource(0, gfx::BindingType::UniformBuffer, slot.handle.index, slot.handle.generation);
-        cb.drawIndexed(static_cast<std::uint32_t>(kGridLines * kGridLines * 6), 1);
-    }
-
-    // Render animated cubes on the grid
-    cb.bindVertexBuffer(0, vbCube_, 24);
-    cb.bindIndexBuffer(ibCube_, gfx::IndexFormat::U16);
-
-    for (int i = 0; i < 8; ++i) {
-        float angle = time_ * 0.5f + i * 0.785f;
-        float radius = 3.f + (i % 3) * 1.5f;
-        float x = std::cos(angle) * radius;
-        float z = std::sin(angle) * radius;
-        float y = 0.5f + std::sin(time_ * 2.f + i) * 0.3f;
-
-        struct CubeUboData {
-            math::Mat4 viewProj;
-            math::Mat4 model;
-            math::Vec3 lightDir;
-            float pad1;
-            math::Vec3 viewPos;
-            float pad2;
-        };
-        CubeUboData ubo;
-        ubo.viewProj = viewProj;
-        ubo.model = math::Mat4::translation({x, y, z}).mul(math::Mat4::rotationY(time_ + i));
-        ubo.lightDir = lightDir; ubo.pad1 = 0;
-        ubo.viewPos = viewPos; ubo.pad2 = 0;
-        auto slot = constRing_.writeAndBind(*device_, cb, std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
-        if (!slot.valid) return;
-        cb.drawIndexed(36, 1);
+        cb.bindVertexBuffer(0, mesh.vertexBuffer, 36);
+        cb.bindIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
+        cb.bindResource(0, gfx::BindingType::UniformBuffer,
+                        slot.handle.index, slot.handle.generation);
+        cb.drawIndexed(mesh.indexCount, 1);
     }
 }
 

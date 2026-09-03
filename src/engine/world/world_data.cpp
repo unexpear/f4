@@ -750,15 +750,117 @@ auto ChunkStore::validCell(const ChunkRecord& chunk, std::uint32_t index,
 auto ChunkStore::edit(ChunkHandle handle, std::uint32_t index, const CellValue& value) -> bool {
     ChunkRecord* chunk = chunks_.get(handle);
     if (chunk == nullptr) return false;
-    std::lock_guard lock(chunk->mutex);
-    if (chunk->state < ChunkState::CellsReady || !validCell(*chunk, index, value)) {
-        return false;
+    ChunkCoord coord;
+    PolicyKind policy = PolicyKind::Voxel;
+    std::array<ChunkCoord, 26> borderNeighbors{};
+    std::array<std::uint32_t, 26> mirroredIndices{};
+    mirroredIndices.fill(std::numeric_limits<std::uint32_t>::max());
+    std::size_t borderNeighborCount = 0;
+    const auto addNeighbor = [&](std::int32_t dx, std::int32_t dy, std::int32_t dz,
+                                 std::uint32_t mirroredIndex =
+                                     std::numeric_limits<std::uint32_t>::max()) {
+        const std::int64_t x = static_cast<std::int64_t>(coord.x) + dx;
+        const std::int64_t y = static_cast<std::int64_t>(coord.y) + dy;
+        const std::int64_t z = static_cast<std::int64_t>(coord.z) + dz;
+        if (x < std::numeric_limits<std::int32_t>::min() ||
+            x > std::numeric_limits<std::int32_t>::max() ||
+            y < std::numeric_limits<std::int32_t>::min() ||
+            y > std::numeric_limits<std::int32_t>::max() ||
+            z < std::numeric_limits<std::int32_t>::min() ||
+            z > std::numeric_limits<std::int32_t>::max()) {
+            return;
+        }
+        borderNeighbors[borderNeighborCount++] = {
+            static_cast<std::int32_t>(x), static_cast<std::int32_t>(y),
+            static_cast<std::int32_t>(z)};
+        mirroredIndices[borderNeighborCount - 1u] = mirroredIndex;
+    };
+    {
+        std::lock_guard lock(chunk->mutex);
+        if (chunk->state < ChunkState::CellsReady || !validCell(*chunk, index, value)) {
+            return false;
+        }
+        if (chunk->version == std::numeric_limits<std::uint64_t>::max()) return false;
+        coord = chunk->coord;
+        policy = chunk->policy;
+        switch (policy) {
+        case PolicyKind::Voxel: {
+            const std::uint32_t x = index & 31u;
+            const std::uint32_t z = (index >> 5u) & 31u;
+            const std::uint32_t y = (index >> 10u) & 31u;
+            const std::int32_t dx = x == 0 ? -1 : (x + 1u == kVoxelEdge ? 1 : 0);
+            const std::int32_t dy = y == 0 ? -1 : (y + 1u == kVoxelEdge ? 1 : 0);
+            const std::int32_t dz = z == 0 ? -1 : (z + 1u == kVoxelEdge ? 1 : 0);
+            for (std::int32_t useX = 0; useX <= (dx != 0 ? 1 : 0); ++useX) {
+                for (std::int32_t useY = 0; useY <= (dy != 0 ? 1 : 0); ++useY) {
+                    for (std::int32_t useZ = 0; useZ <= (dz != 0 ? 1 : 0); ++useZ) {
+                        if (useX == 0 && useY == 0 && useZ == 0) continue;
+                        addNeighbor(dx * useX, dy * useY, dz * useZ);
+                    }
+                }
+            }
+            break;
+        }
+        case PolicyKind::Height: {
+            const std::uint32_t x = index % kHeightSamples;
+            const std::uint32_t z = index / kHeightSamples;
+            if (x == 0) addNeighbor(-1, 0, 0, heightSampleIndex(kHeightQuads, z));
+            if (x == kHeightQuads) addNeighbor(1, 0, 0, heightSampleIndex(0, z));
+            if (z == 0) addNeighbor(0, 0, -1, heightSampleIndex(x, kHeightQuads));
+            if (z == kHeightQuads) addNeighbor(0, 0, 1, heightSampleIndex(x, 0));
+            if (x == 0 && z == 0) {
+                addNeighbor(-1, 0, -1, heightSampleIndex(kHeightQuads, kHeightQuads));
+            } else if (x == 0 && z == kHeightQuads) {
+                addNeighbor(-1, 0, 1, heightSampleIndex(kHeightQuads, 0));
+            } else if (x == kHeightQuads && z == 0) {
+                addNeighbor(1, 0, -1, heightSampleIndex(0, kHeightQuads));
+            } else if (x == kHeightQuads && z == kHeightQuads) {
+                addNeighbor(1, 0, 1, heightSampleIndex(0, 0));
+            }
+            break;
+        }
+        case PolicyKind::Hex: {
+            const HexTile* tile = std::get_if<HexTile>(&chunk->base);
+            if (tile == nullptr || tile->width == 0) return false;
+            const std::int32_t r = static_cast<std::int32_t>(index / tile->width) -
+                                   static_cast<std::int32_t>(tile->radius);
+            const std::int32_t q = static_cast<std::int32_t>(index % tile->width) -
+                                   floorDiv(r, 2) -
+                                   static_cast<std::int32_t>(tile->radius);
+            for (const AxialCoord direction : kHexDirections) {
+                if (!tile->contains({q + direction.q, r + direction.r})) {
+                    addNeighbor(direction.q, 0, direction.r);
+                }
+            }
+            break;
+        }
+        }
+        chunk->deltas.set(index, value);
+        ++chunk->version;
+        chunk->dirty = {true, true, true};
+        if (chunk->state == ChunkState::Meshed) chunk->state = ChunkState::CellsReady;
     }
-    if (chunk->version == std::numeric_limits<std::uint64_t>::max()) return false;
-    chunk->deltas.set(index, value);
-    ++chunk->version;
-    chunk->dirty = {true, true, true};
-    if (chunk->state == ChunkState::Meshed) chunk->state = ChunkState::CellsReady;
+
+    // Never hold two chunk locks at once. Neighbor topology is main-thread
+    // owned until M16, while each dirty/version transition remains synchronized.
+    for (std::size_t i = 0; i < borderNeighborCount; ++i) {
+        ChunkRecord* neighbor = chunks_.get(find(borderNeighbors[i]));
+        if (neighbor == nullptr) continue;
+        std::lock_guard neighborLock(neighbor->mutex);
+        if (neighbor->policy != policy || neighbor->state < ChunkState::CellsReady ||
+            neighbor->version == std::numeric_limits<std::uint64_t>::max()) {
+            continue;
+        }
+        if (policy == PolicyKind::Height &&
+            mirroredIndices[i] != std::numeric_limits<std::uint32_t>::max()) {
+            neighbor->deltas.set(mirroredIndices[i], value);
+            neighbor->dirty.cellsDirty = true;
+        }
+        neighbor->dirty.meshDirty = true;
+        neighbor->dirty.bordersDirty = true;
+        ++neighbor->version;
+        if (neighbor->state == ChunkState::Meshed) neighbor->state = ChunkState::CellsReady;
+    }
     return true;
 }
 

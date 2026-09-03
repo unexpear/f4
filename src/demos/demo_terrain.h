@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "demos/demo_bench.h"
 #include "engine/rendering/shader_constants.h"
 
@@ -7,7 +9,7 @@ namespace f4::demo {
 
 class TerrainScene : public IDemoScene {
 public:
-    const char* name() const override { return "Terrain Grid"; }
+    const char* name() const override { return "M15 Terrain Meshers"; }
     bool init(gfx::IDevice* device, platform::Window* window) override;
     void shutdown(gfx::IDevice* device) override;
     void onResize(std::uint32_t width, std::uint32_t height) override;
@@ -15,18 +17,21 @@ public:
     void render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) override;
 
 private:
-    gfx::BufferHandle vbGrid_;
-    gfx::BufferHandle ibGrid_;
-    gfx::BufferHandle vbCube_;
-    gfx::BufferHandle ibCube_;
+    struct TerrainGpuMesh {
+        gfx::BufferHandle vertexBuffer{};
+        gfx::BufferHandle indexBuffer{};
+        gfx::IndexFormat indexFormat = gfx::IndexFormat::U16;
+        std::uint32_t indexCount = 0;
+        math::Mat4 model = math::Mat4::identity();
+    };
+
+    std::array<TerrainGpuMesh, 3> meshes_{};
     gfx::PipelineHandle pipeline_;
     gfx::ShaderHandle vs_;
     gfx::ShaderHandle fs_;
     engine::ConstantRing constRing_;
     bool inited_ = false;
     gfx::IDevice* device_ = nullptr;
-    float time_ = 0.f;
-    static constexpr int kGridSize = 20;
 };
 
 } // namespace f4::demo

@@ -67,6 +67,7 @@ bool EcsScene::init(gfx::IDevice* dev, platform::Window*) {
 
     engine::StandardMaterialDesc matDesc;
     matDesc.tint = math::Vec4(1.f, 1.f, 1.f, 1.f);
+    matDesc.doubleSided = true;
     auto matH = impl_->renderer.createMaterial(matDesc);
     if (impl_->renderer.ensureMaterialPipeline(matH) != gfx::GfxError::None) return false;
 
@@ -120,11 +121,6 @@ void EcsScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
     {
         diag::ScopedZone zone(impl_->diagnostics.profiler(), "frame");
 
-        // Orbit camera (use the bench's free camera instead? For now, use ECS camera)
-        if (auto* c = impl_->registry.get<engine::Camera>(impl_->camE)) {
-            c->eye = engine::orbitEye(2.2f, impl_->angle, 0.8f, c->center);
-        }
-
         // Spin triangle
         if (auto* lt2 = impl_->registry.get<ecs::LocalTransform>(impl_->triE)) {
             lt2->rotation = math::Quat::fromAxisAngle(math::Vec3(0.f, 1.f, 0.f), impl_->angle);
@@ -147,12 +143,17 @@ void EcsScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
 void EcsScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) {
     if (!impl_) return;
 
-    // Use the bench's free camera for view/proj, but render through the ECS renderer
-    // The renderer expects a camera entity with Camera component
-    // We'll temporarily update the ECS camera from the free camera
+    // Renderer::record derives viewProj from these fields, so synchronize the
+    // complete camera rather than writing a matrix that record will replace.
     if (auto* c = impl_->registry.get<engine::Camera>(impl_->camE)) {
-        float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.f;
-        c->viewProj = camera.viewProjMatrix(aspect);
+        const float cy = std::cos(camera.yaw);
+        const float sy = std::sin(camera.yaw);
+        const float cp = std::cos(camera.pitch);
+        const float sp = std::sin(camera.pitch);
+        const math::Vec3 forward{-cy * cp, -sp, -sy * cp};
+        c->eye = camera.position;
+        c->center = camera.position + forward;
+        c->up = math::Vec3(0.f, 1.f, 0.f);
     }
 
     impl_->renderer.record(cb, impl_->camE, height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.f);

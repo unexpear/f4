@@ -159,6 +159,7 @@ f4_enable_sanitizers(f4_graphics)
 
 add_library(f4_engine STATIC
     engine/world/world_data.cpp
+    engine/world/terrain_meshing.cpp
     engine/rendering/pbr.cpp
     engine/rendering/material.cpp
     engine/rendering/gpu_mesh.cpp

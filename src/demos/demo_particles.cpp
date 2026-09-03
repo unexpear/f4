@@ -1,5 +1,6 @@
 #include "demos/demo_particles.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -155,10 +156,8 @@ bool ParticleScene::init(gfx::IDevice* dev, platform::Window*) {
     pipeline_ = pipe.value();
 
     // Initialize particles
-    std::mt19937 rng(0xC0FFEE);
-    std::uniform_real_distribution<float> dist(-1.f, 1.f);
-    std::uniform_real_distribution<float> distLife(1.f, 3.f);
-    std::uniform_real_distribution<float> distSize(0.1f, 0.3f);
+    aliveCount_ = 0;
+    spawnTimer_ = 0.f;
     for (int i = 0; i < kMaxParticles; ++i) {
         particles_[i].pos = {0.f, 0.f, 0.f};
         particles_[i].vel = {0.f, 0.f, 0.f};
@@ -166,6 +165,21 @@ bool ParticleScene::init(gfx::IDevice* dev, platform::Window*) {
         particles_[i].maxLife = 0.f;
         particles_[i].size = 0.f;
         particles_[i].color = {0.f, 0.f, 0.f};
+    }
+
+    // Start with a deterministic slice of the emitter already in flight so a
+    // short smoke run exercises instancing, billboarding, and alpha blending.
+    constexpr int kInitialParticles = 128;
+    aliveCount_ = kInitialParticles;
+    for (int i = 0; i < aliveCount_; ++i) {
+        spawnParticle(i);
+        const float phase = static_cast<float>(i) /
+                            static_cast<float>(kInitialParticles - 1);
+        const float age = std::min(phase * 1.25f, particles_[i].life * 0.75f);
+        particles_[i].pos = particles_[i].vel * age;
+        particles_[i].pos.y -= 1.5f * age * age;
+        particles_[i].vel.y -= 3.f * age;
+        particles_[i].life -= age;
     }
 
     inited_ = true;
