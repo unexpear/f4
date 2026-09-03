@@ -9,6 +9,7 @@
 
 #include "core/ecs/transform.h"
 #include "core/ecs/view.h"
+#include "core/math/frustum.h"
 #include "core/math/mat4.h"
 #include "engine/cameras/camera.h"
 #include "engine/lighting/light.h"
@@ -20,6 +21,8 @@
 namespace f4::engine {
 
 namespace {
+
+constexpr std::uint32_t kRenderInstanceStride = 112;
 
 struct SceneUbo {
     math::Mat4 viewProj;
@@ -43,6 +46,9 @@ struct ShadowUbo {
     math::Vec4 alphaParams;
 };
 static_assert(sizeof(ShadowUbo) == 144, "ShadowUbo must match std140/HLSL layout");
+
+inline constexpr std::uint32_t kInstanceModelLocation = 9;
+inline constexpr std::uint32_t kInstanceNormalLocation = 13;
 
 struct FrameLight {
     math::Vec3 direction{0.0f, -1.0f, 0.0f};
@@ -260,10 +266,31 @@ void bindMesh(gfx::CommandBuffer& commandBuffer, const GpuMesh& mesh) {
     }
 }
 
+[[nodiscard]] auto makeInstancedLayout(const GpuMesh& mesh,
+                                       std::uint32_t& instanceBinding)
+    -> gfx::VertexInputLayout {
+    gfx::VertexInputLayout layout = mesh.layout;
+    instanceBinding = 0;
+    for (const auto& binding : layout.bindings) {
+        instanceBinding = std::max(instanceBinding, binding.binding + 1u);
+    }
+    layout.bindings.push({instanceBinding, kRenderInstanceStride, 1});
+    for (std::uint32_t column = 0; column < 4; ++column) {
+        layout.attributes.push({instanceBinding, kInstanceModelLocation + column,
+                                gfx::VertexFormat::Float32x4, column * 16u});
+    }
+    for (std::uint32_t column = 0; column < 3; ++column) {
+        layout.attributes.push({instanceBinding, kInstanceNormalLocation + column,
+                                gfx::VertexFormat::Float32x4, 64u + column * 16u});
+    }
+    return layout;
+}
+
 void drawMesh(gfx::CommandBuffer& commandBuffer, const resources::Mesh& mesh,
-              const GpuMesh& gpu, std::uint32_t subMeshIndex) {
+              const GpuMesh& gpu, std::uint32_t subMeshIndex,
+              std::uint32_t instanceCount = 1) {
     if (!gpu.indexBuffer.isValid()) {
-        commandBuffer.draw(gpu.vertexCount, 1);
+        commandBuffer.draw(gpu.vertexCount, instanceCount);
         return;
     }
     if (subMeshIndex < mesh.submeshes.size()) {
@@ -272,12 +299,13 @@ void drawMesh(gfx::CommandBuffer& commandBuffer, const resources::Mesh& mesh,
             subMesh.indexCount <= std::numeric_limits<std::uint32_t>::max() &&
             subMesh.firstIndex <= mesh.indexCount() &&
             subMesh.indexCount <= mesh.indexCount() - subMesh.firstIndex) {
-            commandBuffer.drawIndexed(static_cast<std::uint32_t>(subMesh.indexCount), 1,
+            commandBuffer.drawIndexed(static_cast<std::uint32_t>(subMesh.indexCount),
+                                      instanceCount,
                                       static_cast<std::uint32_t>(subMesh.firstIndex));
             return;
         }
     }
-    commandBuffer.drawIndexed(gpu.indexCount, 1);
+    commandBuffer.drawIndexed(gpu.indexCount, instanceCount);
 }
 
 } // namespace
@@ -308,6 +336,7 @@ void Renderer::releaseInitializationResources() {
     surfaceSampler_ = {};
     shadowConstants_.destroy(device_);
     sceneConstants_.destroy(device_);
+    sceneInstances_.destroy(device_);
     defaultEnvironmentMipCount_ = 1;
     inited_ = false;
 }
@@ -338,6 +367,10 @@ auto Renderer::init() -> gfx::GfxError {
         return fail(error);
     }
     if (const auto error = shadowConstants_.create(device_, sizeof(ShadowUbo), 64);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
+    if (const auto error = sceneInstances_.create(device_, gfx::BufferUsage::Vertex);
         error != gfx::GfxError::None) {
         return fail(error);
     }
@@ -448,7 +481,9 @@ auto Renderer::createMesh(const resources::Mesh& mesh) -> resources::MeshHandle 
     const auto handle = meshArena_.acquire(mesh);
     MeshEntry entry;
     entry.mesh = mesh;
+    entry.mesh.bounds = resources::computeBounds(entry.mesh);
     entry.gpu = static_cast<GpuMesh&&>(gpu);
+    entry.instancedLayout = makeInstancedLayout(entry.gpu, entry.instanceBinding);
     meshMap_.set(handle, static_cast<MeshEntry&&>(entry));
     return handle;
 }
@@ -555,7 +590,9 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
     const FrameLight light = findFrameLight(registry_, *camera, pbrSettings_);
     if (!frameShadowsActive_) frameLightViewProj_ = light.viewProj;
     const math::Mat4 view = cameraView(*camera);
+    const math::Frustum frustum = math::Frustum::fromViewProjection(camera->viewProj);
     sceneConstants_.beginFrame();
+    sceneInstances_.beginFrame();
     queue_.clear();
 
     for (auto [entity, renderer, world] :
@@ -563,25 +600,40 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         auto* entry = meshMap_.find(renderer.mesh);
         const StandardMaterial* material = materials_.get(renderer.material);
         if (entry == nullptr || material == nullptr) continue;
+        ++stats_.candidates;
+        const bool hasBounds = entry->mesh.bounds.isValid();
+        const math::AABB worldBounds =
+            hasBounds ? entry->mesh.bounds.transformed(world.matrix) : math::AABB{};
+        if (pbrSettings_.frustumCullingEnabled && hasBounds && worldBounds.isValid() &&
+            !frustum.intersects(worldBounds)) {
+            ++stats_.frustumCulled;
+            continue;
+        }
         if (const auto error = materials_.ensurePipeline(
-                device_, renderer.material, entry->gpu.layout);
+                device_, renderer.material, entry->instancedLayout);
             error != gfx::GfxError::None) {
             recordError_ = error;
             continue;
         }
         const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(renderer.material, entry->gpu.layout);
+            materials_.pipelineFor(renderer.material, entry->instancedLayout);
         if (!pipeline.isValid()) continue;
         RenderItem item;
         item.entity = entity;
         item.meshRenderer = renderer;
         item.material = renderer.material;
-        item.depth = -view.transformPoint(world.matrix.col[3].xyz()).z;
+        const math::Vec3 depthPoint =
+            hasBounds && worldBounds.isValid() ? worldBounds.center()
+                                               : world.matrix.col[3].xyz();
+        item.depth = -view.transformPoint(depthPoint).z;
+        if (!std::isfinite(item.depth)) item.depth = std::numeric_limits<float>::max();
         item.transparent = renderer.transparent || isBlended(material->desc);
         item.pipelineSortKey = pipeline.index;
         queue_.push(item);
     }
     queue_.sort();
+    queue_.buildBatches(batches_, pbrSettings_.batchingEnabled);
+    stats_.visible = static_cast<std::uint32_t>(queue_.count());
 
     gfx::TextureHandle environment = defaultEnvironmentTex_;
     std::uint32_t environmentMipCount = defaultEnvironmentMipCount_;
@@ -590,28 +642,55 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         environmentMipCount = static_cast<std::uint32_t>(entry->texture.mips.size());
     }
 
-    for (const RenderItem& item : queue_.items()) {
+    static_assert(sizeof(RenderInstance) == kRenderInstanceStride,
+                  "RenderInstance must match the native instanced vertex shaders");
+    const auto& items = queue_.items();
+    for (const RenderBatch& batch : batches_) {
+        const RenderItem& item = items[batch.firstItem];
         auto* entry = meshMap_.find(item.meshRenderer.mesh);
         const StandardMaterial* material = materials_.get(item.material);
-        const ecs::WorldMatrix* world = registry_.get<ecs::WorldMatrix>(item.entity);
-        if (entry == nullptr || material == nullptr || world == nullptr) continue;
+        if (entry == nullptr || material == nullptr) continue;
         const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(item.material, entry->gpu.layout);
+            materials_.pipelineFor(item.material, entry->instancedLayout);
         if (!pipeline.isValid()) continue;
+
+        instanceStaging_.clear();
+        instanceStaging_.reserve(batch.itemCount);
+        for (std::uint32_t offset = 0; offset < batch.itemCount; ++offset) {
+            const ecs::WorldMatrix* world =
+                registry_.get<ecs::WorldMatrix>(items[batch.firstItem + offset].entity);
+            if (world == nullptr) continue;
+            const float determinant = world->matrix.determinant();
+            const math::Mat4 normalMatrix = std::abs(determinant) > 1.0e-8f
+                                                ? world->matrix.inverse().transpose()
+                                                : math::Mat4::identity();
+            RenderInstance instance;
+            instance.model = world->matrix;
+            instance.normalColumns[0] = normalMatrix.col[0];
+            instance.normalColumns[1] = normalMatrix.col[1];
+            instance.normalColumns[2] = normalMatrix.col[2];
+            instanceStaging_.push(instance);
+        }
+        if (instanceStaging_.isEmpty()) continue;
+        const auto instanceBytes = std::span(
+            reinterpret_cast<const std::byte*>(instanceStaging_.data()),
+            instanceStaging_.size() * sizeof(RenderInstance));
+        const DynamicBufferRing::Slot instanceSlot =
+            sceneInstances_.alloc(device_, instanceBytes);
+        if (!instanceSlot.valid) {
+            recordError_ = gfx::GfxError::OutOfMemory;
+            continue;
+        }
 
         std::uint32_t flags = 0;
         if (material->desc.alphaMode == MaterialAlphaMode::Mask) flags |= 1u;
         if (material->desc.unlit) flags |= 2u;
         if (hasSemantic(entry->mesh, resources::VertexSemantic::Color0)) flags |= 4u;
         if (hasSemantic(entry->mesh, resources::VertexSemantic::Normal)) flags |= 8u;
-        const float determinant = world->matrix.determinant();
-        const math::Mat4 normalMatrix = std::abs(determinant) > 1.0e-8f
-                                            ? world->matrix.inverse().transpose()
-                                            : math::Mat4::identity();
         SceneUbo constants;
         constants.viewProj = camera->viewProj;
-        constants.model = world->matrix;
-        constants.normalMatrix = normalMatrix;
+        constants.model = math::Mat4::identity();
+        constants.normalMatrix = math::Mat4::identity();
         constants.lightViewProj = frameLightViewProj_;
         constants.baseColorFactor = material->desc.tint;
         constants.emissiveMetallic = math::Vec4(material->desc.emissiveFactor,
@@ -663,10 +742,13 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
                                        samplers[resourceSlot].generation);
         }
         bindMesh(commandBuffer, entry->gpu);
+        commandBuffer.bindVertexBuffer(entry->instanceBinding, instanceSlot.handle,
+                                       kRenderInstanceStride);
         drawMesh(commandBuffer, entry->mesh, entry->gpu,
-                 item.meshRenderer.subMeshIndex);
+                 item.meshRenderer.subMeshIndex,
+                 static_cast<std::uint32_t>(instanceStaging_.size()));
         ++stats_.draws;
-        ++stats_.instances;
+        stats_.instances += static_cast<std::uint32_t>(instanceStaging_.size());
     }
 }
 

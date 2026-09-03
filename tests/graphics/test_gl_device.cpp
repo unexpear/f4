@@ -940,8 +940,13 @@ TEST_CASE("OpenGL backend: resource byte accounting via stats") {
     BufferDesc bd;
     bd.sizeBytes = 2048;
     bd.usage = BufferUsage::Vertex;
-    auto buf = dev->createBuffer(bd, {});
+    const std::array<std::byte, 4> partialInitialization{};
+    auto buf = dev->createBuffer(bd, partialInitialization);
     REQUIRE(buf.hasValue());
+    std::array<std::byte, 2049> oversizedInitialization{};
+    const auto oversized = dev->createBuffer(bd, oversizedInitialization);
+    REQUIRE(oversized.hasError());
+    CHECK(oversized.error() == GfxError::BadDescriptor);
 
     TextureDesc td;
     td.width = 32;

@@ -47,6 +47,7 @@ add_executable(f4_tests
     graphics/test_rhi.cpp
     engine/test_m8.cpp
     engine/test_m11.cpp
+    engine/test_m12.cpp
     engine/test_m14.cpp
     engine/test_m15.cpp
     engine/test_m16.cpp

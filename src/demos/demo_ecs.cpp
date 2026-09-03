@@ -16,7 +16,7 @@
 namespace f4::demo {
 
 struct EcsScene::Impl {
-    ecs::Registry registry{64};
+    ecs::Registry registry{512};
     engine::Renderer renderer;
     ecs::Entity camE;
     ecs::Entity triE;
@@ -78,12 +78,24 @@ bool EcsScene::init(gfx::IDevice* dev, platform::Window*) {
     cam.center = math::Vec3(0.f, 0.f, 0.f);
     impl_->registry.emplace<engine::Camera>(impl_->camE, cam);
 
-    impl_->triE = impl_->registry.create();
-    auto& lt = impl_->registry.emplace<ecs::LocalTransform>(impl_->triE);
-    lt.position = math::Vec3(0.f, 0.f, 0.f);
-    lt.rotation = math::Quat::identity();
-    lt.scale = math::Vec3(1.f, 1.f, 1.f);
-    impl_->registry.emplace<engine::MeshRenderer>(impl_->triE, engine::MeshRenderer{meshH, matH, 0, false, false});
+    constexpr int columns = 21;
+    constexpr int rows = 13;
+    constexpr float spacing = 1.15f;
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            const ecs::Entity entity = impl_->registry.create();
+            auto& transform = impl_->registry.emplace<ecs::LocalTransform>(entity);
+            transform.position = {
+                static_cast<float>(column - columns / 2) * spacing,
+                static_cast<float>(row - rows / 2) * spacing,
+                0.0f};
+            transform.rotation = math::Quat::identity();
+            transform.scale = math::Vec3(0.82f);
+            impl_->registry.emplace<engine::MeshRenderer>(
+                entity, engine::MeshRenderer{meshH, matH, 0, false, false});
+            if (row == rows / 2 && column == columns / 2) impl_->triE = entity;
+        }
+    }
     ecs::updateWorldTransforms(impl_->registry);
 
     f4::memory::enableHeapTracking(true);
@@ -121,7 +133,8 @@ void EcsScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
     {
         diag::ScopedZone zone(impl_->diagnostics.profiler(), "frame");
 
-        // Spin triangle
+        // One independently moving instance verifies that batching preserves
+        // per-object transforms while the surrounding grid remains one batch.
         if (auto* lt2 = impl_->registry.get<ecs::LocalTransform>(impl_->triE)) {
             lt2->rotation = math::Quat::fromAxisAngle(math::Vec3(0.f, 1.f, 0.f), impl_->angle);
             ecs::tagTransformDirty(impl_->registry, impl_->triE);

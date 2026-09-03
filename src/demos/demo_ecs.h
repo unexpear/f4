@@ -21,7 +21,7 @@ namespace f4::demo {
 
 class EcsScene : public IDemoScene {
 public:
-    const char* name() const override { return "ECS Renderer"; }
+    const char* name() const override { return "M12 Culling + Batching"; }
     bool init(gfx::IDevice* device, platform::Window* window) override;
     void shutdown(gfx::IDevice* device) override;
     void onResize(std::uint32_t width, std::uint32_t height) override;

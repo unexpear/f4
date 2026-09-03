@@ -17,6 +17,9 @@
 namespace f4::engine {
 
 struct FrameStats {
+    std::uint32_t candidates = 0;
+    std::uint32_t visible = 0;
+    std::uint32_t frustumCulled = 0;
     std::uint32_t draws = 0;
     std::uint32_t instances = 0;
 };
@@ -31,6 +34,8 @@ struct PbrRenderSettings {
     float shadowFar = 50.0f;
     std::uint32_t shadowResolution = 512;
     bool shadowsEnabled = true;
+    bool frustumCullingEnabled = true;
+    bool batchingEnabled = true;
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -89,6 +94,13 @@ private:
     struct MeshEntry {
         resources::Mesh mesh;
         GpuMesh gpu;
+        gfx::VertexInputLayout instancedLayout;
+        std::uint32_t instanceBinding = 0;
+    };
+
+    struct RenderInstance {
+        math::Mat4 model;
+        math::Vec4 normalColumns[3];
     };
 
     struct TextureEntry {
@@ -107,12 +119,15 @@ private:
     MaterialCache materials_;
     gfx::RenderGraph graph_;
     RenderQueue queue_;
+    Array<RenderBatch> batches_;
+    Array<RenderInstance> instanceStaging_;
     FrameStats stats_{};
 
     // One UBO per queued draw prevents deferred command replay from observing
     // only the final model/tint upload.
     ConstantRing sceneConstants_;
     ConstantRing shadowConstants_;
+    DynamicBufferRing sceneInstances_;
     gfx::TextureHandle whiteTex_{};
     gfx::TextureHandle neutralNormalTex_{};
     gfx::TextureHandle blackTex_{};

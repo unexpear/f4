@@ -180,6 +180,7 @@ target_include_directories(f4_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_engine PUBLIC f4_core f4_graphics)
 target_compile_definitions(f4_engine PRIVATE
     F4_PBR_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_opengl.vert"
+    F4_PBR_OPENGL_INSTANCED_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_instanced_opengl.vert"
     F4_PBR_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_opengl.frag"
     F4_SHADOW_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.vert"
     F4_SHADOW_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.frag")
@@ -258,6 +259,7 @@ if(Vulkan_FOUND)
     if(TARGET Vulkan::glslangValidator)
         set(F4_PBR_VK_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/pbr-vulkan-shaders")
         set(F4_PBR_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/pbr.vert.spv")
+        set(F4_PBR_VK_INSTANCED_VERTEX "${F4_PBR_VK_SHADER_DIR}/pbr_instanced.vert.spv")
         set(F4_PBR_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/pbr.frag.spv")
         set(F4_SHADOW_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/shadow.vert.spv")
         set(F4_SHADOW_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/shadow.frag.spv")
@@ -274,6 +276,8 @@ if(Vulkan_FOUND)
         endfunction()
         f4_compile_pbr_spirv("${F4_PBR_VK_VERTEX}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_vulkan.vert" vert)
+        f4_compile_pbr_spirv("${F4_PBR_VK_INSTANCED_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_instanced_vulkan.vert" vert)
         f4_compile_pbr_spirv("${F4_PBR_VK_FRAGMENT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_vulkan.frag" frag)
         f4_compile_pbr_spirv("${F4_SHADOW_VK_VERTEX}"
@@ -281,11 +285,13 @@ if(Vulkan_FOUND)
         f4_compile_pbr_spirv("${F4_SHADOW_VK_FRAGMENT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_vulkan.frag" frag)
         add_custom_target(f4_pbr_vk_shaders DEPENDS
-            "${F4_PBR_VK_VERTEX}" "${F4_PBR_VK_FRAGMENT}"
+            "${F4_PBR_VK_VERTEX}" "${F4_PBR_VK_INSTANCED_VERTEX}"
+            "${F4_PBR_VK_FRAGMENT}"
             "${F4_SHADOW_VK_VERTEX}" "${F4_SHADOW_VK_FRAGMENT}")
         add_dependencies(f4_engine f4_pbr_vk_shaders)
         target_compile_definitions(f4_engine PRIVATE
             F4_PBR_VULKAN_VERTEX="${F4_PBR_VK_VERTEX}"
+            F4_PBR_VULKAN_INSTANCED_VERTEX="${F4_PBR_VK_INSTANCED_VERTEX}"
             F4_PBR_VULKAN_FRAGMENT="${F4_PBR_VK_FRAGMENT}"
             F4_SHADOW_VULKAN_VERTEX="${F4_SHADOW_VK_VERTEX}"
             F4_SHADOW_VULKAN_FRAGMENT="${F4_SHADOW_VK_FRAGMENT}")
@@ -357,6 +363,7 @@ if(WIN32)
     if(F4_DXC_EXECUTABLE)
         set(F4_PBR_DX12_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/pbr-dx12-shaders")
         set(F4_PBR_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/pbr.vert.dxil")
+        set(F4_PBR_DX12_INSTANCED_VERTEX "${F4_PBR_DX12_SHADER_DIR}/pbr_instanced.vert.dxil")
         set(F4_PBR_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/pbr.frag.dxil")
         set(F4_SHADOW_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/shadow.vert.dxil")
         set(F4_SHADOW_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/shadow.frag.dxil")
@@ -372,6 +379,9 @@ if(WIN32)
         f4_compile_pbr_dxil("${F4_PBR_DX12_VERTEX}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_dx12.hlsl"
             vs_6_0 VSMain)
+        f4_compile_pbr_dxil("${F4_PBR_DX12_INSTANCED_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_dx12.hlsl"
+            vs_6_0 VSMainInstanced)
         f4_compile_pbr_dxil("${F4_PBR_DX12_FRAGMENT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_dx12.hlsl"
             ps_6_0 PSMain)
@@ -382,11 +392,13 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_dx12.hlsl"
             ps_6_0 PSMain)
         add_custom_target(f4_pbr_dx12_shaders DEPENDS
-            "${F4_PBR_DX12_VERTEX}" "${F4_PBR_DX12_FRAGMENT}"
+            "${F4_PBR_DX12_VERTEX}" "${F4_PBR_DX12_INSTANCED_VERTEX}"
+            "${F4_PBR_DX12_FRAGMENT}"
             "${F4_SHADOW_DX12_VERTEX}" "${F4_SHADOW_DX12_FRAGMENT}")
         add_dependencies(f4_engine f4_pbr_dx12_shaders)
         target_compile_definitions(f4_engine PRIVATE
             F4_PBR_DX12_VERTEX="${F4_PBR_DX12_VERTEX}"
+            F4_PBR_DX12_INSTANCED_VERTEX="${F4_PBR_DX12_INSTANCED_VERTEX}"
             F4_PBR_DX12_FRAGMENT="${F4_PBR_DX12_FRAGMENT}"
             F4_SHADOW_DX12_VERTEX="${F4_SHADOW_DX12_VERTEX}"
             F4_SHADOW_DX12_FRAGMENT="${F4_SHADOW_DX12_FRAGMENT}")

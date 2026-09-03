@@ -1,6 +1,7 @@
 #include "engine/rendering/shader_constants.h"
 
 #include <algorithm>
+#include <limits>
 
 #include "graphics/buffer/buffer_desc.h"
 
@@ -87,6 +88,85 @@ auto ConstantRing::writeAndBind(gfx::IDevice& device, gfx::CommandBuffer& cb,
     Slot slot = alloc(device, data);
     bind(cb, slot);
     return slot;
+}
+
+auto DynamicBufferRing::create(gfx::IDevice& device, gfx::BufferUsage usage)
+    -> gfx::GfxError {
+    if (usage == gfx::BufferUsage::None) return gfx::GfxError::BadDescriptor;
+    if (valid()) {
+        return device_ == &device && usage_ == usage ? gfx::GfxError::None
+                                                     : gfx::GfxError::BadDescriptor;
+    }
+    device_ = &device;
+    usage_ = usage;
+    currentFrame_ = kBufferedFrames - 1;
+    cursor_ = 0;
+    return gfx::GfxError::None;
+}
+
+void DynamicBufferRing::destroy(gfx::IDevice& device) {
+    for (auto& frameRecords : records_) {
+        for (const Record& record : frameRecords) {
+            if (record.handle.isValid()) (void)device.destroyBuffer(record.handle);
+        }
+        frameRecords.clear();
+    }
+    device_ = nullptr;
+    usage_ = gfx::BufferUsage::None;
+    currentFrame_ = kBufferedFrames - 1;
+    cursor_ = 0;
+}
+
+auto DynamicBufferRing::bufferCount() const -> std::size_t {
+    std::size_t count = 0;
+    for (const auto& frameRecords : records_) {
+        for (const Record& record : frameRecords) {
+            if (record.handle.isValid()) ++count;
+        }
+    }
+    return count;
+}
+
+auto DynamicBufferRing::alloc(gfx::IDevice& device, std::span<const std::byte> data)
+    -> Slot {
+    if (!valid() || device_ != &device || data.empty() ||
+        data.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return {};
+    }
+
+    auto& frameRecords = records_[currentFrame_];
+    if (cursor_ == frameRecords.size()) frameRecords.push(Record{});
+    Record& record = frameRecords[cursor_];
+    const std::uint32_t sizeBytes = static_cast<std::uint32_t>(data.size());
+
+    if (record.capacityBytes < sizeBytes) {
+        std::uint64_t target = std::max<std::uint64_t>(record.capacityBytes, 256u);
+        while (target < sizeBytes) {
+            target = std::min<std::uint64_t>(
+                std::numeric_limits<std::uint32_t>::max(), target * 2u);
+            if (target < sizeBytes &&
+                target == std::numeric_limits<std::uint32_t>::max()) {
+                return {};
+            }
+        }
+        gfx::BufferDesc desc;
+        desc.sizeBytes = target;
+        desc.usage = usage_;
+        auto replacement = device.createBuffer(desc, {});
+        if (!replacement.hasValue()) return {};
+        if (device.writeBuffer(replacement.value(), 0, data) != gfx::GfxError::None) {
+            (void)device.destroyBuffer(replacement.value());
+            return {};
+        }
+        if (record.handle.isValid()) (void)device.destroyBuffer(record.handle);
+        record.handle = replacement.value();
+        record.capacityBytes = static_cast<std::uint32_t>(target);
+    } else if (device.writeBuffer(record.handle, 0, data) != gfx::GfxError::None) {
+        return {};
+    }
+
+    ++cursor_;
+    return {record.handle, sizeBytes, record.capacityBytes, true};
 }
 
 } // namespace f4::engine

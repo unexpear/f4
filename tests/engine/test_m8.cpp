@@ -308,8 +308,10 @@ TEST_CASE("M8: Renderer submits more than 64 objects without dropping draws") {
     REQUIRE(framebuffer.hasValue());
 
     REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
-    CHECK(device.stats().drawIndexedCalls == objectCount);
-    CHECK(device.stats().batches == objectCount);
+    CHECK(device.stats().drawIndexedCalls == 1);
+    CHECK(device.stats().batches == 1);
+    CHECK(device.stats().instances == objectCount);
+    CHECK(renderer.stats().instances == objectCount);
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
 }
 

@@ -380,7 +380,7 @@ auto OpenGLDevice::backend() const -> Backend { return Backend::OpenGL; }
 
 auto OpenGLDevice::createBuffer(const BufferDesc& desc, std::span<const std::byte> initialData)
     -> Result<BufferHandle, GfxError> {
-    if (desc.sizeBytes == 0) {
+    if (desc.sizeBytes == 0 || initialData.size() > desc.sizeBytes) {
         return GfxError::BadDescriptor;
     }
     GlBuffer b;
@@ -389,8 +389,13 @@ auto OpenGLDevice::createBuffer(const BufferDesc& desc, std::span<const std::byt
     b.target = bufferTarget(desc.usage);
     glGenBuffers(1, &b.id);
     glBindBuffer(b.target, b.id);
-    glBufferData(b.target, static_cast<GLsizeiptr>(desc.sizeBytes), initialData.data(),
-                 GL_STATIC_DRAW);
+    const bool initializesWholeBuffer = initialData.size() == desc.sizeBytes;
+    glBufferData(b.target, static_cast<GLsizeiptr>(desc.sizeBytes),
+                 initializesWholeBuffer ? initialData.data() : nullptr, GL_STATIC_DRAW);
+    if (!initialData.empty() && !initializesWholeBuffer) {
+        glBufferSubData(b.target, 0, static_cast<GLsizeiptr>(initialData.size()),
+                        initialData.data());
+    }
     return impl_->buffers.create(b);
 }
 

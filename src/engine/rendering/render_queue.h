@@ -20,6 +20,11 @@ struct RenderItem {
     std::uint32_t pipelineSortKey = 0; // material pipeline index for batching
 };
 
+struct RenderBatch {
+    std::uint32_t firstItem = 0;
+    std::uint32_t itemCount = 0;
+};
+
 class RenderQueue {
 public:
     void clear() { items_.clear(); }
@@ -27,8 +32,15 @@ public:
     void push(RenderItem&& item) { items_.push(static_cast<RenderItem&&>(item)); }
 
     // Sorts: opaque front-to-back, transparent back-to-front.
-    // Opaque group sorted by pipeline key then depth; transparent by depth descending.
+    // Opaque items sort by complete batch state then depth; transparent items
+    // sort by depth descending before state tie-breaks.
     void sort();
+
+    // Builds contiguous draw ranges after sort(). Opaque items with identical
+    // pipeline/material/mesh/submesh state are instanced together. Blended
+    // items stay one draw each because merging non-adjacent depth layers would
+    // violate back-to-front compositing.
+    void buildBatches(Array<RenderBatch>& output, bool batchingEnabled = true) const;
 
     [[nodiscard]] auto items() const -> const Array<RenderItem>& { return items_; }
     [[nodiscard]] auto items() -> Array<RenderItem>& { return items_; }

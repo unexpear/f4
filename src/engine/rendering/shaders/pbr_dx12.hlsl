@@ -37,6 +37,20 @@ struct VertexInput {
     float4 color : TEXCOORD3;
 };
 
+struct InstancedVertexInput {
+    float3 position : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float2 uv : TEXCOORD2;
+    float4 color : TEXCOORD3;
+    float4 model0 : TEXCOORD9;
+    float4 model1 : TEXCOORD10;
+    float4 model2 : TEXCOORD11;
+    float4 model3 : TEXCOORD12;
+    float4 normal0 : TEXCOORD13;
+    float4 normal1 : TEXCOORD14;
+    float4 normal2 : TEXCOORD15;
+};
+
 struct VertexOutput {
     float4 position : SV_Position;
     float3 worldPosition : TEXCOORD0;
@@ -52,6 +66,22 @@ VertexOutput VSMain(VertexInput input) {
     output.position = mul(viewProj, world);
     output.worldPosition = world.xyz;
     output.worldNormal = mul((float3x3)normalMatrix, input.normal);
+    output.uv = input.uv;
+    output.color = input.color;
+    output.lightClip = mul(lightViewProj, world);
+    return output;
+}
+
+VertexOutput VSMainInstanced(InstancedVertexInput input) {
+    VertexOutput output;
+    const float4 world = input.model0 * input.position.x +
+                         input.model1 * input.position.y +
+                         input.model2 * input.position.z + input.model3;
+    output.position = mul(viewProj, world);
+    output.worldPosition = world.xyz;
+    output.worldNormal = input.normal0.xyz * input.normal.x +
+                         input.normal1.xyz * input.normal.y +
+                         input.normal2.xyz * input.normal.z;
     output.uv = input.uv;
     output.color = input.color;
     output.lightClip = mul(lightViewProj, world);

@@ -169,7 +169,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
-| M12 Optimization | ⚠ Early foundations | Instanced RHI draws/demo, pipeline-key sorting, and M16's first-class distance-priority job system exist. Frustum/occlusion culling, draw batching, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
+| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
 | M13 Deterministic noise | ⚠ CPU complete; GPU parity open | Seeded value/perlin/simplex, FBM, and domain warp APIs, locked floating-point flags, bit-exact GCC/MSVC/Clang golden vectors, range/continuity, and octave-contract tests are present across Windows and Linux. The written every-backend promise remains open for CPU-reference versus GPU-sampled noise parity. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
@@ -528,9 +528,13 @@ Completed delivery and acceptance gates:
   behavior. Single-sided front faces remain visible in all three native paths.
 
 ### Milestone 12 — Optimization
-- Frustum culling, occlusion culling
-- Batching, instancing
-- Job system, multithreaded command recording
+- ✅ World-space AABB frustum culling with per-frame candidate/visible/culled
+  counters; invalid bounds conservatively remain visible
+- ✅ Deterministic opaque state batching and native per-instance model/normal
+  vertex streams on OpenGL, Vulkan, and DX12; transparent draws stay isolated
+- Occlusion culling
+- ✅ Distance/stage-priority job system (delivered by M16); multithreaded command
+  recording remains open
 - SIMD math paths
 - Render graph scheduling, async compute
 
@@ -838,14 +842,24 @@ The demo bench also gained repeatable back-buffer capture; three captured frames
 from each of all 20 scenes were inspected, with no blinking or missing cube
 faces and all seven rendering-validation scenes intact.
 
+The first M12 renderer slice completed on 2026-09-03. Mesh-local bounds are
+recomputed from uploaded geometry, transformed conservatively into world-space
+AABBs, and tested against the camera frustum before queue insertion. A complete
+pipeline/material/mesh/submesh batch key now feeds dedicated native instanced
+vertex paths on OpenGL, Vulkan, and DX12 through a growable triple-buffered
+upload ring. Focused NullDevice and native pixel-parity regressions cover culling,
+batch toggles, buffer growth/reuse, non-finite queue depths, and two-object
+instanced output. All 60 captures from the 20-scene OpenGL bench were inspected
+across three frames, including the cube and seven rendering-validation scenes,
+with no missing or blinking faces.
+
 ### Current next work (2026-09-03 audit)
 
-1. Continue M12 from profiling evidence: frustum/occlusion culling and draw
-   batching first, using M16's completed job system where measurements justify
-   parallel work.
-2. Add the API-neutral compute pipeline/command model and backend implementations
+1. Add the API-neutral compute pipeline/command model and backend implementations
    needed to finish M13's CPU-reference versus GPU-sampled noise parity gate.
-3. Return to M12's multithreaded command recording, SIMD paths, render-graph
+2. Profile representative dense and occluded scenes before choosing an M12
+   occlusion strategy; add occlusion only with a measured acceptance threshold.
+3. Continue M12's multithreaded command recording, SIMD paths, render-graph
    scheduling, and async compute only where profiling demonstrates value.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies

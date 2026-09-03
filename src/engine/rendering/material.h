@@ -147,6 +147,7 @@ private:
     HashMap<std::uint64_t, resources::MaterialHandle> lookup_;
     gfx::IDevice* owner_ = nullptr;
     gfx::ShaderHandle pbrVs_{};
+    gfx::ShaderHandle pbrInstancedVs_{};
     gfx::ShaderHandle pbrFs_{};
     gfx::ShaderHandle shadowVs_{};
     gfx::ShaderHandle shadowFs_{};

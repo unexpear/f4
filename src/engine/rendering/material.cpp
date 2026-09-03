@@ -1,7 +1,9 @@
 #include "engine/rendering/material.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 #include "graphics/shader/shader_desc.h"
 
@@ -82,13 +84,16 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
 }
 
 [[nodiscard]] auto shaderPaths(gfx::Backend backend, const char*& vertex,
-                               const char*& fragment, const char*& shadowVertex,
+                               const char*& instancedVertex, const char*& fragment,
+                               const char*& shadowVertex,
                                const char*& shadowFragment) -> bool {
     switch (backend) {
     case gfx::Backend::OpenGL:
 #if defined(F4_PBR_OPENGL_VERTEX) && defined(F4_PBR_OPENGL_FRAGMENT) && \
+    defined(F4_PBR_OPENGL_INSTANCED_VERTEX) && \
     defined(F4_SHADOW_OPENGL_VERTEX) && defined(F4_SHADOW_OPENGL_FRAGMENT)
         vertex = F4_PBR_OPENGL_VERTEX;
+        instancedVertex = F4_PBR_OPENGL_INSTANCED_VERTEX;
         fragment = F4_PBR_OPENGL_FRAGMENT;
         shadowVertex = F4_SHADOW_OPENGL_VERTEX;
         shadowFragment = F4_SHADOW_OPENGL_FRAGMENT;
@@ -98,8 +103,10 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
 #endif
     case gfx::Backend::Vulkan:
 #if defined(F4_PBR_VULKAN_VERTEX) && defined(F4_PBR_VULKAN_FRAGMENT) && \
+    defined(F4_PBR_VULKAN_INSTANCED_VERTEX) && \
     defined(F4_SHADOW_VULKAN_VERTEX) && defined(F4_SHADOW_VULKAN_FRAGMENT)
         vertex = F4_PBR_VULKAN_VERTEX;
+        instancedVertex = F4_PBR_VULKAN_INSTANCED_VERTEX;
         fragment = F4_PBR_VULKAN_FRAGMENT;
         shadowVertex = F4_SHADOW_VULKAN_VERTEX;
         shadowFragment = F4_SHADOW_VULKAN_FRAGMENT;
@@ -109,8 +116,10 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
 #endif
     case gfx::Backend::DirectX12:
 #if defined(F4_PBR_DX12_VERTEX) && defined(F4_PBR_DX12_FRAGMENT) && \
+    defined(F4_PBR_DX12_INSTANCED_VERTEX) && \
     defined(F4_SHADOW_DX12_VERTEX) && defined(F4_SHADOW_DX12_FRAGMENT)
         vertex = F4_PBR_DX12_VERTEX;
+        instancedVertex = F4_PBR_DX12_INSTANCED_VERTEX;
         fragment = F4_PBR_DX12_FRAGMENT;
         shadowVertex = F4_SHADOW_DX12_VERTEX;
         shadowFragment = F4_SHADOW_DX12_FRAGMENT;
@@ -122,6 +131,32 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
         return true;
     }
     return false;
+}
+
+[[nodiscard]] auto hasInstancedTransforms(const gfx::VertexInputLayout& layout) -> bool {
+    std::uint32_t instanceBinding = std::numeric_limits<std::uint32_t>::max();
+    for (std::uint32_t index = 0; index < 7; ++index) {
+        const std::uint32_t location = 9u + index;
+        const std::uint32_t offset = index * 16u;
+        const auto attribute = std::find_if(
+            layout.attributes.begin(), layout.attributes.end(),
+            [&](const auto& candidate) {
+                return candidate.location == location &&
+                       candidate.format == gfx::VertexFormat::Float32x4 &&
+                       candidate.offsetBytes == offset;
+            });
+        if (attribute == layout.attributes.end()) return false;
+        if (index == 0) {
+            instanceBinding = attribute->binding;
+        } else if (attribute->binding != instanceBinding) {
+            return false;
+        }
+    }
+    const auto binding = std::find_if(
+        layout.bindings.begin(), layout.bindings.end(),
+        [&](const auto& candidate) { return candidate.binding == instanceBinding; });
+    return binding != layout.bindings.end() && binding->divisor == 1 &&
+           binding->strideBytes >= 112;
 }
 
 [[nodiscard]] auto loadShader(const char* path, gfx::ShaderStage stage,
@@ -264,29 +299,32 @@ auto MaterialCache::getOrCreate(const StandardMaterialDesc& desc) -> resources::
 
 auto MaterialCache::ensureShaders(gfx::IDevice& dev) -> gfx::GfxError {
     if (owner_ != nullptr && owner_ != &dev) return gfx::GfxError::InvalidHandle;
-    if (pbrVs_.isValid() && pbrFs_.isValid() && shadowVs_.isValid() &&
+    if (pbrVs_.isValid() && pbrInstancedVs_.isValid() && pbrFs_.isValid() && shadowVs_.isValid() &&
         shadowFs_.isValid()) {
         return gfx::GfxError::None;
     }
 
     const char* vertex = nullptr;
+    const char* instancedVertex = nullptr;
     const char* fragment = nullptr;
     const char* shadowVertex = nullptr;
     const char* shadowFragment = nullptr;
-    if (!shaderPaths(dev.backend(), vertex, fragment, shadowVertex, shadowFragment)) {
+    if (!shaderPaths(dev.backend(), vertex, instancedVertex, fragment, shadowVertex,
+                     shadowFragment)) {
         return gfx::GfxError::BackendUnavailable;
     }
 
-    gfx::ShaderDesc descriptions[4];
+    gfx::ShaderDesc descriptions[5];
     if (!loadShader(vertex, gfx::ShaderStage::Vertex, dev.backend(), descriptions[0]) ||
-        !loadShader(fragment, gfx::ShaderStage::Fragment, dev.backend(), descriptions[1]) ||
-        !loadShader(shadowVertex, gfx::ShaderStage::Vertex, dev.backend(), descriptions[2]) ||
-        !loadShader(shadowFragment, gfx::ShaderStage::Fragment, dev.backend(), descriptions[3])) {
+        !loadShader(instancedVertex, gfx::ShaderStage::Vertex, dev.backend(), descriptions[1]) ||
+        !loadShader(fragment, gfx::ShaderStage::Fragment, dev.backend(), descriptions[2]) ||
+        !loadShader(shadowVertex, gfx::ShaderStage::Vertex, dev.backend(), descriptions[3]) ||
+        !loadShader(shadowFragment, gfx::ShaderStage::Fragment, dev.backend(), descriptions[4])) {
         return gfx::GfxError::BackendUnavailable;
     }
 
-    gfx::ShaderHandle handles[4];
-    for (std::size_t i = 0; i < 4; ++i) {
+    gfx::ShaderHandle handles[5];
+    for (std::size_t i = 0; i < 5; ++i) {
         auto result = dev.createShader(descriptions[i]);
         if (!result.hasValue()) {
             for (std::size_t j = 0; j < i; ++j) (void)dev.destroyShader(handles[j]);
@@ -295,9 +333,10 @@ auto MaterialCache::ensureShaders(gfx::IDevice& dev) -> gfx::GfxError {
         handles[i] = result.value();
     }
     pbrVs_ = handles[0];
-    pbrFs_ = handles[1];
-    shadowVs_ = handles[2];
-    shadowFs_ = handles[3];
+    pbrInstancedVs_ = handles[1];
+    pbrFs_ = handles[2];
+    shadowVs_ = handles[3];
+    shadowFs_ = handles[4];
     owner_ = &dev;
     return gfx::GfxError::None;
 }
@@ -316,7 +355,7 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
     if (const auto error = ensureShaders(dev); error != gfx::GfxError::None) return error;
 
     gfx::PipelineStateDesc pipeline;
-    pipeline.vertexShader = pbrVs_;
+    pipeline.vertexShader = hasInstancedTransforms(vertexInput) ? pbrInstancedVs_ : pbrVs_;
     pipeline.fragmentShader = pbrFs_;
     pipeline.vertexInput = vertexInput;
     pipeline.topology = gfx::PrimitiveTopology::TriangleList;
@@ -441,10 +480,12 @@ void MaterialCache::clear(gfx::IDevice& dev) {
     }
     shadowVariants_.clear();
     if (pbrVs_.isValid()) (void)dev.destroyShader(pbrVs_);
+    if (pbrInstancedVs_.isValid()) (void)dev.destroyShader(pbrInstancedVs_);
     if (pbrFs_.isValid()) (void)dev.destroyShader(pbrFs_);
     if (shadowVs_.isValid()) (void)dev.destroyShader(shadowVs_);
     if (shadowFs_.isValid()) (void)dev.destroyShader(shadowFs_);
     pbrVs_ = {};
+    pbrInstancedVs_ = {};
     pbrFs_ = {};
     shadowVs_ = {};
     shadowFs_ = {};

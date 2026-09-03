@@ -66,6 +66,17 @@ void flipCaptureRows(PbrCapture& capture) {
         }
     }
 }
+
+[[nodiscard]] auto litPixelCount(const PbrCapture& capture) -> std::size_t {
+    std::size_t count = 0;
+    for (std::size_t offset = 0; offset < capture.size(); offset += 4) {
+        if (capture[offset] > 20 || capture[offset + 1] > 20 ||
+            capture[offset + 2] > 20) {
+            ++count;
+        }
+    }
+    return count;
+}
 #endif
 
 [[nodiscard]] auto makeM11Triangle() -> resources::Mesh {
@@ -146,7 +157,7 @@ void flipCaptureRows(PbrCapture& capture) {
     defined(F4_GRAPHICS_HAS_DX12)
 template <typename Reader>
 [[nodiscard]] auto capturePbrFrame(gfx::IDevice& device, bool shadows, Reader&& reader,
-                                   bool positionOnly = false)
+                                   bool positionOnly = false, bool batchedPair = false)
     -> PbrCapture {
     constexpr std::uint32_t extent = kCaptureExtent;
     gfx::TextureDesc colorDesc;
@@ -224,13 +235,25 @@ template <typename Reader>
         light.color = {1.0f, 0.92f, 0.8f};
         light.intensity = 2.5f;
         registry.emplace<engine::DirectionalLight>(lightEntity, light);
-        const ecs::Entity object = registry.create();
-        registry.emplace<ecs::LocalTransform>(object, ecs::LocalTransform{});
-        registry.emplace<engine::MeshRenderer>(
-            object, engine::MeshRenderer{mesh, material, 0, shadows, false});
+        const std::uint32_t objectCount = batchedPair ? 2u : 1u;
+        for (std::uint32_t index = 0; index < objectCount; ++index) {
+            const ecs::Entity object = registry.create();
+            auto& transform = registry.emplace<ecs::LocalTransform>(
+                object, ecs::LocalTransform{});
+            if (batchedPair) {
+                transform.position.x = index == 0 ? -0.48f : 0.48f;
+                transform.scale = {0.68f, 0.68f, 0.68f};
+            }
+            registry.emplace<engine::MeshRenderer>(
+                object, engine::MeshRenderer{mesh, material, 0, shadows, false});
+        }
         ecs::updateWorldTransforms(registry);
         REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) ==
                 gfx::GfxError::None);
+        if (batchedPair) {
+            CHECK(renderer.stats().draws == 1);
+            CHECK(renderer.stats().instances == 2);
+        }
         device.waitIdle();
 
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
@@ -527,6 +550,12 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
             return glGetError() == GL_NO_ERROR ? gfx::GfxError::None
                                                : gfx::GfxError::DeviceLost;
         }, true);
+    const auto openGlBatched = capturePbrFrame(
+        *openGlBase, false, [](gfx::TextureHandle, std::span<std::byte> output) {
+            glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, output.data());
+            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None
+                                               : gfx::GfxError::DeviceLost;
+        }, false, true);
     gfx::deleteDevice(openGlBase);
     delete window;
 
@@ -542,6 +571,11 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
                                 std::span<std::byte> output) {
             return vulkan->readTexture(texture, 0, output);
         }, true);
+    const auto vkBatched = capturePbrFrame(
+        *vulkan, false, [vulkan](gfx::TextureHandle texture,
+                                std::span<std::byte> output) {
+            return vulkan->readTexture(texture, 0, output);
+        }, false, true);
     CHECK(vulkan->validationWarningCount() == 0);
     CHECK(vulkan->validationErrorCount() == 0);
     gfx::deleteDevice(vulkanBase);
@@ -558,6 +592,11 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
                              std::span<std::byte> output) {
             return dx12->readTexture(texture, 0, output);
         }, true);
+    const auto dxBatched = capturePbrFrame(
+        *dx12, false, [dx12](gfx::TextureHandle texture,
+                             std::span<std::byte> output) {
+            return dx12->readTexture(texture, 0, output);
+        }, false, true);
     CHECK(dx12->validationWarningCount() == 0);
     CHECK(dx12->validationErrorCount() == 0);
     gfx::deleteDevice(dx12Base);
@@ -586,6 +625,8 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
         openGlPositionOnly, vkPositionOnly, 2);
     const auto compactGlDx = engine::compareShaderImagesRgba8(
         openGlPositionOnly, dxPositionOnly, 2);
+    const auto batchedGlVk = engine::compareShaderImagesRgba8(openGlBatched, vkBatched, 2);
+    const auto batchedGlDx = engine::compareShaderImagesRgba8(openGlBatched, dxBatched, 2);
     INFO("full PBR GL/VK mismatches=" << glVk.mismatchPixelCount
                                        << " max delta="
                                        << static_cast<int>(glVk.maxChannelDelta)
@@ -596,6 +637,9 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
     CHECK(glDx.matches());
     CHECK(compactGlVk.matches());
     CHECK(compactGlDx.matches());
+    CHECK(litPixelCount(openGlBatched) > 100);
+    CHECK(batchedGlVk.matches());
+    CHECK(batchedGlDx.matches());
 }
 
 TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {

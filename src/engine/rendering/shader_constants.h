@@ -5,6 +5,7 @@
 #include <span>
 
 #include "core/containers/array.h"
+#include "graphics/buffer/buffer_desc.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/device/device.h"
 #include "graphics/handle.h"
@@ -86,6 +87,52 @@ private:
     std::size_t cursor_ = 0;
     std::size_t allocationsThisFrame_ = 0;
     std::array<containers::Array<gfx::BufferHandle>, kBufferedFrames> handles_;
+};
+
+// Triple-buffered variable-size uploads. Each allocation owns one reusable
+// buffer slot, so a recorded draw can retain its exact byte range without
+// dynamic offsets. Slots grow geometrically and rotate across three frame
+// banks to avoid rewriting storage still referenced by an in-flight submit.
+class DynamicBufferRing {
+public:
+    struct Slot {
+        gfx::BufferHandle handle{};
+        std::uint32_t sizeBytes = 0;
+        std::uint32_t capacityBytes = 0;
+        bool valid = false;
+    };
+
+    DynamicBufferRing() = default;
+    DynamicBufferRing(const DynamicBufferRing&) = delete;
+    DynamicBufferRing& operator=(const DynamicBufferRing&) = delete;
+
+    [[nodiscard]] auto create(gfx::IDevice& device, gfx::BufferUsage usage)
+        -> gfx::GfxError;
+    void destroy(gfx::IDevice& device);
+
+    [[nodiscard]] auto valid() const -> bool { return device_ != nullptr; }
+    [[nodiscard]] auto bufferCount() const -> std::size_t;
+
+    void beginFrame() {
+        currentFrame_ = (currentFrame_ + 1) % kBufferedFrames;
+        cursor_ = 0;
+    }
+
+    [[nodiscard]] auto alloc(gfx::IDevice& device, std::span<const std::byte> data)
+        -> Slot;
+
+private:
+    struct Record {
+        gfx::BufferHandle handle{};
+        std::uint32_t capacityBytes = 0;
+    };
+
+    gfx::IDevice* device_ = nullptr;
+    gfx::BufferUsage usage_ = gfx::BufferUsage::None;
+    static constexpr std::size_t kBufferedFrames = 3;
+    std::size_t currentFrame_ = kBufferedFrames - 1;
+    std::size_t cursor_ = 0;
+    std::array<containers::Array<Record>, kBufferedFrames> records_;
 };
 
 } // namespace f4::engine
