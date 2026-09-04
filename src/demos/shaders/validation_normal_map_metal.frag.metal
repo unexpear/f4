@@ -9,7 +9,7 @@ struct FragmentInput {
 fragment float4 validation_normal_map_fragment(
     FragmentInput input [[stage_in]],
     texture2d<float> normalTexture [[texture(0)]],
-    sampler normalSampler [[sampler(0)]]) [[color(0)]] {
+    sampler normalSampler [[sampler(0)]]) {
     const bool flipped = input.uv.x >= 0.5f;
     const float2 panelUv(fract(input.uv.x * 2.0f), input.uv.y);
     const float2 tiledUv = panelUv * 4.0f;

@@ -17,7 +17,7 @@ struct CubeFragmentInput {
 
 fragment float4 cube_fragment(
     CubeFragmentInput input [[stage_in]],
-    constant CubeUniforms& uniforms [[buffer(16)]]) [[color(0)]] {
+    constant CubeUniforms& uniforms [[buffer(16)]]) {
     const float3 normal = normalize(input.normal);
     const float3 lightDirection = normalize(-uniforms.lightDir.xyz);
     const float3 viewDirection = normalize(uniforms.viewPos.xyz - input.worldPosition);

@@ -6,7 +6,6 @@ struct FragmentInput {
     float4 color;
 };
 
-fragment float4 validation_vertex_color_fragment(FragmentInput input [[stage_in]])
-    [[color(0)]] {
+fragment float4 validation_vertex_color_fragment(FragmentInput input [[stage_in]]) {
     return input.color;
 }

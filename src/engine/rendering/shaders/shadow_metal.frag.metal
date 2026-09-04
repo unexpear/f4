@@ -10,7 +10,7 @@ struct VertexOutput {
 
 fragment float shadow_fragment(VertexOutput input [[stage_in]],
                                texture2d<float> baseColorTexture [[texture(0)]],
-                               sampler baseColorSampler [[sampler(0)]]) [[color(0)]] {
+                               sampler baseColorSampler [[sampler(0)]]) {
     if (input.alpha.z > 0.5f &&
         baseColorTexture.sample(baseColorSampler, input.uv).a * input.alpha.x < input.alpha.y) {
         discard_fragment();

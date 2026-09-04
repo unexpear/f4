@@ -16,8 +16,7 @@ struct FragmentInput {
 };
 
 fragment float4 validation_terrain_fragment(
-    FragmentInput input [[stage_in]], constant Scene& scene [[buffer(16)]])
-    [[color(0)]] {
+    FragmentInput input [[stage_in]], constant Scene& scene [[buffer(16)]]) {
     const float3 normal = normalize(input.normal);
     const float3 light = normalize(-scene.lightDir);
     const float3 view = normalize(scene.viewPos - input.worldPosition);

@@ -20,6 +20,6 @@ vertex VertexOutput triangle_vertex(uint vertexId [[vertex_id]]) {
     return output;
 }
 
-fragment float4 triangle_fragment(VertexOutput input [[stage_in]]) [[color(0)]] {
+fragment float4 triangle_fragment(VertexOutput input [[stage_in]]) {
     return float4(input.color, 1.0f);
 }

@@ -150,7 +150,7 @@ fragment float4 pbr_fragment(
     sampler environmentSampler [[sampler(5)]],
     texture2d<float> shadowTexture [[texture(6)]],
     sampler shadowSampler [[sampler(6)]],
-    bool frontFacing [[front_facing]]) [[color(0)]] {
+    bool frontFacing [[front_facing]]) {
     const int flags = int(scene.ambientFlags.y + 0.5f);
     const float4 baseSample = baseColorTexture.sample(baseColorSampler, input.uv);
     const float4 vertexColor = (flags & 4) != 0 ? input.color : float4(1.0f);

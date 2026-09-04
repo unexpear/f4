@@ -19,6 +19,6 @@ vertex VertexOutput bind_vertex(uint vertexId [[vertex_id]]) {
 fragment float4 bind_fragment(VertexOutput input [[stage_in]],
                               constant float4& tint [[buffer(16)]],
                               texture2d<float> source [[texture(0)]],
-                              sampler sourceSampler [[sampler(0)]]) [[color(0)]] {
+                              sampler sourceSampler [[sampler(0)]]) {
     return source.sample(sourceSampler, input.uv) * tint;
 }

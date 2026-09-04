@@ -11,7 +11,7 @@ fragment float4 validation_deferred_fragment(
     texture2d<float> albedoTexture [[texture(0)]],
     sampler albedoSampler [[sampler(0)]],
     texture2d<float> normalTexture [[texture(1)]],
-    sampler normalSampler [[sampler(1)]]) [[color(0)]] {
+    sampler normalSampler [[sampler(1)]]) {
     const float4 albedoSample = albedoTexture.sample(albedoSampler, input.uv);
     const float3 encodedNormal = normalTexture.sample(normalSampler, input.uv).xyz;
     if (albedoSample.a < 0.5f) {

@@ -11,7 +11,7 @@ fragment float4 validation_mip_fragment(
     texture2d<float> levelZeroTexture [[texture(0)]],
     sampler levelZeroSampler [[sampler(0)]],
     texture2d<float> mipTexture [[texture(1)]],
-    sampler mipSampler [[sampler(1)]]) [[color(0)]] {
+    sampler mipSampler [[sampler(1)]]) {
     const bool mipmapped = input.uv.x >= 0.5f;
     const float localX = fract(input.uv.x * 2.0f) * 2.0f - 1.0f;
     const float horizonDistance = max(0.875f - input.uv.y, 0.012f);

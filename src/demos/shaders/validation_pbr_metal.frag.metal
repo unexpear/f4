@@ -35,8 +35,7 @@ float3 fresnelSchlick(float cosine, float3 f0) {
 }
 
 fragment float4 validation_pbr_fragment(
-    FragmentInput input [[stage_in]], constant Scene& scene [[buffer(16)]])
-    [[color(0)]] {
+    FragmentInput input [[stage_in]], constant Scene& scene [[buffer(16)]]) {
     const float metallic = clamp(input.material.x, 0.0f, 1.0f);
     const float roughness = clamp(input.material.y, 0.06f, 1.0f);
     const float3 albedo = mix(float3(0.72f, 0.08f, 0.035f),
