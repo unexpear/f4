@@ -97,6 +97,10 @@ if(F4_ENABLE_SANITIZERS AND MSVC)
     # VirtualAlloc error before any test executes; Vulkan remains covered by
     # the Debug/Release validation-layer gates.
     add_test(NAME core COMMAND f4_tests "--test-case-exclude=*Vulkan*,*DX12*,M10:*")
+elseif(F4_GRAPHICS_HAS_METAL)
+    # Standard hosted macOS runners build Metal but do not guarantee GPU
+    # passthrough. Keep native execution in the separately labelled gate.
+    add_test(NAME core COMMAND f4_tests "--test-case-exclude=Metal hardware:*")
 else()
     add_test(NAME core COMMAND f4_tests)
 endif()
@@ -302,5 +306,43 @@ if(F4_GRAPHICS_HAS_VULKAN)
             F4_VK_TEST_PARITY_FRAGMENT_SPV="${F4_VK_TEST_PARITY_FRAGMENT_SPV}"
             F4_VK_TEST_IMAGE_FRAGMENT_SPV="${F4_VK_TEST_IMAGE_FRAGMENT_SPV}"
             F4_M13_VK_COMPUTE_SPV="${F4_M13_VK_COMPUTE_SPV}")
+    endif()
+endif()
+
+if(F4_GRAPHICS_HAS_METAL)
+    target_sources(f4_tests PRIVATE graphics/test_metal_device.cpp)
+    include(${CMAKE_SOURCE_DIR}/cmake/MetalShaders.cmake)
+    set(F4_METAL_TEST_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/metal-shaders")
+    set(F4_METAL_TEST_TRIANGLE_SHADER
+        "${F4_METAL_TEST_SHADER_DIR}/m17_triangle.metallib")
+    set(F4_METAL_TEST_BIND_SHADER
+        "${F4_METAL_TEST_SHADER_DIR}/m17_bind.metallib")
+    set(F4_M13_METAL_COMPUTE
+        "${F4_METAL_TEST_SHADER_DIR}/m13_noise.comp.metallib")
+    f4_compile_metallib("${F4_METAL_TEST_TRIANGLE_SHADER}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m17_triangle.metal")
+    f4_compile_metallib("${F4_METAL_TEST_BIND_SHADER}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m17_bind.metal")
+    f4_compile_metallib("${F4_M13_METAL_COMPUTE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/m13_noise.comp.metal")
+    add_custom_target(f4_metal_test_shaders DEPENDS
+        "${F4_METAL_TEST_TRIANGLE_SHADER}"
+        "${F4_METAL_TEST_BIND_SHADER}"
+        "${F4_M13_METAL_COMPUTE}")
+    add_dependencies(f4_tests f4_metal_test_shaders)
+    target_compile_definitions(f4_tests PRIVATE
+        F4_METAL_TEST_TRIANGLE_SHADER="${F4_METAL_TEST_TRIANGLE_SHADER}"
+        F4_METAL_TEST_BIND_SHADER="${F4_METAL_TEST_BIND_SHADER}"
+        F4_M13_METAL_COMPUTE="${F4_M13_METAL_COMPUTE}"
+        F4_M11_REFERENCE_DEFLATE_BASE64="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/m11_reference.deflate.base64")
+    add_test(NAME metal_hardware COMMAND f4_tests "--test-case=Metal hardware:*")
+    set_tests_properties(metal_hardware PROPERTIES LABELS metal-hardware)
+    if(TARGET f4_metal_validation_app)
+        add_test(NAME metal_visual_capture
+            COMMAND f4_metal_validation_app
+                    --capture-dir "${CMAKE_BINARY_DIR}/m17-metal-captures")
+        set_tests_properties(metal_visual_capture PROPERTIES
+            LABELS metal-hardware
+            RUN_SERIAL TRUE)
     endif()
 endif()

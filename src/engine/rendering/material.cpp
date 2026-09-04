@@ -7,6 +7,10 @@
 
 #include "graphics/shader/shader_desc.h"
 
+#if defined(F4_WEBGPU_SHADER_HEADER)
+#include F4_WEBGPU_SHADER_HEADER
+#endif
+
 namespace f4::engine {
 
 namespace {
@@ -127,8 +131,32 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
 #else
         return false;
 #endif
+    case gfx::Backend::Metal:
+#if defined(F4_PBR_METAL_VERTEX) && defined(F4_PBR_METAL_FRAGMENT) && \
+    defined(F4_PBR_METAL_INSTANCED_VERTEX) && \
+    defined(F4_SHADOW_METAL_VERTEX) && defined(F4_SHADOW_METAL_FRAGMENT)
+        vertex = F4_PBR_METAL_VERTEX;
+        instancedVertex = F4_PBR_METAL_INSTANCED_VERTEX;
+        fragment = F4_PBR_METAL_FRAGMENT;
+        shadowVertex = F4_SHADOW_METAL_VERTEX;
+        shadowFragment = F4_SHADOW_METAL_FRAGMENT;
+        return true;
+#else
+        return false;
+#endif
     case gfx::Backend::Null:
         return true;
+    case gfx::Backend::WebGPU:
+#if defined(F4_WEBGPU_SHADER_HEADER)
+        vertex = web::kPbrVertexWgsl;
+        instancedVertex = web::kPbrInstancedVertexWgsl;
+        fragment = web::kPbrFragmentWgsl;
+        shadowVertex = web::kShadowVertexWgsl;
+        shadowFragment = web::kShadowFragmentWgsl;
+        return true;
+#else
+        return false;
+#endif
     }
     return false;
 }
@@ -164,6 +192,13 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
     output.stage = stage;
     if (backend == gfx::Backend::Null) {
         output.blob.push(std::byte{0});
+        return true;
+    }
+    if (backend == gfx::Backend::WebGPU) {
+        const std::size_t size = std::strlen(path);
+        if (size == 0) return false;
+        output.blob.resize(size);
+        std::memcpy(output.blob.data(), path, size);
         return true;
     }
     std::ifstream file(path, std::ios::binary | std::ios::ate);

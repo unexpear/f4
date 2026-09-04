@@ -15,10 +15,12 @@ using containers::Array;
 // ---------------------------------------------------------------------------
 // Binding model — the API-divergence-critical abstraction.
 //
-// One binding model abstracts the three native mechanisms:
+// One binding model abstracts each backend mechanism:
 //   - OpenGL   : uniform blocks + sampler uniforms (M7)
 //   - Vulkan   : descriptor sets + set layouts   (M9)
 //   - DirectX12: descriptor tables + heaps       (M10)
+//   - Metal    : stage resource-index namespaces (M17)
+//   - WebGPU   : bind groups + bind-group layouts (M18)
 //
 // A PipelineLayout is an ordered list of bind groups (bind points). Each group
 // has a set of typed slots. The semantics (which bound resource goes at which
@@ -78,7 +80,7 @@ enum class VertexFormat : std::uint8_t {
 
 // Vertex input expressed as the M5 Mesh records are laid out. `attributes`
 // parallel the asset layer's VertexAttribute list but are resolved to explicit
-// bindings/locations here so all three backends agree.
+// bindings/locations here so all backends agree.
 struct VertexInputLayout {
     struct VertexBinding {
         std::uint32_t binding = 0; // vertex buffer slot
@@ -103,6 +105,12 @@ struct DepthStencilState {
     bool depthWriteEnable = false;
     CompareOp depthCompare = CompareOp::Less;
     TextureFormat format = TextureFormat::Depth32F;
+    // Declare pass attachment compatibility even when testing and writes are disabled.
+    bool depthAttachmentEnable = false;
+
+    [[nodiscard]] constexpr auto usesAttachment() const -> bool {
+        return depthAttachmentEnable || depthTestEnable || depthWriteEnable;
+    }
 };
 
 struct RasterState {
@@ -126,6 +134,8 @@ struct PipelineStateDesc {
     PipelineLayoutDesc layout;
     VertexInputLayout vertexInput;
     PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+    // WebGPU requires indexed strip pipelines to pin the primitive-restart format.
+    IndexFormat stripIndexFormat = IndexFormat::U16;
     ShaderHandle vertexShader{};
     ShaderHandle fragmentShader{};
     // A pipeline is either graphics (vertex + fragment) or compute, never both.

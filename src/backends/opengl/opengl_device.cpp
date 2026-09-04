@@ -502,7 +502,7 @@ auto OpenGLDevice::createPipeline(const PipelineStateDesc& desc)
     if (compute && (!desc.vertexInput.bindings.isEmpty() ||
                     !desc.vertexInput.attributes.isEmpty() ||
                     !desc.colorAttachments.isEmpty() ||
-                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+                    desc.depthStencil.usesAttachment())) {
         return GfxError::BadDescriptor;
     }
     const std::size_t colorStateCount =

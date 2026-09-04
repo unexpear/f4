@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <span>
 #include <vector>
 
@@ -16,6 +17,15 @@
 #include "graphics/sampler/sampler_desc.h"
 #include "graphics/shader/shader_desc.h"
 #include "graphics/texture/texture_desc.h"
+#ifdef F4_GRAPHICS_BACKEND_metal
+#include "demos/metal_demo_shaders.h"
+#define F4_VALIDATION_SHADER(glslName, wgslName) f4::metal::wgslName
+#elif defined(F4_GRAPHICS_BACKEND_webgpu)
+#include "webgpu_shaders.h"
+#define F4_VALIDATION_SHADER(glslName, wgslName) f4::web::wgslName
+#else
+#define F4_VALIDATION_SHADER(glslName, wgslName) glslName
+#endif
 
 namespace f4::demo {
 namespace {
@@ -26,9 +36,20 @@ auto createShader(gfx::IDevice& device, gfx::ShaderStage stage, const char* sour
                   gfx::ShaderHandle& output) -> bool {
     gfx::ShaderDesc desc;
     desc.stage = stage;
+#ifdef F4_GRAPHICS_BACKEND_metal
+    std::ifstream stream(source, std::ios::binary | std::ios::ate);
+    if (!stream.good()) return false;
+    const std::streamsize size = stream.tellg();
+    if (size <= 0) return false;
+    stream.seekg(0);
+    desc.blob.resize(static_cast<std::size_t>(size));
+    stream.read(reinterpret_cast<char*>(desc.blob.data()), size);
+    if (!stream.good()) return false;
+#else
     const std::size_t length = std::strlen(source);
     desc.blob.resize(length);
     std::memcpy(desc.blob.data(), source, length);
+#endif
     const auto result = device.createShader(desc);
     if (!result.hasValue()) return false;
     output = result.value();
@@ -44,6 +65,23 @@ auto createBuffer(gfx::IDevice& device, gfx::BufferUsage usage,
     if (!result.hasValue()) return false;
     output = result.value();
     return true;
+}
+
+auto groupZero(gfx::PipelineStateDesc& pipeline) -> gfx::BindGroup& {
+    if (pipeline.layout.groups.isEmpty()) pipeline.layout.groups.push(gfx::BindGroup{});
+    return pipeline.layout.groups[0];
+}
+
+void addUniform(gfx::PipelineStateDesc& pipeline, std::uint32_t stages) {
+    groupZero(pipeline).slots.push({0, gfx::BindingType::UniformBuffer, stages, 1});
+}
+
+void addSampledTexture(gfx::PipelineStateDesc& pipeline, std::uint32_t slot) {
+    auto& group = groupZero(pipeline);
+    group.slots.push({slot, gfx::BindingType::Texture,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+    group.slots.push({slot, gfx::BindingType::Sampler,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
 }
 
 template <typename T>
@@ -84,7 +122,7 @@ void buildSphere(std::vector<SphereVertex>& vertices, std::vector<std::uint16_t>
     }
 }
 
-constexpr const char* kPbrVertex = R"glsl(
+[[maybe_unused]] constexpr const char* kPbrVertex = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
@@ -106,7 +144,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kPbrFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kPbrFragment = R"glsl(
 #version 430 core
 in vec3 vWorldPos;
 in vec3 vNormal;
@@ -160,7 +198,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kFullscreenVertex = R"glsl(
+[[maybe_unused]] constexpr const char* kFullscreenVertex = R"glsl(
 #version 430 core
 out vec2 vUv;
 void main() {
@@ -171,7 +209,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kMipFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kMipFragment = R"glsl(
 #version 430 core
 in vec2 vUv;
 uniform sampler2D uTex;
@@ -210,7 +248,7 @@ void appendWorldQuad(std::vector<ColorVertex>& output, float left, float right,
     output.insert(output.end(), {a, c, b, a, d, c});
 }
 
-constexpr const char* kWorldColorVertex = R"glsl(
+[[maybe_unused]] constexpr const char* kWorldColorVertex = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec4 aColor;
@@ -222,7 +260,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kVertexColorFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kVertexColorFragment = R"glsl(
 #version 430 core
 in vec4 vColor;
 out vec4 fragColor;
@@ -247,7 +285,7 @@ void appendScreenQuad(std::vector<ScreenVertex>& output, float centerX, float ce
     output.insert(output.end(), {a, b, c, a, c, d});
 }
 
-constexpr const char* kScreenColorVertex = R"glsl(
+[[maybe_unused]] constexpr const char* kScreenColorVertex = R"glsl(
 #version 430 core
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec4 aColor;
@@ -258,7 +296,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kNormalMapFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kNormalMapFragment = R"glsl(
 #version 430 core
 in vec2 vUv;
 uniform sampler2D uTex;
@@ -312,8 +350,12 @@ bool PbrSphereGridScene::init(gfx::IDevice* device, platform::Window*) {
     }
     if (!uploadVector(*device, gfx::BufferUsage::Vertex, instances, instanceBuffer_)) return false;
     if (constants_.create(*device, 96, 1) != gfx::GfxError::None) return false;
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kPbrVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kPbrFragment, fragmentShader_)) return false;
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kPbrVertex, kValidationPbrVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kPbrFragment, kValidationPbrFragmentWgsl),
+                      fragmentShader_)) return false;
 
     gfx::PipelineStateDesc desc;
     desc.vertexShader = vertexShader_;
@@ -326,6 +368,8 @@ bool PbrSphereGridScene::init(gfx::IDevice* device, platform::Window*) {
     desc.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x3, 12});
     desc.vertexInput.attributes.push({1, 2, gfx::VertexFormat::Float32x3, 0});
     desc.vertexInput.attributes.push({1, 3, gfx::VertexFormat::Float32x3, 12});
+    addUniform(desc, gfx::shaderStageBit(gfx::ShaderStage::Vertex) |
+                         gfx::shaderStageBit(gfx::ShaderStage::Fragment));
     const auto pipeline = device->createPipeline(desc);
     if (!pipeline.hasValue()) return false;
     pipeline_ = pipeline.value();
@@ -440,12 +484,20 @@ bool MipmappingScene::init(gfx::IDevice* device, platform::Window*) {
     if (!trilinear.hasValue()) return false;
     mipSampler_ = trilinear.value();
 
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kFullscreenVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kMipFragment, fragmentShader_)) return false;
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kFullscreenVertex,
+                                           kValidationFullscreenVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kMipFragment, kValidationMipFragmentWgsl),
+                      fragmentShader_)) return false;
     gfx::PipelineStateDesc desc;
     desc.vertexShader = vertexShader_;
     desc.fragmentShader = fragmentShader_;
     desc.raster.cullMode = gfx::CullMode::None;
+    desc.depthStencil.depthAttachmentEnable = true;
+    addSampledTexture(desc, 0);
+    addSampledTexture(desc, 1);
     const auto pipeline = device->createPipeline(desc);
     if (!pipeline.hasValue()) return false;
     pipeline_ = pipeline.value();
@@ -504,8 +556,14 @@ bool ZFightingScene::init(gfx::IDevice* device, platform::Window*) {
     vertexCount_ = static_cast<std::uint32_t>(vertices.size());
     if (!uploadVector(*device, gfx::BufferUsage::Vertex, vertices, vertexBuffer_)) return false;
     if (constants_.create(*device, 64, 1) != gfx::GfxError::None) return false;
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kWorldColorVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kVertexColorFragment, fragmentShader_)) return false;
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kWorldColorVertex,
+                                           kValidationWorldColorVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kVertexColorFragment,
+                                           kValidationVertexColorFragmentWgsl),
+                      fragmentShader_)) return false;
     gfx::PipelineStateDesc desc;
     desc.vertexShader = vertexShader_;
     desc.fragmentShader = fragmentShader_;
@@ -514,6 +572,7 @@ bool ZFightingScene::init(gfx::IDevice* device, platform::Window*) {
     desc.vertexInput.bindings.push({0, sizeof(ColorVertex), 0});
     desc.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x3, 0});
     desc.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x4, 12});
+    addUniform(desc, gfx::shaderStageBit(gfx::ShaderStage::Vertex));
     const auto pipeline = device->createPipeline(desc);
     if (!pipeline.hasValue()) return false;
     pipeline_ = pipeline.value();
@@ -571,12 +630,19 @@ bool AlphaOrderScene::init(gfx::IDevice* device, platform::Window*) {
             if (!uploadVector(*device, gfx::BufferUsage::Vertex, quad, layerBuffers_[index])) return false;
         }
     }
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kScreenColorVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kVertexColorFragment, fragmentShader_)) return false;
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kScreenColorVertex,
+                                           kValidationScreenColorVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kVertexColorFragment,
+                                           kValidationVertexColorFragmentWgsl),
+                      fragmentShader_)) return false;
     gfx::PipelineStateDesc opaque;
     opaque.vertexShader = vertexShader_;
     opaque.fragmentShader = fragmentShader_;
     opaque.raster.cullMode = gfx::CullMode::None;
+    opaque.depthStencil.depthAttachmentEnable = true;
     opaque.vertexInput.bindings.push({0, sizeof(ScreenVertex), 0});
     opaque.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x2, 0});
     opaque.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x4, 8});
@@ -674,12 +740,20 @@ bool NormalMapOrientationScene::init(gfx::IDevice* device, platform::Window*) {
     const auto sampler = device->createSampler(samplerDesc);
     if (!sampler.hasValue()) return false;
     sampler_ = sampler.value();
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kFullscreenVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kNormalMapFragment, fragmentShader_)) return false;
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kFullscreenVertex,
+                                           kValidationFullscreenVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kNormalMapFragment,
+                                           kValidationNormalMapFragmentWgsl),
+                      fragmentShader_)) return false;
     gfx::PipelineStateDesc desc;
     desc.vertexShader = vertexShader_;
     desc.fragmentShader = fragmentShader_;
     desc.raster.cullMode = gfx::CullMode::None;
+    desc.depthStencil.depthAttachmentEnable = true;
+    addSampledTexture(desc, 0);
     const auto pipeline = device->createPipeline(desc);
     if (!pipeline.hasValue()) return false;
     pipeline_ = pipeline.value();
@@ -753,7 +827,7 @@ constexpr std::uint16_t kCubeIndices[] = {
     16, 18, 17, 18, 16, 19, 20, 21, 22, 22, 23, 20,
 };
 
-constexpr const char* kGBufferVertex = R"glsl(
+[[maybe_unused]] constexpr const char* kGBufferVertex = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
@@ -772,7 +846,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kGBufferFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kGBufferFragment = R"glsl(
 #version 430 core
 in vec3 vNormal;
 in vec4 vAlbedo;
@@ -784,7 +858,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kDeferredLightingFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kDeferredLightingFragment = R"glsl(
 #version 430 core
 in vec2 vUv;
 uniform sampler2D uTex;
@@ -807,7 +881,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kForwardGlassFragment = R"glsl(
+[[maybe_unused]] constexpr const char* kForwardGlassFragment = R"glsl(
 #version 430 core
 in vec4 vColor;
 out vec4 fragColor;
@@ -836,13 +910,29 @@ bool HybridRenderingScene::init(gfx::IDevice* device, platform::Window*) {
     }
     if (constants_.create(*device, 144, 4) != gfx::GfxError::None) return false;
 
-    if (!createShader(*device, gfx::ShaderStage::Vertex, kGBufferVertex, vertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kGBufferFragment, fragmentShader_) ||
-        !createShader(*device, gfx::ShaderStage::Vertex, kFullscreenVertex, deferredVertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kDeferredLightingFragment,
+    if (!createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kGBufferVertex,
+                                           kValidationGBufferVertexWgsl),
+                      vertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kGBufferFragment,
+                                           kValidationGBufferFragmentWgsl),
+                      fragmentShader_) ||
+        !createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kFullscreenVertex,
+                                           kValidationFullscreenVertexWgsl),
+                      deferredVertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kDeferredLightingFragment,
+                                           kValidationDeferredFragmentWgsl),
                       deferredFragmentShader_) ||
-        !createShader(*device, gfx::ShaderStage::Vertex, kScreenColorVertex, transparentVertexShader_) ||
-        !createShader(*device, gfx::ShaderStage::Fragment, kForwardGlassFragment,
+        !createShader(*device, gfx::ShaderStage::Vertex,
+                      F4_VALIDATION_SHADER(kScreenColorVertex,
+                                           kValidationScreenColorVertexWgsl),
+                      transparentVertexShader_) ||
+        !createShader(*device, gfx::ShaderStage::Fragment,
+                      F4_VALIDATION_SHADER(kForwardGlassFragment,
+                                           kValidationVertexColorFragmentWgsl),
                       transparentFragmentShader_)) return false;
 
     gfx::PipelineStateDesc geometry;
@@ -854,7 +944,10 @@ bool HybridRenderingScene::init(gfx::IDevice* device, platform::Window*) {
     geometry.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x3, 0});
     geometry.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x3, 12});
     geometry.colorAttachments.push({});
-    geometry.colorAttachments.push({});
+    gfx::ColorAttachmentState normalTarget;
+    normalTarget.format = gfx::TextureFormat::RGBA16_FLOAT;
+    geometry.colorAttachments.push(normalTarget);
+    addUniform(geometry, gfx::shaderStageBit(gfx::ShaderStage::Vertex));
     auto pipeline = device->createPipeline(geometry);
     if (!pipeline.hasValue()) return false;
     geometryPipeline_ = pipeline.value();
@@ -863,6 +956,9 @@ bool HybridRenderingScene::init(gfx::IDevice* device, platform::Window*) {
     deferred.vertexShader = deferredVertexShader_;
     deferred.fragmentShader = deferredFragmentShader_;
     deferred.raster.cullMode = gfx::CullMode::None;
+    deferred.depthStencil.depthAttachmentEnable = true;
+    addSampledTexture(deferred, 0);
+    addSampledTexture(deferred, 1);
     pipeline = device->createPipeline(deferred);
     if (!pipeline.hasValue()) return false;
     deferredPipeline_ = pipeline.value();
@@ -871,6 +967,7 @@ bool HybridRenderingScene::init(gfx::IDevice* device, platform::Window*) {
     transparent.vertexShader = transparentVertexShader_;
     transparent.fragmentShader = transparentFragmentShader_;
     transparent.raster.cullMode = gfx::CullMode::None;
+    transparent.depthStencil.depthAttachmentEnable = true;
     transparent.vertexInput.bindings.push({0, sizeof(ScreenVertex), 0});
     transparent.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x2, 0});
     transparent.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x4, 8});
@@ -1066,3 +1163,5 @@ void HybridRenderingScene::renderPasses(gfx::CommandBuffer& cb, const FreeCamera
 }
 
 } // namespace f4::demo
+
+#undef F4_VALIDATION_SHADER

@@ -7,6 +7,9 @@
 #if defined(F4_PLATFORM_HAS_VULKAN)
 #include <SDL2/SDL_vulkan.h>
 #endif
+#if defined(__APPLE__)
+#include <SDL2/SDL_metal.h>
+#endif
 
 #include <cstdio>
 
@@ -16,11 +19,16 @@ namespace f4::platform {
 
 namespace {
 
-[[nodiscard]] auto toSdlFlags(const WindowDesc& desc, bool openGl, bool vulkan)
+[[nodiscard]] auto toSdlFlags(const WindowDesc& desc, bool openGl, bool vulkan, bool metal)
     -> std::uint32_t {
     std::uint32_t flags = SDL_WINDOW_RESIZABLE;
     if (vulkan) flags |= SDL_WINDOW_VULKAN;
     if (openGl) flags |= SDL_WINDOW_OPENGL;
+#if defined(__APPLE__)
+    if (metal) flags |= SDL_WINDOW_METAL | SDL_WINDOW_ALLOW_HIGHDPI;
+#else
+    (void)metal;
+#endif
     if (!desc.visible) {
         flags |= SDL_WINDOW_HIDDEN;
     }
@@ -55,7 +63,7 @@ auto Window::createInternal(const WindowDesc& desc, Api api)
         SDL_WINDOWPOS_CENTERED,
         static_cast<int>(desc.width),
         static_cast<int>(desc.height),
-        toSdlFlags(desc, api == Api::OpenGL, api == Api::Vulkan));
+        toSdlFlags(desc, api == Api::OpenGL, api == Api::Vulkan, api == Api::Metal));
     if (window == nullptr) {
         SDL_Quit();
         return WindowError::WindowCreateFailed;
@@ -72,9 +80,26 @@ auto Window::createInternal(const WindowDesc& desc, Api api)
         SDL_GL_SetSwapInterval(1); // vsync
     }
 
+    void* metalView = nullptr;
+    if (api == Api::Metal) {
+#if defined(__APPLE__)
+        metalView = SDL_Metal_CreateView(window);
+        if (metalView == nullptr) {
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return WindowError::BackendUnavailable;
+        }
+#else
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return WindowError::BackendUnavailable;
+#endif
+    }
+
     auto* w = new Window();
     w->window_ = window;
     w->glContext_ = context;
+    w->metalView_ = metalView;
     w->api_ = api;
     w->width_ = desc.width;
     w->height_ = desc.height;
@@ -98,10 +123,24 @@ auto Window::createNative(const WindowDesc& desc) -> Result<Window*, WindowError
     return createInternal(desc, Api::Native);
 }
 
+auto Window::createMetal(const WindowDesc& desc) -> Result<Window*, WindowError> {
+#if defined(__APPLE__)
+    return createInternal(desc, Api::Metal);
+#else
+    (void)desc;
+    return WindowError::BackendUnavailable;
+#endif
+}
+
 Window::~Window() {
     if (glContext_ != nullptr) {
         SDL_GL_DeleteContext(static_cast<SDL_GLContext>(glContext_));
     }
+#if defined(__APPLE__)
+    if (metalView_ != nullptr) {
+        SDL_Metal_DestroyView(static_cast<SDL_MetalView>(metalView_));
+    }
+#endif
     if (window_ != nullptr) {
         SDL_DestroyWindow(static_cast<SDL_Window*>(window_));
     }
@@ -140,6 +179,11 @@ auto Window::width() const -> std::uint32_t {
         SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
     } else
 #endif
+#if defined(__APPLE__)
+    if (api_ == Api::Metal) {
+        SDL_Metal_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
+    } else
+#endif
     {
         if (api_ == Api::OpenGL) {
             SDL_GL_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
@@ -155,6 +199,11 @@ auto Window::height() const -> std::uint32_t {
 #if defined(F4_PLATFORM_HAS_VULKAN)
     if (api_ == Api::Vulkan) {
         SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
+    } else
+#endif
+#if defined(__APPLE__)
+    if (api_ == Api::Metal) {
+        SDL_Metal_GetDrawableSize(static_cast<SDL_Window*>(window_), &w, &h);
     } else
 #endif
     {
@@ -179,6 +228,15 @@ auto Window::logicalHeight() const -> std::uint32_t {
     return h > 0 ? static_cast<std::uint32_t>(h) : height_;
 }
 auto Window::glContext() const -> void* { return glContext_; }
+
+auto Window::metalLayer() const -> void* {
+#if defined(__APPLE__)
+    if (api_ != Api::Metal || metalView_ == nullptr) return nullptr;
+    return SDL_Metal_GetLayer(static_cast<SDL_MetalView>(metalView_));
+#else
+    return nullptr;
+#endif
+}
 
 auto Window::nativeHandle() const -> void* {
 #if defined(_WIN32)

@@ -117,7 +117,7 @@ auto NullDevice::createPipeline(const PipelineStateDesc& desc) -> Result<Pipelin
     if (compute && (!desc.vertexInput.bindings.isEmpty() ||
                     !desc.vertexInput.attributes.isEmpty() ||
                     !desc.colorAttachments.isEmpty() ||
-                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+                    desc.depthStencil.usesAttachment())) {
         return GfxError::BadDescriptor;
     }
     const std::uint32_t allowedStages = compute

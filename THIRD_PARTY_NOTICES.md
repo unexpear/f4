@@ -1,9 +1,11 @@
 # Third-Party Dependency Manifest and Notices
 
-This file records every dependency declared with CMake `FetchContent`. The
-declared refs come from `src/CMakeLists.txt` and `tests/CMakeLists.txt`; resolved
-commits were read from the fetched source trees for those refs on 2026-09-02.
-Update this file whenever a dependency ref changes.
+This file records every dependency declared with CMake `FetchContent` plus the
+pinned browser toolchain/port used by the WebGPU build. The declared refs come
+from `src/CMakeLists.txt`, `tests/CMakeLists.txt`, and `CMakePresets.json`;
+resolved commits were read from the fetched source trees and installed
+toolchain metadata. Update this file whenever a dependency or toolchain pin
+changes.
 
 | Dependency | Declared ref | Resolved commit | License used | Upstream |
 |---|---|---|---|---|
@@ -17,8 +19,20 @@ Update this file whenever a dependency ref changes.
 | tinyusdz | `v0.9.1` | `a04ee0bcbd1a930e30cc40938fcee3526a6fa8eb` | Apache-2.0 | <https://github.com/lighttransport/tinyusdz> |
 | doctest | `v2.4.12` | `1da23a3e8119ec5cce4f9388e91b065e20bf06f5` | MIT | <https://github.com/doctest/doctest> |
 
-System-provided build and graphics packages are not vendored by `FetchContent`
-and are outside this source-dependency manifest.
+## Browser Toolchain Manifest
+
+These tools are downloaded outside the repository and are not vendored. The
+Emdawnwebgpu and SDL2 ports contribute C bindings, JavaScript glue, and
+platform support to the browser artifact.
+
+| Dependency | Pinned version | Resolved revision | License used | Upstream |
+|---|---|---|---|---|
+| Emscripten SDK | `6.0.9` | release `6.0.9` | MIT (selected from MIT or University of Illinois/NCSA) | <https://github.com/emscripten-core/emscripten> |
+| Emdawnwebgpu / Dawn | `v20260423.175430` | `31e25af254ab572c77054edec4946d2244e184dd` | BSD-3-Clause; generated Emscripten C shim under MIT/NCSA | <https://github.com/google/dawn> |
+| SDL2 Emscripten port | `release-2.32.10` | release archive `2.32.10` | Zlib | <https://github.com/libsdl-org/SDL> |
+
+Other system-provided build and graphics packages remain outside this source
+dependency manifest.
 
 ## MIT License Notices
 
@@ -38,6 +52,10 @@ Copyright (c) 2020 Samuli Raivio
 
 Copyright (c) 2016-2023 Viktor Kirilov
 
+### Emscripten / browser WebGPU C shim
+
+Copyright (c) 2010-2014 Emscripten authors
+
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
 the Software without restriction, including without limitation the rights to
@@ -56,7 +74,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Zlib License Notice
+## Zlib License Notices
+
+### zlib
 
 Copyright (C) 1995-2022 Jean-loup Gailly and Mark Adler
 
@@ -79,6 +99,26 @@ subject to the following restrictions:
 Jean-loup Gailly, `jloup@gzip.org`
 
 Mark Adler, `madler@alumni.caltech.edu`
+
+### SDL2
+
+Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+
+This software is provided 'as-is', without any express or implied warranty. In
+no event will the authors be held liable for any damages arising from the use
+of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it freely,
+subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not claim
+   that you wrote the original software. If you use this software in a product,
+   an acknowledgment in the product documentation would be appreciated but is
+   not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
 
 ## BSD-3-Clause License Notices
 
@@ -118,6 +158,10 @@ Industrial Light & Magic, ILM and the Bulb and Gear design logo are all
 registered trademarks or service marks of Lucasfilm Ltd.
 
 Copyright 2009-2015 Sony Pictures Imageworks Inc. All rights reserved.
+
+### Dawn / Emdawnwebgpu
+
+Copyright 2017-2025 The Dawn & Tint Authors
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

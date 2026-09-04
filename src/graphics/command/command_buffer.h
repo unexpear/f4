@@ -17,7 +17,7 @@ using containers::Array;
 // ---------------------------------------------------------------------------
 // CommandBuffer — record-only by construction. The engine NEVER talks to the
 // device directly; it records commands here, then IDevice::submit replays them
-// (immediately on a GL backend, deferred on Vulkan/DX12). See plan §3.
+// (immediately on GL and encoded on Vulkan/DX12/Metal/WebGPU). See plan §3.
 // ---------------------------------------------------------------------------
 
 enum class CommandKind : std::uint8_t {

@@ -3,12 +3,6 @@ include(FetchContent)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 
-# Backend compiled into this build. 'null' is a software RHI device with no
-# window/GPU dependency (the M6 headless workhorse and conformance reference);
-# opengl/vulkan/dx12 activate in M7/M9/M10.
-set(F4_GRAPHICS_BACKEND "null" CACHE STRING "RHI backend: null|opengl|vulkan|dx12")
-set_property(CACHE F4_GRAPHICS_BACKEND PROPERTY STRINGS null opengl vulkan dx12)
-
 FetchContent_Declare(stb
     SYSTEM
     GIT_REPOSITORY https://github.com/nothings/stb.git
@@ -449,3 +443,193 @@ elseif(F4_GRAPHICS_BACKEND STREQUAL "dx12")
 endif()
 set(F4_GRAPHICS_HAS_DX12 ${F4_GRAPHICS_HAS_DX12} PARENT_SCOPE)
 set(F4_GRAPHICS_HAS_DX12_WINDOW ${F4_GRAPHICS_HAS_DX12_WINDOW} PARENT_SCOPE)
+
+# --- Native Metal backend (M17) ---------------------------------------------
+set(F4_GRAPHICS_HAS_METAL OFF)
+set(F4_GRAPHICS_HAS_METAL_WINDOW OFF)
+if(APPLE)
+    if(NOT TARGET f4_platform)
+        message(FATAL_ERROR "The Metal backend requires SDL2 and f4_platform")
+    endif()
+    find_library(F4_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(F4_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+    set(F4_GRAPHICS_HAS_METAL ON)
+    set(F4_GRAPHICS_HAS_METAL_WINDOW ON)
+    target_sources(f4_graphics PRIVATE backends/metal/metal_device.mm)
+    target_compile_options(f4_graphics PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+    target_compile_definitions(f4_graphics PUBLIC
+        F4_GRAPHICS_HAS_METAL=1 F4_GRAPHICS_HAS_METAL_WINDOW=1)
+    target_link_libraries(f4_graphics PRIVATE
+        f4_platform ${F4_METAL_FRAMEWORK} ${F4_QUARTZCORE_FRAMEWORK})
+
+    include(${CMAKE_SOURCE_DIR}/cmake/MetalShaders.cmake)
+    set(F4_PBR_METAL_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/pbr-metal-shaders")
+    set(F4_PBR_METAL_VERTEX "${F4_PBR_METAL_SHADER_DIR}/pbr.vert.metallib")
+    set(F4_PBR_METAL_INSTANCED_VERTEX
+        "${F4_PBR_METAL_SHADER_DIR}/pbr_instanced.vert.metallib")
+    set(F4_PBR_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/pbr.frag.metallib")
+    set(F4_SHADOW_METAL_VERTEX "${F4_PBR_METAL_SHADER_DIR}/shadow.vert.metallib")
+    set(F4_SHADOW_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/shadow.frag.metallib")
+    f4_compile_metallib("${F4_PBR_METAL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_metal.vert.metal")
+    f4_compile_metallib("${F4_PBR_METAL_INSTANCED_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_instanced_metal.vert.metal")
+    f4_compile_metallib("${F4_PBR_METAL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_metal.frag.metal")
+    f4_compile_metallib("${F4_SHADOW_METAL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_metal.vert.metal")
+    f4_compile_metallib("${F4_SHADOW_METAL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_metal.frag.metal")
+    add_custom_target(f4_pbr_metal_shaders DEPENDS
+        "${F4_PBR_METAL_VERTEX}" "${F4_PBR_METAL_INSTANCED_VERTEX}"
+        "${F4_PBR_METAL_FRAGMENT}" "${F4_SHADOW_METAL_VERTEX}"
+        "${F4_SHADOW_METAL_FRAGMENT}")
+    add_dependencies(f4_engine f4_pbr_metal_shaders)
+    target_compile_definitions(f4_engine PRIVATE
+        F4_PBR_METAL_VERTEX="${F4_PBR_METAL_VERTEX}"
+        F4_PBR_METAL_INSTANCED_VERTEX="${F4_PBR_METAL_INSTANCED_VERTEX}"
+        F4_PBR_METAL_FRAGMENT="${F4_PBR_METAL_FRAGMENT}"
+        F4_SHADOW_METAL_VERTEX="${F4_SHADOW_METAL_VERTEX}"
+        F4_SHADOW_METAL_FRAGMENT="${F4_SHADOW_METAL_FRAGMENT}")
+
+    set(F4_METAL_APP_SHADER "${CMAKE_CURRENT_BINARY_DIR}/metal-app-shaders/triangle.metallib")
+    f4_compile_metallib("${F4_METAL_APP_SHADER}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/app/shaders/metal_triangle.metal")
+    add_custom_target(f4_metal_app_shaders DEPENDS "${F4_METAL_APP_SHADER}")
+    add_executable(f4_metal_app app/f4_metal_app.cpp)
+    add_dependencies(f4_metal_app f4_metal_app_shaders)
+    target_compile_definitions(f4_metal_app PRIVATE
+        F4_METAL_APP_SHADER="${F4_METAL_APP_SHADER}")
+    target_include_directories(f4_metal_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(f4_metal_app PRIVATE
+        f4_graphics f4_platform f4_core SDL2::SDL2)
+    f4_set_warnings(f4_metal_app)
+    f4_set_float_precision(f4_metal_app)
+    f4_enable_sanitizers(f4_metal_app)
+
+    set(F4_METAL_VALIDATION_SHADER_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/metal-validation-shaders")
+    set(F4_CUBE_METAL_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/cube.vert.metallib")
+    set(F4_CUBE_METAL_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/cube.frag.metallib")
+    set(F4_VALIDATION_METAL_CORNELL_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/cornell.vert.metallib")
+    set(F4_VALIDATION_METAL_CORNELL_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/cornell.frag.metallib")
+    set(F4_VALIDATION_METAL_DEFERRED_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/deferred.frag.metallib")
+    set(F4_VALIDATION_METAL_FULLSCREEN_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/fullscreen.vert.metallib")
+    set(F4_VALIDATION_METAL_GBUFFER_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/gbuffer.frag.metallib")
+    set(F4_VALIDATION_METAL_GBUFFER_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/gbuffer.vert.metallib")
+    set(F4_VALIDATION_METAL_MIP_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/mip.frag.metallib")
+    set(F4_VALIDATION_METAL_NORMAL_MAP_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/normal_map.frag.metallib")
+    set(F4_VALIDATION_METAL_PBR_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/pbr.frag.metallib")
+    set(F4_VALIDATION_METAL_PBR_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/pbr.vert.metallib")
+    set(F4_VALIDATION_METAL_SCREEN_COLOR_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/screen_color.vert.metallib")
+    set(F4_VALIDATION_METAL_TERRAIN_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/terrain.frag.metallib")
+    set(F4_VALIDATION_METAL_TERRAIN_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/terrain.vert.metallib")
+    set(F4_VALIDATION_METAL_VERTEX_COLOR_FRAGMENT
+        "${F4_METAL_VALIDATION_SHADER_DIR}/vertex_color.frag.metallib")
+    set(F4_VALIDATION_METAL_WORLD_COLOR_VERTEX
+        "${F4_METAL_VALIDATION_SHADER_DIR}/world_color.vert.metallib")
+
+    f4_compile_metallib("${F4_CUBE_METAL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/cube_metal.vert.metal")
+    f4_compile_metallib("${F4_CUBE_METAL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/cube_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_CORNELL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_cornell_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_CORNELL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_cornell_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_DEFERRED_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_deferred_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_FULLSCREEN_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_fullscreen_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_GBUFFER_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_gbuffer_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_GBUFFER_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_gbuffer_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_MIP_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_mip_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_NORMAL_MAP_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_normal_map_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_PBR_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_pbr_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_PBR_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_pbr_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_SCREEN_COLOR_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_screen_color_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_TERRAIN_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_terrain_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_TERRAIN_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_terrain_metal.vert.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_VERTEX_COLOR_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_vertex_color_metal.frag.metal")
+    f4_compile_metallib("${F4_VALIDATION_METAL_WORLD_COLOR_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/demos/shaders/validation_world_color_metal.vert.metal")
+    add_custom_target(f4_metal_validation_shaders DEPENDS
+        "${F4_CUBE_METAL_VERTEX}"
+        "${F4_CUBE_METAL_FRAGMENT}"
+        "${F4_VALIDATION_METAL_CORNELL_VERTEX}"
+        "${F4_VALIDATION_METAL_CORNELL_FRAGMENT}"
+        "${F4_VALIDATION_METAL_DEFERRED_FRAGMENT}"
+        "${F4_VALIDATION_METAL_FULLSCREEN_VERTEX}"
+        "${F4_VALIDATION_METAL_GBUFFER_FRAGMENT}"
+        "${F4_VALIDATION_METAL_GBUFFER_VERTEX}"
+        "${F4_VALIDATION_METAL_MIP_FRAGMENT}"
+        "${F4_VALIDATION_METAL_NORMAL_MAP_FRAGMENT}"
+        "${F4_VALIDATION_METAL_PBR_FRAGMENT}"
+        "${F4_VALIDATION_METAL_PBR_VERTEX}"
+        "${F4_VALIDATION_METAL_SCREEN_COLOR_VERTEX}"
+        "${F4_VALIDATION_METAL_TERRAIN_FRAGMENT}"
+        "${F4_VALIDATION_METAL_TERRAIN_VERTEX}"
+        "${F4_VALIDATION_METAL_VERTEX_COLOR_FRAGMENT}"
+        "${F4_VALIDATION_METAL_WORLD_COLOR_VERTEX}")
+    add_executable(f4_metal_validation_app
+        app/f4_metal_validation_app.cpp
+        demos/demo_cornell_box.cpp
+        demos/demo_cube.cpp
+        demos/demo_render_validation.cpp
+        demos/demo_terrain.cpp)
+    add_dependencies(f4_metal_validation_app f4_metal_validation_shaders)
+    target_compile_definitions(f4_metal_validation_app PRIVATE
+        F4_CUBE_METAL_VERTEX="${F4_CUBE_METAL_VERTEX}"
+        F4_CUBE_METAL_FRAGMENT="${F4_CUBE_METAL_FRAGMENT}"
+        F4_VALIDATION_METAL_CORNELL_VERTEX="${F4_VALIDATION_METAL_CORNELL_VERTEX}"
+        F4_VALIDATION_METAL_CORNELL_FRAGMENT="${F4_VALIDATION_METAL_CORNELL_FRAGMENT}"
+        F4_VALIDATION_METAL_DEFERRED_FRAGMENT="${F4_VALIDATION_METAL_DEFERRED_FRAGMENT}"
+        F4_VALIDATION_METAL_FULLSCREEN_VERTEX="${F4_VALIDATION_METAL_FULLSCREEN_VERTEX}"
+        F4_VALIDATION_METAL_GBUFFER_FRAGMENT="${F4_VALIDATION_METAL_GBUFFER_FRAGMENT}"
+        F4_VALIDATION_METAL_GBUFFER_VERTEX="${F4_VALIDATION_METAL_GBUFFER_VERTEX}"
+        F4_VALIDATION_METAL_MIP_FRAGMENT="${F4_VALIDATION_METAL_MIP_FRAGMENT}"
+        F4_VALIDATION_METAL_NORMAL_MAP_FRAGMENT="${F4_VALIDATION_METAL_NORMAL_MAP_FRAGMENT}"
+        F4_VALIDATION_METAL_PBR_FRAGMENT="${F4_VALIDATION_METAL_PBR_FRAGMENT}"
+        F4_VALIDATION_METAL_PBR_VERTEX="${F4_VALIDATION_METAL_PBR_VERTEX}"
+        F4_VALIDATION_METAL_SCREEN_COLOR_VERTEX="${F4_VALIDATION_METAL_SCREEN_COLOR_VERTEX}"
+        F4_VALIDATION_METAL_TERRAIN_FRAGMENT="${F4_VALIDATION_METAL_TERRAIN_FRAGMENT}"
+        F4_VALIDATION_METAL_TERRAIN_VERTEX="${F4_VALIDATION_METAL_TERRAIN_VERTEX}"
+        F4_VALIDATION_METAL_VERTEX_COLOR_FRAGMENT="${F4_VALIDATION_METAL_VERTEX_COLOR_FRAGMENT}"
+        F4_VALIDATION_METAL_WORLD_COLOR_VERTEX="${F4_VALIDATION_METAL_WORLD_COLOR_VERTEX}")
+    target_include_directories(f4_metal_validation_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(f4_metal_validation_app PRIVATE
+        f4_engine f4_graphics f4_platform f4_core SDL2::SDL2)
+    f4_set_warnings(f4_metal_validation_app)
+    f4_set_float_precision(f4_metal_validation_app)
+    f4_enable_sanitizers(f4_metal_validation_app)
+elseif(F4_GRAPHICS_BACKEND STREQUAL "metal")
+    message(FATAL_ERROR "F4_GRAPHICS_BACKEND=metal is only available on Apple platforms")
+endif()
+set(F4_GRAPHICS_HAS_METAL ${F4_GRAPHICS_HAS_METAL} PARENT_SCOPE)
+set(F4_GRAPHICS_HAS_METAL_WINDOW ${F4_GRAPHICS_HAS_METAL_WINDOW} PARENT_SCOPE)

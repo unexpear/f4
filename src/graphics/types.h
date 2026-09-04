@@ -15,6 +15,8 @@ enum class Backend : std::uint8_t {
     OpenGL,
     Vulkan,
     DirectX12,
+    Metal,
+    WebGPU,
 };
 
 // Coarse device capability tier (M6 only needs the minimum; backends fill in

@@ -66,13 +66,6 @@ private:
     std::uint64_t frameStartFreed_ = 0;
     HeapFrameStats frame_;
 
-    std::uint64_t totalAllocations_ = 0;
-    std::uint64_t totalFrees_ = 0;
-    std::uint64_t totalBytes_ = 0;
-    std::uint64_t totalFreed_ = 0;
-    std::uint64_t liveBytes_ = 0;
-    std::uint64_t peakLiveBytes_ = 0;
-    std::uint64_t liveGroups_ = 0;
 };
 
 // Toggles tracker hooks in heapAllocate/heapFree. Disabled by default so the

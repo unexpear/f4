@@ -1,0 +1,89 @@
+#pragma once
+
+namespace f4::web {
+
+inline constexpr char kM13NoiseWgsl[] = R"F4WGSL(
+@F4_M13_WEBGPU_WGSL@
+)F4WGSL";
+
+inline constexpr char kPbrVertexWgsl[] = R"F4WGSL(
+@F4_PBR_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kPbrInstancedVertexWgsl[] = R"F4WGSL(
+@F4_PBR_WEBGPU_INSTANCED_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kPbrFragmentWgsl[] = R"F4WGSL(
+@F4_PBR_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kShadowVertexWgsl[] = R"F4WGSL(
+@F4_SHADOW_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kShadowFragmentWgsl[] = R"F4WGSL(
+@F4_SHADOW_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationPbrVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_PBR_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationPbrFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_PBR_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationFullscreenVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_FULLSCREEN_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationMipFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_MIP_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationWorldColorVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_WORLD_COLOR_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationVertexColorFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_VERTEX_COLOR_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationScreenColorVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_SCREEN_COLOR_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationNormalMapFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_NORMAL_MAP_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationGBufferVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_GBUFFER_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationGBufferFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_GBUFFER_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationDeferredFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_DEFERRED_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationCornellVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_CORNELL_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationCornellFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_CORNELL_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationTerrainVertexWgsl[] = R"F4WGSL(
+@F4_VALIDATION_TERRAIN_WEBGPU_VERTEX_WGSL@
+)F4WGSL";
+
+inline constexpr char kValidationTerrainFragmentWgsl[] = R"F4WGSL(
+@F4_VALIDATION_TERRAIN_WEBGPU_FRAGMENT_WGSL@
+)F4WGSL";
+
+} // namespace f4::web

@@ -1,7 +1,9 @@
 #include "demos/demo_cornell_box.h"
 
 #include <cstring>
+#include <fstream>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "core/math/mat4.h"
@@ -10,6 +12,15 @@
 #include "graphics/command/command_buffer.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
+#ifdef F4_GRAPHICS_BACKEND_metal
+#include "demos/metal_demo_shaders.h"
+#define F4_CORNELL_SHADER(glslName, wgslName) f4::metal::wgslName
+#elif defined(F4_GRAPHICS_BACKEND_webgpu)
+#include "webgpu_shaders.h"
+#define F4_CORNELL_SHADER(glslName, wgslName) f4::web::wgslName
+#else
+#define F4_CORNELL_SHADER(glslName, wgslName) glslName
+#endif
 
 namespace f4::demo {
 namespace {
@@ -20,7 +31,7 @@ struct Vertex {
     float color[4];
 };
 
-constexpr const char* kVs = R"glsl(
+[[maybe_unused]] constexpr const char* kVs = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
@@ -43,7 +54,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kFs = R"glsl(
+[[maybe_unused]] constexpr const char* kFs = R"glsl(
 #version 430 core
 in vec3 vNormal;
 in vec3 vWorldPos;
@@ -139,12 +150,27 @@ bool CornellBoxScene::init(gfx::IDevice* dev, platform::Window*) {
     auto makeShader = [&](gfx::ShaderStage stage, const char* source) {
         gfx::ShaderDesc desc;
         desc.stage = stage;
+#ifdef F4_GRAPHICS_BACKEND_metal
+        std::ifstream stream(source, std::ios::binary | std::ios::ate);
+        if (!stream.good()) return dev->createShader(desc);
+        const std::streamsize size = stream.tellg();
+        if (size <= 0) return dev->createShader(desc);
+        stream.seekg(0);
+        desc.blob.resize(static_cast<std::size_t>(size));
+        stream.read(reinterpret_cast<char*>(desc.blob.data()), size);
+        if (!stream.good()) desc.blob.clear();
+#else
         desc.blob.resize(std::strlen(source));
         std::memcpy(desc.blob.data(), source, desc.blob.size());
+#endif
         return dev->createShader(desc);
     };
-    auto vertexShader = makeShader(gfx::ShaderStage::Vertex, kVs);
-    auto fragmentShader = makeShader(gfx::ShaderStage::Fragment, kFs);
+    auto vertexShader = makeShader(
+        gfx::ShaderStage::Vertex,
+        F4_CORNELL_SHADER(kVs, kValidationCornellVertexWgsl));
+    auto fragmentShader = makeShader(
+        gfx::ShaderStage::Fragment,
+        F4_CORNELL_SHADER(kFs, kValidationCornellFragmentWgsl));
     if (!vertexShader.hasValue() || !fragmentShader.hasValue()) return false;
     vs_ = vertexShader.value();
     fs_ = fragmentShader.value();
@@ -160,6 +186,13 @@ bool CornellBoxScene::init(gfx::IDevice* dev, platform::Window*) {
     pipelineDesc.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x3, 0});
     pipelineDesc.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x3, 12});
     pipelineDesc.vertexInput.attributes.push({0, 2, gfx::VertexFormat::Float32x4, 24});
+    gfx::BindGroup resources;
+    resources.slots.push({
+        0, gfx::BindingType::UniformBuffer,
+        gfx::shaderStageBit(gfx::ShaderStage::Vertex) |
+            gfx::shaderStageBit(gfx::ShaderStage::Fragment),
+        1});
+    pipelineDesc.layout.groups.push(std::move(resources));
     auto pipeline = dev->createPipeline(pipelineDesc);
     if (!pipeline.hasValue()) return false;
     pipeline_ = pipeline.value();
@@ -212,3 +245,5 @@ void CornellBoxScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
 }
 
 } // namespace f4::demo
+
+#undef F4_CORNELL_SHADER

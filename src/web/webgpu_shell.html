@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>f4 WebGPU conformance</title>
+  <style>
+    :root { color-scheme: dark; --ink: #e9f0e8; --muted: #8ea29a; --line: #31534a; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      color: var(--ink); font-family: Bahnschrift, "Arial Narrow", sans-serif;
+      background:
+        radial-gradient(circle at 18% 16%, #214c42 0, transparent 34rem),
+        linear-gradient(145deg, #07100e, #111c18 55%, #050908);
+    }
+    main { width: min(94vw, 1080px); }
+    header { display: flex; align-items: end; justify-content: space-between; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: clamp(1.4rem, 4vw, 2.7rem); letter-spacing: .04em; }
+    p { margin: 0 0 5px; color: var(--muted); font-family: Consolas, monospace; font-size: .78rem; }
+    #status { color: #e6c56d; text-align: right; }
+    canvas {
+      display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--line);
+      background: #080d0b; box-shadow: 0 26px 90px #000b, inset 0 0 0 1px #ffffff0a;
+    }
+    pre { min-height: 1.2em; margin: 12px 0 0; color: #d47767; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p>M18 / NATIVE BROWSER PATH</p><h1>WebGPU RHI</h1></div>
+      <p id="status">initializing adapter...</p>
+    </header>
+    <canvas id="canvas" width="960" height="540" tabindex="-1"></canvas>
+    <pre id="output"></pre>
+  </main>
+  <script>
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      print: function (text) { console.log(text); },
+      printErr: function (text) {
+        console.error(text);
+        document.getElementById('output').textContent += text + '\n';
+      }
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

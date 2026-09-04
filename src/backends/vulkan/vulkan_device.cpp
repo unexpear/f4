@@ -1325,7 +1325,7 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     if (compute && (!desc.vertexInput.bindings.isEmpty() ||
                     !desc.vertexInput.attributes.isEmpty() ||
                     !desc.colorAttachments.isEmpty() ||
-                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+                    desc.depthStencil.usesAttachment())) {
         return GfxError::BadDescriptor;
     }
 
@@ -1540,7 +1540,7 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     rendering.colorAttachmentCount = static_cast<std::uint32_t>(colorFormats.size());
     rendering.pColorAttachmentFormats = colorFormats.data();
-    if (desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable) {
+    if (desc.depthStencil.usesAttachment()) {
         if (!isDepthFormat(desc.depthStencil.format)) {
             vkDestroyPipelineLayout(impl_->device, record.layout, nullptr);
             destroySetLayouts();

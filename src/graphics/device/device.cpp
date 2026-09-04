@@ -7,6 +7,12 @@
 #if defined(F4_GRAPHICS_BACKEND_dx12)
 #include "backends/dx12/dx12_device.h"
 #endif
+#if defined(F4_GRAPHICS_BACKEND_metal)
+#include "backends/metal/metal_device.h"
+#endif
+#if defined(F4_GRAPHICS_BACKEND_webgpu)
+#include "backends/webgpu/webgpu_device.h"
+#endif
 
 namespace f4::gfx {
 
@@ -21,6 +27,10 @@ auto createDevice() -> IDevice* {
     return createVulkanDevice();
 #elif defined(F4_GRAPHICS_BACKEND_dx12)
     return createDx12Device();
+#elif defined(F4_GRAPHICS_BACKEND_metal)
+    return createMetalDevice();
+#elif defined(F4_GRAPHICS_BACKEND_webgpu)
+    return createWebGpuDevice();
 #else
     // No backend selected in this build; nothing to instantiate.
     F4_VERIFY(false, "F4_GRAPHICS_BACKEND does not resolve to a compiled backend");

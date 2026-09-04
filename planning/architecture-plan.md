@@ -5,10 +5,15 @@ Single source of truth for engine design decisions. Reference material: [awesome
 ## 1. Goals & Constraints
 
 - Build a 3D game engine **from scratch** in C++ — custom math library, no engine frameworks.
-- Target platforms: **Windows + Linux**.
-- Graphics backends: **OpenGL, Vulkan, DirectX 12** — all three, behind one abstraction.
+- Target platforms: **Windows + Linux + macOS + Web (WebAssembly)**. Windows,
+  Linux, and Web are implemented; macOS is the remaining expansion target.
+- Graphics backends: **OpenGL, Vulkan, native DirectX 12, native Metal, and
+  browser WebGPU** behind one abstraction. DirectX 12 must remain direct
+  D3D12/DXGI, Metal must not route through MoltenVK, and WebGPU must not route
+  through WebGL.
 - No deadline. Slow, correct foundation over fast results.
-- The goal is **not** "make three APIs work." The goal is to build an **API-independent rendering model that happens to have three implementations.**
+- The goal is **not** "make five APIs work." The goal is to build an
+  **API-independent rendering model with conforming native implementations.**
 - **PRODUCT GOAL (primary):** this engine exists to ship real 3D games with
   **procedurally generated worlds** — Minecraft-style voxel terrain,
   Ark/Valheim-style streamed open worlds with biomes, and hex/grid-cell
@@ -27,7 +32,7 @@ Single source of truth for engine design decisions. Reference material: [awesome
 | Language | C++20 | Concepts/spans/constexpr; solid MSVC + GCC + Clang support |
 | Platform layer | SDL2 | Window + input, wrapped in engine-owned abstraction |
 | Testing | doctest | Header-only, fast compiles, fits template-heavy code |
-| Shaders | Per-backend native | GLSL (GL), HLSL (DX12), GLSL→SPIR-V via glslang (Vulkan) |
+| Shaders | Per-backend native | GLSL (GL), HLSL/DXIL (DX12), GLSL→SPIR-V via glslang (Vulkan), MSL/metallib (Metal), WGSL (WebGPU) |
 | ECS | Data-oriented | No `Component` base class; components are data, systems operate on them |
 | Component storage | `ComponentStorage<T>` sparse-set default | Interface swappable; semantics over layout |
 | Render graph | Declarations-only version at M8 | Before Vulkan |
@@ -77,9 +82,9 @@ Renderer ↔ backends relationship (RHI):
                 v
        Graphics Abstraction (RHI)
                 |
-     +----------+-----------+
-     v          v           v
-   OpenGL     Vulkan      DX12
+   +-------+-------+-------+-------+
+   v       v       v       v       v
+ OpenGL  Vulkan   DX12   Metal  WebGPU
 ```
 
 ## 5. Folder Layout
@@ -118,7 +123,9 @@ src/
 └── backends/
     ├── opengl/            # M7
     ├── vulkan/            # M9
-    └── dx12/              # M10
+    ├── dx12/              # M10
+    ├── metal/             # M17
+    └── webgpu/            # M18
 tests/                     # doctest suites, mirrors src/ structure
 planning/                  # this folder
 ```
@@ -126,26 +133,42 @@ planning/                  # this folder
 ## 6. Conventions (locked once, documented forever)
 
 - **Matrices:** column-major, right-handed world space.
-- **Clip space:** depth range **0..1** (D3D-style), forward-Z (near 0, far 1). One projection matrix feeds all three backends; OpenGL requires `GL_ARB_clip_control` and selects `GL_ZERO_TO_ONE` when its device is created. Reversed-Z is deferred until clear values and depth comparisons can change atomically on every backend.
+- **Clip space:** depth range **0..1** (D3D-style), forward-Z (near 0, far 1).
+  One projection matrix feeds every backend; OpenGL requires
+  `GL_ARB_clip_control` and selects `GL_ZERO_TO_ONE` when its device is created.
+  Reversed-Z is deferred until clear values and depth comparisons can change
+  atomically on every backend.
 - **Handles everywhere:** engine code never touches raw API objects or raw resource pointers — opaque handles only (`BufferHandle`, `TextureHandle`, ...).
 - Generational IDs for entities and resources (stale-handle detection).
 - Warnings-as-errors on configured compilers; sanitizers (ASan/UBSan) run wherever the toolchain provides them. MSVC ASan is active via `EnableASAN` plus a test-time DLL path prepend. MSYS2 GCC ships no sanitizer runtimes, so that preset builds without sanitizers. Linux/Clang debug and ASan+UBSan configure-build-test gates are defined in CMake presets and GitHub Actions; both were also verified locally with Clang 18 on Ubuntu 24.04.
 
 ## 7. Shader Strategy (per-backend native)
 
-Chosen trade-off: effects are maintained twice (GLSL + HLSL). Mitigations baked into milestones:
+Chosen trade-off: effects use native backend languages. The implemented desktop
+set is maintained in GLSL + HLSL; M17 adds MSL and M18 adds WGSL. Mitigations
+baked into milestones:
 
 - Identical **vertex input layouts** and **uniform block structures** across backends, enforced via shared layout-constant headers per material.
 - **Shader parity infrastructure** starts in M8. Each real backend must add the
-  same seeded float probes and reference-scene captures when it lands. OpenGL
-  and Vulkan parity is established at M9; three-backend parity remains gated on
-  M10.
+  same seeded float probes and reference-scene captures when it lands. OpenGL,
+  Vulkan, and DX12 parity is established; M17 and M18 own Metal and WebGPU
+  admission to that conformance set.
 - Escape hatch: migrating to HLSL+DXC single-source later touches only the asset pipeline — no engine changes, because M6 keeps shader sources as opaque blobs behind handles.
 - Vulkan path: GLSL → SPIR-V via glslang at build time.
 
+The M13 hash's paired-`u32` implementation is the canonical cross-backend
+algorithm, not a workaround for a 32-bit host. Host/process bitness does not
+define shader-language integer support: OpenGL exposes 64-bit shader integers
+through `GL_ARB_gpu_shader_int64`, Vulkan gates them behind the optional
+`shaderInt64` feature, HLSL adds them at Shader Model 6, Metal support varies by
+GPU family, and WGSL has only concrete `i32`/`u32` runtime integer scalars.
+Backends may add a native-`u64` fast path only after it produces the same locked
+vectors and is measurably beneficial; the paired-`u32` path remains required so
+parity does not depend on an optional capability.
+
 ## 8. Development Roadmap
 
-### Implementation audit (2026-09-02)
+### Implementation audit (2026-09-03)
 
 Status is based on code and tests in the working tree, not on historical status
 notes later in this document.
@@ -170,10 +193,12 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
 | M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
-| M13 Deterministic noise | ✅ Complete | Seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback now run equivalent GLSL/SPIR-V and HLSL/DXIL kernels on OpenGL, Vulkan, and DX12. All CPU/GPU and cross-backend probes pass the centralized float tolerance with at least a 4x margin. |
+| M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
 | M16 World streaming | ✅ Complete | Policy-aware camera rings use distance/stage-priority workers and bounded main-thread topology/publication. Versioned layout/cell/mesh results reject unloaded or edited work; sparse edits survive unload, including absent shared height neighbors. Resident voxel DDA and height sampling provide collision hooks. M16 also closes the deferred shared-resource reference contract and stores normal voxel bases in deterministic 4-bit/8-bit palettes. |
+| M17 Native Metal | ⚠ Partial | The direct Objective-C++ Metal device, SDL `CAMetalLayer`, queue/replay, resources, pipelines, metallib build rules, presentation, readback, retirement, M11/M13 shader families, 130-draw regression, locked M11 image gate, and nine-scene repeated capture runner are implemented. Windows builds/tests and host demo regressions remain clean, but M17 cannot be accepted until Apple Clang compiles the Objective-C++/MSL paths and Metal-capable Apple hardware passes diagnostics, parity, presentation/resize, and visual review of all 27 captures. |
+| M18 Browser WebGPU | ✅ Complete | Emscripten 6.0.9 and Emdawnwebgpu provide a browser-native WebGPU RHI with asynchronous setup/pipeline admission, device-loss reporting, negotiated limits/features/formats, canvas resize/presentation, complete resource/binding/render/compute command paths, readback, and deferred reclamation. Native WGSL covers M11, M13, Cornell, all six focused rendering validations, and terrain. Chromium gates zero errors, 130 draws, indexed-strip format conformance, M13 CPU/GPU parity, byte-exact M11 full-frame parity, resize stability, and three identical captures from each of the seven validation scenes plus terrain; every capture was visually inspected. |
 
 ### Milestone 0 — Infrastructure ✅
 - `git init`; CMake presets (MSVC + GCC/Clang); warnings-as-errors
@@ -639,9 +664,57 @@ GCC Debug/Release, MSVC Debug/Release/ASan, and Linux Clang Debug/ASan+UBSan
 pass all six CTest targets. The 20-scene OpenGL bench completed 60 inspected captures
 without missing/blinking faces or regressions in the seven validation scenes.
 
+### Milestone 17 — Native Metal Backend
+
+1. Add macOS Apple Clang Debug/Release presets and CI on Apple hardware. The
+   milestone cannot be marked complete from a cross-compile-only or non-Apple
+   validation run.
+2. Isolate Objective-C++ below the RHI. Create an SDL Metal view, bind its
+   `CAMetalLayer` to a native `MTLDevice`, and implement drawable resize/present
+   without leaking Cocoa or Metal types above `src/backends/metal`.
+3. Implement native command queues/buffers, frames in flight, buffers, textures,
+   samplers, render targets, graphics and compute pipelines, resource bindings,
+   barriers/synchronization, readback, and deferred resource retirement.
+4. Compile MSL to a metallib as a build artifact. Port the M11 material/shadow
+   contract and M13 paired-`u32` compute kernel without changing RHI semantics.
+5. Require clean Metal diagnostics, focused resource/pixel/stability tests, the
+   130-draw regression, M11 full-frame comparison, M13 CPU/GPU and cross-backend
+   probes, and repeated demo captures inspected for missing or blinking faces,
+   alpha-order faults, normal-map inversion, moire, and z-fighting.
+
+Implementation is in progress as of the 2026-09-03 audit. Apple Clang
+Debug/Release presets and CI build the native Objective-C++ backend and MSL
+libraries. A manually dispatched Metal-capable Apple runner is the acceptance
+gate: it enables Metal API/shader validation, runs focused resource, 130-draw,
+resize/present, M11 locked-image, and M13 CPU/GPU tests, then produces three
+stability captures each for the cube, Cornell box, PBR sphere grid, mipmapping,
+z-fighting, alpha order, normal-map orientation, hybrid rendering, and terrain.
+The implementation and non-Metal regressions have been checked on Windows, but
+none of the Apple-only results are claimed until that runner executes cleanly
+and all 27 captures are visually inspected.
+
+### Milestone 18 — Browser WebGPU Backend ✅
+
+1. Add an Emscripten/WebAssembly preset and browser application. Use
+   Emdawnwebgpu's C API over the browser's WebGPU implementation; WebGL is not an
+   acceptable fallback for this backend.
+2. Integrate the browser event loop plus asynchronous adapter/device creation,
+   device-loss handling, canvas configuration, resize, and presentation behind
+   the existing synchronous RHI-facing ownership model.
+3. Implement buffers, textures, samplers, bind groups, render and compute
+   pipelines, render/compute passes, copies/readback, limit negotiation, and
+   deferred destruction without backend types leaking upward.
+4. Maintain WGSL shaders as a native family. M13 must use the canonical
+   paired-`u32` mixer because WGSL has no concrete runtime `u64` scalar.
+5. Require zero uncaptured WebGPU errors, focused resource/pixel/stability tests,
+   the no-fixed-draw-ceiling regression, M11 full-frame comparison, M13 CPU/GPU
+   and cross-backend probes, and automated repeated captures of every validation
+   and terrain demo with visual inspection.
+
 Recommended interleave: M13 right after M4 (no renderer required), M14 after
 M5 (resources), M15 as soon as M7 draws its first mesh, M16 alongside M12.
-The renderer track stays exactly as written above.
+M17 and M18 extend the renderer track only after the original three-backend RHI
+contract is locked, so they conform to it instead of reshaping it around one API.
 
 ## 9. Key References
 
@@ -664,6 +737,10 @@ The renderer track stays exactly as written above.
 | Light transport foundations | *Physically Based Rendering: From Theory to Implementation* — Pharr/Jakob/Humphreys (offline but the physics our real-time approximations approximate) |
 | Lighting pipelines | Forward vs Deferred vs Forward+ comparisons (3DGEP); Forward+ paper; 2048 point lights @60fps — **mandatory reading before M6 device design / M8 pipeline choice** |
 | Vulkan | Writing an Efficient Vulkan Renderer (zeux.io); BansheeEngine Vulkan blog/code |
+| DirectX 12 | [Microsoft Direct3D 12 programming guide](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide) and [HLSL scalar types](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-scalar) |
+| Metal | [Apple Metal resources and specifications](https://developer.apple.com/metal/resources/) and [SDL Metal view contract](https://wiki.libsdl.org/SDL2/SDL_Metal_CreateView) |
+| WebGPU | [W3C WGSL specification](https://www.w3.org/TR/WGSL/) and [Emscripten WebGPU support](https://emscripten.org/docs/porting/multimedia_and_graphics/WebGPU-support.html) |
+| Portable shader integers | [OpenGL `ARB_gpu_shader_int64`](https://registry.khronos.org/OpenGL/extensions/ARB/ARB_gpu_shader_int64.txt), [Vulkan `shaderInt64`](https://registry.khronos.org/vulkan/specs/latest/man/html/VkPhysicalDeviceFeatures.html), and [Apple Metal feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf) |
 | Optimization | Fast Hierarchical Culling (Cesium); Frostbite compute pipeline; Agner's optimization resources |
 | Physics (later) | Introduction to Networked Physics (Gaffer on Games); Unified Particle Physics preprint |
 | Code study | BansheeEngine (C++14/Vulkan), Tiny Renderers, EntityX |
@@ -872,12 +949,44 @@ and ASan+UBSan gates also pass. A fresh 60-frame OpenGL demo capture review
 found no missing or blinking faces and no regressions in the seven validation
 scenes.
 
+M18 completed on 2026-09-03. The Emscripten 6.0.9 preset
+uses Emdawnwebgpu's C API over `navigator.gpu`; there is no WebGL fallback. The
+browser RHI covers adapter/device/canvas setup, negotiated limit
+checks, buffers, textures, samplers, shaders, explicit bind-group and pipeline
+layouts, render/compute passes, storage dispatch/readback, and animation-frame
+presentation. The production M11 standard, instanced, fragment, and shadow WGSL
+modules are selected by `MaterialCache`; shader diagnostics and asynchronous
+pipeline completion are checked before handles are admitted. The device also
+requires `float32-filterable`, matching M11's filtered RGBA32F environment-map
+contract instead of deferring an unsupported-format error until drawing, and
+negotiates depth-clip-control when available. Indexed triangle strips pin their
+primitive-restart index format at pipeline creation and reject mismatched index
+bindings before native encoding. Its
+Chromium CTest gate attaches diagnostics before navigation, requires zero
+console/runtime/WebGPU errors, verifies the full 36-value M13 paired-`u32`
+CPU/GPU vector, proves the WebGPU deferred-reclamation contract by destroying a
+submitted input immediately, and executes 130 resource-bound indexed PBR-cube
+draws per frame. It then forces depth-backed canvas target recreation, audits
+the visible cube for nonblank coverage, bounds, and color diversity, and
+requires three byte-identical post-resize captures. The real `Renderer::render()`
+M11 fixture matches the locked native image byte-for-byte in Chromium. Cornell,
+PBR spheres, mipmapping, z-fighting, alpha order, normal-map orientation, hybrid
+deferred-opaque/forward-transparent composition, and the voxel/height/hex terrain
+gallery each pass three-frame stability and pixel-diversity gates; all captures
+were visually inspected with no missing or blinking faces.
+
 ### Current next work (2026-09-03 audit)
 
-1. Profile representative dense and occluded scenes before choosing an M12
-   occlusion strategy; add occlusion only with a measured acceptance threshold.
-2. Continue M12's multithreaded command recording, SIMD paths, render-graph
-   scheduling, and async compute only where profiling demonstrates value.
+1. Run the M17 Apple Clang Debug/Release CI jobs and fix any native
+   Objective-C++ or MSL compiler findings; the Windows host cannot validate
+   those toolchains.
+2. Dispatch the Metal-hardware acceptance job and admit M17 only after clean API
+   and shader diagnostics, swapchain resize/presentation, the locked M11
+   full-frame gate, M13 arithmetic parity, and visual inspection of all 27
+   repeated captures.
+3. Resume the remaining M12 profiling, occlusion, multithreaded recording, SIMD,
+   render-graph scheduling, and async-compute work after backend conformance is
+   closed, unless profiling identifies a release blocker first.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 

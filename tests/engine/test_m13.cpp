@@ -24,6 +24,9 @@
 #if defined(F4_M13_DX12_COMPUTE_DXIL)
 #include "backends/dx12/dx12_device.h"
 #endif
+#if defined(F4_M13_METAL_COMPUTE)
+#include "backends/metal/metal_device.h"
+#endif
 
 using namespace f4;
 
@@ -190,6 +193,20 @@ TEST_CASE("M13: DX12 compute noise matches the CPU contract") {
     const NoiseValues values = runNoiseCompute(
         *device, loadShaderFile(F4_M13_DX12_COMPUTE_DXIL, gfx::ShaderStage::Compute));
     checkCpuParity("DX12", values);
+    device->waitIdle();
+    CHECK(device->validationErrorCount() == 0);
+    gfx::deleteDevice(device);
+}
+#endif
+
+#if defined(F4_M13_METAL_COMPUTE)
+TEST_CASE("Metal hardware: M13 compute noise matches the CPU contract") {
+    gfx::IDevice* base = gfx::createMetalDevice();
+    REQUIRE(base != nullptr);
+    auto* device = static_cast<gfx::MetalDevice*>(base);
+    const NoiseValues values = runNoiseCompute(
+        *device, loadShaderFile(F4_M13_METAL_COMPUTE, gfx::ShaderStage::Compute));
+    checkCpuParity("Metal", values);
     device->waitIdle();
     CHECK(device->validationErrorCount() == 0);
     gfx::deleteDevice(device);

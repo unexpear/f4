@@ -1,8 +1,14 @@
 #include "demos/demo_cube.h"
 
 #include <cstring>
+#ifdef F4_GRAPHICS_BACKEND_metal
+#include <fstream>
+#endif
 
 #include "core/math/mat4.h"
+#ifdef F4_GRAPHICS_BACKEND_metal
+#include "demos/metal_demo_shaders.h"
+#endif
 #include "engine/rendering/shader_constants.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/pipeline/pipeline_state.h"
@@ -138,15 +144,32 @@ bool CubeScene::init(gfx::IDevice* dev, platform::Window*) {
     if (constRing_.create(*dev, 160, 16) != gfx::GfxError::None) return false;
 
     // Shaders
-    auto makeShader = [&](gfx::ShaderStage stage, const char* src) {
+    auto makeShader = [&](gfx::ShaderStage stage, const char* src)
+        -> Result<gfx::ShaderHandle, gfx::GfxError> {
         gfx::ShaderDesc d;
         d.stage = stage;
+#ifdef F4_GRAPHICS_BACKEND_metal
+        std::ifstream stream(src, std::ios::binary | std::ios::ate);
+        if (!stream.good()) return gfx::GfxError::BadDescriptor;
+        const std::streamsize size = stream.tellg();
+        if (size <= 0) return gfx::GfxError::BadDescriptor;
+        stream.seekg(0);
+        d.blob.resize(static_cast<std::size_t>(size));
+        stream.read(reinterpret_cast<char*>(d.blob.data()), size);
+        if (!stream.good()) return gfx::GfxError::BadDescriptor;
+#else
         d.blob.resize(std::strlen(src));
         std::memcpy(d.blob.data(), src, d.blob.size());
+#endif
         return dev->createShader(d);
     };
+#ifdef F4_GRAPHICS_BACKEND_metal
+    auto vs = makeShader(gfx::ShaderStage::Vertex, f4::metal::kCubeVertexMetallib);
+    auto fs = makeShader(gfx::ShaderStage::Fragment, f4::metal::kCubeFragmentMetallib);
+#else
     auto vs = makeShader(gfx::ShaderStage::Vertex, kVs);
     auto fs = makeShader(gfx::ShaderStage::Fragment, kFs);
+#endif
     if (!vs.hasValue() || !fs.hasValue()) return false;
     vs_ = vs.value();
     fs_ = fs.value();

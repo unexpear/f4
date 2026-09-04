@@ -789,7 +789,7 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
     if (compute && (!desc.vertexInput.bindings.isEmpty() ||
                     !desc.vertexInput.attributes.isEmpty() ||
                     !desc.colorAttachments.isEmpty() ||
-                    desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable)) {
+                    desc.depthStencil.usesAttachment())) {
         return GfxError::BadDescriptor;
     }
     DxShaderRecord* vertex = compute ? nullptr : impl_->shaders.get(desc.vertexShader);
@@ -991,7 +991,7 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
     pipelineDesc.DepthStencilState.StencilEnable = FALSE;
     pipelineDesc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
     pipelineDesc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
-    if (desc.depthStencil.depthTestEnable || desc.depthStencil.depthWriteEnable) {
+    if (desc.depthStencil.usesAttachment()) {
         pipelineDesc.DSVFormat = dxgiFormat(desc.depthStencil.format);
         record.depthFormat = pipelineDesc.DSVFormat;
     }

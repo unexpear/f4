@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.29)
 
 project(f4_engine VERSION 0.1.0 LANGUAGES CXX)
 
+# Objective-C++ is needed only by the native Metal backend. Keep it out of
+# non-Apple toolchains while enabling it at the highest directory that owns the
+# Objective-C++ target, as required by CMake's language model.
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 # This C++20 project does not use modules. Avoid requiring clang-scan-deps and
 # an unnecessary dependency scan on CMake 3.28+ Ninja builds.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
@@ -15,6 +22,14 @@ option(F4_BUILD_TESTS "Build unit tests" ON)
 option(F4_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(F4_ENABLE_SANITIZERS "Enable address/UB sanitizers" OFF)
 option(F4_VULKAN_VALIDATION "Enable Vulkan validation in Debug builds" ON)
+
+# One backend is selected for createDevice(). WebGPU is intentionally available
+# only through the Emscripten build path below; native desktop builds continue
+# through src/CMakeLists.txt unchanged.
+set(F4_GRAPHICS_BACKEND "null" CACHE STRING
+    "RHI backend: null|opengl|vulkan|dx12|metal|webgpu")
+set_property(CACHE F4_GRAPHICS_BACKEND PROPERTY STRINGS
+    null opengl vulkan dx12 metal webgpu)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompilerWarnings.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FloatPrecision.cmake)
@@ -31,9 +46,20 @@ if(F4_ENABLE_SANITIZERS AND MSVC)
     add_compile_options(/fsanitize=address)
 endif()
 
-add_subdirectory(src)
+if(F4_GRAPHICS_BACKEND STREQUAL "webgpu")
+    if(NOT EMSCRIPTEN)
+        message(FATAL_ERROR
+            "F4_GRAPHICS_BACKEND=webgpu requires the Emscripten toolchain")
+    endif()
+    if(F4_BUILD_TESTS)
+        enable_testing()
+    endif()
+    add_subdirectory(src/web)
+else()
+    add_subdirectory(src)
 
-if(F4_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
+    if(F4_BUILD_TESTS)
+        enable_testing()
+        add_subdirectory(tests)
+    endif()
 endif()

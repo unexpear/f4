@@ -59,6 +59,10 @@ public:
     // presentation context.
     static auto createNative(const WindowDesc& desc) -> Result<Window*, WindowError>;
 
+    // Opens an SDL_WINDOW_METAL window and creates its CAMetalLayer-backed
+    // SDL_MetalView. The public seam remains opaque to Cocoa and Metal types.
+    static auto createMetal(const WindowDesc& desc) -> Result<Window*, WindowError>;
+
     // Makes the GL context current on the calling thread.
     auto makeCurrent() -> bool;
 
@@ -77,6 +81,7 @@ public:
     [[nodiscard]] auto logicalHeight() const -> std::uint32_t;
     [[nodiscard]] auto glContext() const -> void*;
     [[nodiscard]] auto nativeHandle() const -> void*;
+    [[nodiscard]] auto metalLayer() const -> void*;
 
     // SDL Vulkan bridge using opaque arguments so Vulkan types do not leak into
     // the platform header. `surfaceOut` points to a VkSurfaceKHR.
@@ -89,13 +94,14 @@ public:
     void setVSyncEnabled(bool enabled);
 
 private:
-    enum class Api : std::uint8_t { OpenGL, Vulkan, Native };
+    enum class Api : std::uint8_t { OpenGL, Vulkan, Native, Metal };
 
     static auto createInternal(const WindowDesc& desc, Api api)
         -> Result<Window*, WindowError>;
 
     void* window_ = nullptr;   // SDL_Window*
     void* glContext_ = nullptr; // SDL_GLContext
+    void* metalView_ = nullptr; // SDL_MetalView
     Api api_ = Api::OpenGL;
     std::uint32_t width_ = 0;  // fallback size if SDL cannot report a drawable
     std::uint32_t height_ = 0;

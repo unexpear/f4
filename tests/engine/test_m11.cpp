@@ -5,6 +5,13 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#ifdef F4_GRAPHICS_HAS_METAL
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include <zlib.h>
+#endif
 
 #include "backends/null/null_device.h"
 #include "core/ecs/transform.h"
@@ -36,6 +43,15 @@
 #include "backends/dx12/dx12_device.h"
 #endif
 
+#ifdef F4_GRAPHICS_HAS_METAL
+#include "backends/metal/metal_device.h"
+#endif
+
+#if defined(F4_GRAPHICS_HAS_OPENGL) || defined(F4_GRAPHICS_HAS_VULKAN) || \
+    defined(F4_GRAPHICS_HAS_DX12) || defined(F4_GRAPHICS_HAS_METAL)
+#define F4_M11_GPU_CAPTURE 1
+#endif
+
 using namespace f4;
 
 namespace {
@@ -44,8 +60,7 @@ constexpr std::uint32_t kCaptureExtent = 64;
 using PbrCapture = std::array<std::uint8_t,
                               kCaptureExtent * kCaptureExtent * 4>;
 
-#if defined(F4_GRAPHICS_HAS_OPENGL) && defined(F4_GRAPHICS_HAS_VULKAN) && \
-    defined(F4_GRAPHICS_HAS_DX12)
+#if defined(F4_M11_GPU_CAPTURE)
 [[nodiscard]] auto centerPixel(const PbrCapture& capture)
     -> std::array<std::uint8_t, 4> {
     const std::size_t offset =
@@ -66,6 +81,61 @@ void flipCaptureRows(PbrCapture& capture) {
         }
     }
 }
+
+#ifdef F4_GRAPHICS_HAS_METAL
+[[nodiscard]] auto decodeBase64(const std::string& encoded) -> std::vector<std::byte> {
+    const auto decode = [](char character) -> int {
+        if (character >= 'A' && character <= 'Z') return character - 'A';
+        if (character >= 'a' && character <= 'z') return character - 'a' + 26;
+        if (character >= '0' && character <= '9') return character - '0' + 52;
+        if (character == '+') return 62;
+        if (character == '/') return 63;
+        return -1;
+    };
+    std::vector<std::byte> bytes;
+    std::uint32_t value = 0;
+    int availableBits = -8;
+    for (const char character : encoded) {
+        if (character == '=') break;
+        if (character == ' ' || character == '\t' || character == '\r' ||
+            character == '\n') {
+            continue;
+        }
+        const int digit = decode(character);
+        if (digit < 0) return {};
+        value = (value << 6u) | static_cast<std::uint32_t>(digit);
+        availableBits += 6;
+        if (availableBits >= 0) {
+            bytes.push_back(static_cast<std::byte>((value >> availableBits) & 0xffu));
+            availableBits -= 8;
+        }
+    }
+    return bytes;
+}
+
+[[nodiscard]] auto loadM11Reference() -> PbrCapture {
+    std::ifstream stream(F4_M11_REFERENCE_DEFLATE_BASE64,
+                         std::ios::binary | std::ios::ate);
+    REQUIRE(stream.good());
+    const std::streamsize size = stream.tellg();
+    REQUIRE(size > 0);
+    stream.seekg(0);
+    std::string encoded(static_cast<std::size_t>(size), '\0');
+    stream.read(encoded.data(), size);
+    REQUIRE(stream.good());
+    const std::vector<std::byte> compressed = decodeBase64(encoded);
+    REQUIRE_FALSE(compressed.empty());
+
+    PbrCapture reference{};
+    uLongf outputSize = reference.size();
+    const int result = uncompress(
+        reference.data(), &outputSize,
+        reinterpret_cast<const Bytef*>(compressed.data()), compressed.size());
+    REQUIRE(result == Z_OK);
+    REQUIRE(outputSize == reference.size());
+    return reference;
+}
+#endif
 
 [[nodiscard]] auto litPixelCount(const PbrCapture& capture) -> std::size_t {
     std::size_t count = 0;
@@ -153,8 +223,7 @@ void flipCaptureRows(PbrCapture& capture) {
     return texture;
 }
 
-#if defined(F4_GRAPHICS_HAS_OPENGL) && defined(F4_GRAPHICS_HAS_VULKAN) && \
-    defined(F4_GRAPHICS_HAS_DX12)
+#if defined(F4_M11_GPU_CAPTURE)
 template <typename Reader>
 [[nodiscard]] auto capturePbrFrame(gfx::IDevice& device, bool shadows, Reader&& reader,
                                    bool positionOnly = false, bool batchedPair = false)
@@ -264,6 +333,64 @@ template <typename Reader>
     CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
     CHECK(device.destroyTexture(color.value()) == gfx::GfxError::None);
     return pixels;
+}
+#endif
+
+#if defined(F4_GRAPHICS_HAS_METAL)
+TEST_CASE("Metal hardware: M11 PBR, fallback channels, and instancing are stable") {
+    gfx::IDevice* base = gfx::createMetalDevice();
+    REQUIRE(base != nullptr);
+    auto* device = static_cast<gfx::MetalDevice*>(base);
+    const auto first = capturePbrFrame(
+        *device, false, [device](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return device->readTexture(texture, 0, output);
+        });
+    const auto repeated = capturePbrFrame(
+        *device, false, [device](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return device->readTexture(texture, 0, output);
+        });
+    const auto positionOnly = capturePbrFrame(
+        *device, false, [device](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return device->readTexture(texture, 0, output);
+        }, true);
+    const auto batched = capturePbrFrame(
+        *device, false, [device](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return device->readTexture(texture, 0, output);
+        }, false, true);
+    const auto center = centerPixel(first);
+    const auto compactCenter = centerPixel(positionOnly);
+    for (std::size_t channel = 0; channel < 3; ++channel) {
+        CHECK(center[channel] > 20);
+        CHECK(compactCenter[channel] > 20);
+    }
+    CHECK(litPixelCount(batched) > 100);
+    CHECK(engine::compareShaderImagesRgba8(first, repeated, 0).matches());
+    const auto reference = loadM11Reference();
+    const auto parity = engine::compareShaderImagesRgba8(reference, first, 2);
+    INFO("Metal/native M11 mismatches=" << parity.mismatchPixelCount
+                                         << " max delta="
+                                         << static_cast<int>(parity.maxChannelDelta));
+    CHECK(parity.matches());
+    device->waitIdle();
+    CHECK(device->validationWarningCount() == 0);
+    CHECK(device->validationErrorCount() == 0);
+    gfx::deleteDevice(device);
+}
+
+TEST_CASE("Metal hardware: M11 filtered shadow pass executes cleanly") {
+    gfx::IDevice* base = gfx::createMetalDevice();
+    REQUIRE(base != nullptr);
+    auto* device = static_cast<gfx::MetalDevice*>(base);
+    const auto pixels = capturePbrFrame(
+        *device, true, [device](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return device->readTexture(texture, 0, output);
+        });
+    const auto center = centerPixel(pixels);
+    for (std::size_t channel = 0; channel < 3; ++channel) CHECK(center[channel] > 20);
+    device->waitIdle();
+    CHECK(device->validationWarningCount() == 0);
+    CHECK(device->validationErrorCount() == 0);
+    gfx::deleteDevice(device);
 }
 #endif
 

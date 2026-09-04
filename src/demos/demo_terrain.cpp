@@ -2,20 +2,31 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <span>
+#include <utility>
 
 #include "core/resources/mesh.h"
 #include "engine/world/terrain_meshing.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/shader/shader_desc.h"
+#ifdef F4_GRAPHICS_BACKEND_metal
+#include "demos/metal_demo_shaders.h"
+#define F4_TERRAIN_SHADER(glslName, wgslName) f4::metal::wgslName
+#elif defined(F4_GRAPHICS_BACKEND_webgpu)
+#include "webgpu_shaders.h"
+#define F4_TERRAIN_SHADER(glslName, wgslName) f4::web::wgslName
+#else
+#define F4_TERRAIN_SHADER(glslName, wgslName) glslName
+#endif
 
 namespace f4::demo {
 
 namespace {
 
-constexpr const char* kVs = R"glsl(
+[[maybe_unused]] constexpr const char* kVs = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
@@ -38,7 +49,7 @@ void main() {
 }
 )glsl";
 
-constexpr const char* kFs = R"glsl(
+[[maybe_unused]] constexpr const char* kFs = R"glsl(
 #version 430 core
 in vec3 vColor;
 in vec3 vNormal;
@@ -196,12 +207,27 @@ bool TerrainScene::init(gfx::IDevice* dev, platform::Window*) {
     const auto makeShader = [&](gfx::ShaderStage stage, const char* source) {
         gfx::ShaderDesc desc;
         desc.stage = stage;
+#ifdef F4_GRAPHICS_BACKEND_metal
+        std::ifstream stream(source, std::ios::binary | std::ios::ate);
+        if (!stream.good()) return dev->createShader(desc);
+        const std::streamsize size = stream.tellg();
+        if (size <= 0) return dev->createShader(desc);
+        stream.seekg(0);
+        desc.blob.resize(static_cast<std::size_t>(size));
+        stream.read(reinterpret_cast<char*>(desc.blob.data()), size);
+        if (!stream.good()) desc.blob.clear();
+#else
         desc.blob.resize(std::strlen(source));
         std::memcpy(desc.blob.data(), source, desc.blob.size());
+#endif
         return dev->createShader(desc);
     };
-    auto vertexShader = makeShader(gfx::ShaderStage::Vertex, kVs);
-    auto fragmentShader = makeShader(gfx::ShaderStage::Fragment, kFs);
+    auto vertexShader = makeShader(
+        gfx::ShaderStage::Vertex,
+        F4_TERRAIN_SHADER(kVs, kValidationTerrainVertexWgsl));
+    auto fragmentShader = makeShader(
+        gfx::ShaderStage::Fragment,
+        F4_TERRAIN_SHADER(kFs, kValidationTerrainFragmentWgsl));
     if (!vertexShader || !fragmentShader) return fail();
     vs_ = vertexShader.value();
     fs_ = fragmentShader.value();
@@ -218,6 +244,13 @@ bool TerrainScene::init(gfx::IDevice* dev, platform::Window*) {
     pipeline.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x3, 0});
     pipeline.vertexInput.attributes.push({0, 1, gfx::VertexFormat::Float32x3, 12});
     pipeline.vertexInput.attributes.push({0, 3, gfx::VertexFormat::UNorm8x4, 32});
+    gfx::BindGroup resources;
+    resources.slots.push({
+        0, gfx::BindingType::UniformBuffer,
+        gfx::shaderStageBit(gfx::ShaderStage::Vertex) |
+            gfx::shaderStageBit(gfx::ShaderStage::Fragment),
+        1});
+    pipeline.layout.groups.push(std::move(resources));
     auto createdPipeline = dev->createPipeline(pipeline);
     if (!createdPipeline) return fail();
     pipeline_ = createdPipeline.value();
@@ -273,3 +306,5 @@ void TerrainScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
 }
 
 } // namespace f4::demo
+
+#undef F4_TERRAIN_SHADER
