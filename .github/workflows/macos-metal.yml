@@ -16,7 +16,7 @@ jobs:
         preset: [debug, release]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: brew install ninja sdl2
       - name: Configure
@@ -32,7 +32,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macOS, ARM64, metal]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: brew install ninja sdl2
       - name: Configure
