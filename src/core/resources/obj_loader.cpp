@@ -7,6 +7,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <locale>
+#include <sstream>
+#endif
+
 namespace f4::resources {
 
 // ── Line iterator ───────────────────────────────────────────────────────────
@@ -55,7 +60,14 @@ static auto parseFloat(const char*& p, const char* end) -> float {
     const char* start = p;
     while (p < end && *p != ' ' && *p != '\t' && *p != '/' && *p != '\r') ++p;
     float val = 0.0f;
+#if defined(__APPLE__)
+    // Xcode 16's libc++ does not provide the floating-point from_chars overload.
+    std::istringstream stream{std::string(start, p)};
+    stream.imbue(std::locale::classic());
+    stream >> val;
+#else
     std::from_chars(start, p, val);
+#endif
     return val;
 }
 

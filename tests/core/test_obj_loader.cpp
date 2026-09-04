@@ -43,6 +43,23 @@ TEST_CASE("OBJ: single triangle with positions only") {
     CHECK(p[7] == doctest::Approx(1.0f));
 }
 
+TEST_CASE("OBJ: decimal exponents are parsed") {
+    const char* obj =
+        "v -1.25e1 2.5E-1 3.0\n"
+        "v 0.0 0.0 0.0\n"
+        "v 1.0 0.0 0.0\n"
+        "f 1 2 3\n";
+
+    auto result = loadObj(toBytes(obj));
+    REQUIRE(result.hasValue());
+    const auto& mesh = result.value().meshes[0];
+    const auto* positions = reinterpret_cast<const float*>(
+        mesh.streams[0].data.data() + mesh.attributes[0].offsetBytes);
+    CHECK(positions[0] == doctest::Approx(-12.5f));
+    CHECK(positions[1] == doctest::Approx(0.25f));
+    CHECK(positions[2] == doctest::Approx(3.0f));
+}
+
 TEST_CASE("OBJ: triangle with positions, normals, texcoords") {
     const char* obj =
         "v 0.0 0.0 0.0\n"
