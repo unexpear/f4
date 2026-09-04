@@ -56,6 +56,7 @@ constexpr std::array<NoiseSample, kSampleCount> kSamples = {{
     {-0.001f, 0.999f, 42.25f, 0xfedcba9876543210ull},
 }};
 
+#if defined(F4_M13_GPU_COMPUTE)
 auto cpuReference() -> NoiseValues {
     NoiseValues values{};
     const noise::FbmParams fbm{};
@@ -76,7 +77,6 @@ auto cpuReference() -> NoiseValues {
     return values;
 }
 
-#if defined(F4_M13_GPU_COMPUTE)
 auto loadShaderFile(const char* path, gfx::ShaderStage stage) -> gfx::ShaderDesc {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     REQUIRE(stream.good());

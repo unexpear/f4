@@ -197,7 +197,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
 | M16 World streaming | ✅ Complete | Policy-aware camera rings use distance/stage-priority workers and bounded main-thread topology/publication. Versioned layout/cell/mesh results reject unloaded or edited work; sparse edits survive unload, including absent shared height neighbors. Resident voxel DDA and height sampling provide collision hooks. M16 also closes the deferred shared-resource reference contract and stores normal voxel bases in deterministic 4-bit/8-bit palettes. |
-| M17 Native Metal | ⚠ Partial | The direct Objective-C++ Metal device, SDL `CAMetalLayer`, queue/replay, resources, pipelines, metallib build rules, presentation, readback, retirement, M11/M13 shader families, 130-draw regression, locked M11 image gate, and nine-scene repeated capture runner are implemented. Windows builds/tests and host demo regressions remain clean, but M17 cannot be accepted until Apple Clang compiles the Objective-C++/MSL paths and Metal-capable Apple hardware passes diagnostics, parity, presentation/resize, and visual review of all 27 captures. |
+| M17 Native Metal | ⚠ Partial | The direct Objective-C++ Metal device, SDL `CAMetalLayer`, queue/replay, resources, pipelines, metallib build rules, presentation, readback, retirement, M11/M13 shader families, 130-draw regression, locked M11 image gate, and nine-scene repeated capture runner are implemented. Hosted Apple Clang Debug/Release builds and CPU/build conformance pass, but M17 cannot be accepted until Metal-capable Apple hardware passes diagnostics, parity, presentation/resize, and visual review of all 27 captures. |
 | M18 Browser WebGPU | ✅ Complete | Emscripten 6.0.9 and Emdawnwebgpu provide a browser-native WebGPU RHI with asynchronous setup/pipeline admission, device-loss reporting, negotiated limits/features/formats, canvas resize/presentation, complete resource/binding/render/compute command paths, readback, and deferred reclamation. Native WGSL covers M11, M13, Cornell, all six focused rendering validations, and terrain. Chromium gates zero errors, 130 draws, indexed-strip format conformance, M13 CPU/GPU parity, byte-exact M11 full-frame parity, resize stability, and three identical captures from each of the seven validation scenes plus terrain; every capture was visually inspected. |
 
 ### Milestone 0 — Infrastructure ✅
@@ -682,16 +682,16 @@ without missing/blinking faces or regressions in the seven validation scenes.
    probes, and repeated demo captures inspected for missing or blinking faces,
    alpha-order faults, normal-map inversion, moire, and z-fighting.
 
-Implementation is in progress as of the 2026-09-03 audit. Apple Clang
-Debug/Release presets and CI build the native Objective-C++ backend and MSL
-libraries. A manually dispatched Metal-capable Apple runner is the acceptance
-gate: it enables Metal API/shader validation, runs focused resource, 130-draw,
+Implementation is in progress as of the 2026-09-03 audit. Hosted Apple Clang
+Debug/Release CI builds the native Objective-C++ backend and MSL libraries and
+passes CPU/build conformance. A manually dispatched Metal-capable Apple runner
+is the acceptance gate: it enables Metal API/shader validation, runs focused resource, 130-draw,
 resize/present, M11 locked-image, and M13 CPU/GPU tests, then produces three
 stability captures each for the cube, Cornell box, PBR sphere grid, mipmapping,
 z-fighting, alpha order, normal-map orientation, hybrid rendering, and terrain.
 The implementation and non-Metal regressions have been checked on Windows, but
-none of the Apple-only results are claimed until that runner executes cleanly
-and all 27 captures are visually inspected.
+no hardware-only result is claimed until that runner executes cleanly and all 27
+captures are visually inspected.
 
 ### Milestone 18 — Browser WebGPU Backend ✅
 
@@ -977,9 +977,8 @@ were visually inspected with no missing or blinking faces.
 
 ### Current next work (2026-09-03 audit)
 
-1. Run the M17 Apple Clang Debug/Release CI jobs and fix any native
-   Objective-C++ or MSL compiler findings; the Windows host cannot validate
-   those toolchains.
+1. Register a Metal-capable Apple Silicon runner with the workflow's
+   `self-hosted`, `macOS`, `ARM64`, and `metal` labels.
 2. Dispatch the Metal-hardware acceptance job and admit M17 only after clean API
    and shader diagnostics, swapchain resize/presentation, the locked M11
    full-frame gate, M13 arithmetic parity, and visual inspection of all 27
