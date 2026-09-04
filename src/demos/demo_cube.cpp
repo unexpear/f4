@@ -68,6 +68,7 @@ constexpr std::uint16_t kCubeIndices[] = {
     20, 21, 22,  22, 23, 20,
 };
 
+#ifndef F4_GRAPHICS_BACKEND_metal
 constexpr const char* kVs = R"glsl(
 #version 430 core
 layout(location = 0) in vec3 aPos;
@@ -117,6 +118,7 @@ void main() {
     fragColor = vec4(color, 1.0);
 }
 )glsl";
+#endif
 
 } // namespace
 
