@@ -33,7 +33,7 @@
 using namespace f4;
 
 TEST_CASE("M8: constant ring grows past its initial per-frame capacity") {
-    gfx::IDevice* device = gfx::createDevice();
+    gfx::IDevice* device = new gfx::NullDevice();
     REQUIRE(device != nullptr);
     engine::ConstantRing ring;
     REQUIRE(ring.create(*device, 16, 2) == gfx::GfxError::None);
@@ -173,7 +173,7 @@ TEST_CASE("M8: GpuMesh translator maps mesh to GL layout") {
     mesh.attributes.push({resources::VertexSemantic::TexCoord0, resources::VertexFormat::F32_2,0,24});
     mesh.attributes.push({resources::VertexSemantic::Color0, resources::VertexFormat::UNORM8_4,0,32});
     mesh.indexFormat=resources::IndexFormat::U16; uint16_t idx[3]={0,1,2}; mesh.indices.resize(sizeof(idx)); std::memcpy(mesh.indices.data(), idx, sizeof(idx)); mesh.submeshes.push({0,3});
-    gfx::IDevice* dev = gfx::createDevice();
+    gfx::IDevice* dev = new gfx::NullDevice();
     auto res = engine::createGpuMesh(*dev, mesh);
     REQUIRE(res.hasValue());
     auto gpu = std::move(res.value());
@@ -206,7 +206,7 @@ TEST_CASE("M8: RenderQueue sorts opaque front-back transparent back-front") {
 }
 
 TEST_CASE("M8: MaterialCache dedup and pipeline creation (Null backend)") {
-    gfx::IDevice* dev = gfx::createDevice();
+    gfx::IDevice* dev = new gfx::NullDevice();
     engine::MaterialCache cache;
     engine::StandardMaterialDesc d1; d1.tint = math::Vec4(1,0,0,1);
     engine::StandardMaterialDesc d2; d2.tint = math::Vec4(0,1,0,1);
@@ -223,7 +223,7 @@ TEST_CASE("M8: MaterialCache dedup and pipeline creation (Null backend)") {
 }
 
 TEST_CASE("M8: Renderer draws via NullDevice (one triangle)") {
-    gfx::IDevice* dev = gfx::createDevice();
+    gfx::IDevice* dev = new gfx::NullDevice();
     gfx::FramebufferHandle framebuffer{};
     {
         ecs::Registry reg(16);
@@ -316,7 +316,7 @@ TEST_CASE("M8: Renderer submits more than 64 objects without dropping draws") {
 }
 
 TEST_CASE("M8: Renderer rejects use before initialization") {
-    gfx::IDevice* dev = gfx::createDevice();
+    gfx::IDevice* dev = new gfx::NullDevice();
     {
         ecs::Registry registry(1);
         engine::Renderer renderer(registry, *dev);
