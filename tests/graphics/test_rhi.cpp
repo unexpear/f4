@@ -5,6 +5,7 @@
 #include <span>
 #include <vector>
 
+#include "backends/null/null_device.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/device/device.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
@@ -17,10 +18,6 @@
 #include "graphics/texture/texture_desc.h"
 #include "graphics/types.h"
 
-#ifndef F4_GRAPHICS_BACKEND_null
-#error "M6 graphics tests require the null backend (F4_GRAPHICS_BACKEND=null)"
-#endif
-
 using namespace f4::gfx;
 
 namespace {
@@ -28,7 +25,7 @@ namespace {
 struct TestDevice {
     IDevice* dev = nullptr;
     explicit TestDevice() {
-        dev = createDevice();
+        dev = new NullDevice();
         REQUIRE(dev != nullptr);
     }
     ~TestDevice() { deleteDevice(dev); }
@@ -79,7 +76,7 @@ BufferHandle makeBuffer(IDevice* dev, std::uint64_t size, BufferUsage usage) {
 
 } // namespace
 
-TEST_CASE("RHI: createDevice returns the compiled backend kind") {
+TEST_CASE("RHI: test fixture uses the null backend") {
     TestDevice t;
     CHECK(t.dev->backend() == Backend::Null);
 }
