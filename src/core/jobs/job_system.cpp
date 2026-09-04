@@ -54,7 +54,7 @@ void JobSystem::shutdown() {
         stopping_ = true;
     }
     ready_.notify_all();
-    for (std::jthread& worker : workers_) worker.request_stop();
+    for (std::thread& worker : workers_) worker.join();
     workers_.clear();
 }
 

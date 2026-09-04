@@ -58,7 +58,7 @@ private:
     bool stopping_ = false;
     std::atomic<std::uint64_t> completed_{0};
     std::atomic<std::uint64_t> failed_{0};
-    std::vector<std::jthread> workers_;
+    std::vector<std::thread> workers_;
 };
 
 } // namespace f4::jobs
