@@ -37,6 +37,7 @@ using namespace f4;
 
 namespace {
 
+#if defined(F4_M13_GPU_COMPUTE)
 constexpr std::size_t kSampleCount = 4;
 constexpr std::size_t kValuesPerSample = 9;
 constexpr std::size_t kValueCount = kSampleCount * kValuesPerSample;
@@ -56,7 +57,6 @@ constexpr std::array<NoiseSample, kSampleCount> kSamples = {{
     {-0.001f, 0.999f, 42.25f, 0xfedcba9876543210ull},
 }};
 
-#if defined(F4_M13_GPU_COMPUTE)
 auto cpuReference() -> NoiseValues {
     NoiseValues values{};
     const noise::FbmParams fbm{};
@@ -145,7 +145,6 @@ void checkCpuParity(const char* backendName, const NoiseValues& values) {
     CHECK(report.matches());
     CHECK(report.maxAbsoluteError * 4.0f <= math::kParityTolerance.abs);
 }
-#endif
 
 [[maybe_unused]] void checkCrossBackendParity(const char* pairName,
                                               const NoiseValues& first,
@@ -158,6 +157,7 @@ void checkCpuParity(const char* backendName, const NoiseValues& values) {
     CHECK(report.matches());
     CHECK(report.maxAbsoluteError * 4.0f <= math::kParityTolerance.abs);
 }
+#endif
 
 } // namespace
 
