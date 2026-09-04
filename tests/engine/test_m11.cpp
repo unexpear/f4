@@ -47,8 +47,9 @@
 #include "backends/metal/metal_device.h"
 #endif
 
-#if defined(F4_GRAPHICS_HAS_OPENGL) || defined(F4_GRAPHICS_HAS_VULKAN) || \
-    defined(F4_GRAPHICS_HAS_DX12) || defined(F4_GRAPHICS_HAS_METAL)
+#if defined(F4_GRAPHICS_HAS_METAL) ||                                      \
+    (defined(F4_GRAPHICS_HAS_OPENGL) && defined(F4_GRAPHICS_HAS_VULKAN) && \
+     defined(F4_GRAPHICS_HAS_DX12))
 #define F4_M11_GPU_CAPTURE 1
 #endif
 

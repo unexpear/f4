@@ -28,6 +28,11 @@
 #include "backends/metal/metal_device.h"
 #endif
 
+#if defined(F4_M13_OPENGL_SHADER_SOURCE) || defined(F4_M13_VK_COMPUTE_SPV) || \
+    defined(F4_M13_DX12_COMPUTE_DXIL) || defined(F4_M13_METAL_COMPUTE)
+#define F4_M13_GPU_COMPUTE 1
+#endif
+
 using namespace f4;
 
 namespace {
@@ -71,6 +76,7 @@ auto cpuReference() -> NoiseValues {
     return values;
 }
 
+#if defined(F4_M13_GPU_COMPUTE)
 auto loadShaderFile(const char* path, gfx::ShaderStage stage) -> gfx::ShaderDesc {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     REQUIRE(stream.good());
@@ -139,6 +145,7 @@ void checkCpuParity(const char* backendName, const NoiseValues& values) {
     CHECK(report.matches());
     CHECK(report.maxAbsoluteError * 4.0f <= math::kParityTolerance.abs);
 }
+#endif
 
 [[maybe_unused]] void checkCrossBackendParity(const char* pairName,
                                               const NoiseValues& first,
