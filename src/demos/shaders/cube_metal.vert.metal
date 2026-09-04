@@ -27,7 +27,8 @@ vertex CubeVertexOutput cube_vertex(
     CubeVertexOutput output;
     const float4 worldPosition = uniforms.model * float4(input.position, 1.0f);
     output.position = uniforms.viewProj * worldPosition;
-    output.normal = float3x3(uniforms.model) * input.normal;
+    output.normal = float3x3(uniforms.model[0].xyz, uniforms.model[1].xyz,
+                             uniforms.model[2].xyz) * input.normal;
     output.worldPosition = worldPosition.xyz;
     output.albedo = float3(input.faceColor,
                            0.5f + 0.4f * sin(input.faceColor.x * 6.28f +
