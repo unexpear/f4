@@ -22,6 +22,10 @@ struct FrameStats {
     std::uint32_t frustumCulled = 0;
     std::uint32_t draws = 0;
     std::uint32_t instances = 0;
+    // Opt-in CPU/driver wall times, not GPU execution durations.
+    double mainRecordUs = 0;
+    double materialPipelineUs = 0;
+    double graphExecuteUs = 0;
 };
 
 struct PbrRenderSettings {
@@ -36,6 +40,7 @@ struct PbrRenderSettings {
     bool shadowsEnabled = true;
     bool frustumCullingEnabled = true;
     bool batchingEnabled = true;
+    bool profileTimings = false;
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -55,22 +60,30 @@ public:
 
     // Logical mesh creation — stores a copy of the mesh and creates its GpuMesh
     // immediately on the device. Returns a handle for MeshRenderer::mesh.
+    // Returns invalid on upload failure or exhaustion of the 64 live mesh slots.
     [[nodiscard]] auto createMesh(const resources::Mesh& mesh) -> resources::MeshHandle;
     void destroyMesh(resources::MeshHandle h);
 
     // Logical texture creation uploads every uncompressed mip. Materials keep
     // logical handles and never own backend handles directly.
+    // Returns invalid on upload failure or exhaustion of the 128 live texture slots.
     [[nodiscard]] auto createTexture(const resources::Texture& texture)
         -> resources::TextureHandle;
     void destroyTexture(resources::TextureHandle h);
 
-    // Material helpers delegate to MaterialCache.
+    // Material helpers delegate to MaterialCache (64 distinct live materials).
+    // createMaterial returns invalid on exhaustion; glTF import returns CapacityExceeded.
     [[nodiscard]] auto createMaterial(const StandardMaterialDesc& desc) -> resources::MaterialHandle;
     [[nodiscard]] auto createMaterialFromGltf(
         const resources::GltfMaterial& material,
         std::span<const resources::TextureHandle> textures)
         -> Result<resources::MaterialHandle, MaterialImportError>;
     [[nodiscard]] auto ensureMaterialPipeline(resources::MaterialHandle h) -> gfx::GfxError;
+    // Prepare the exact main-pass variant used by an uploaded mesh. The legacy
+    // overload above prepares only the canonical non-instanced layout.
+    [[nodiscard]] auto ensureMaterialPipeline(resources::MaterialHandle h,
+                                               resources::MeshHandle mesh, bool mirrored = false)
+        -> gfx::GfxError;
 
     [[nodiscard]] auto materialCache() -> MaterialCache& { return materials_; }
     [[nodiscard]] auto materialCache() const -> const MaterialCache& { return materials_; }
@@ -109,6 +122,7 @@ private:
     };
 
     void recordShadow(gfx::CommandBuffer& cb);
+    void recordMain(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float aspect);
     void releaseInitializationResources();
     [[nodiscard]] auto resolveTexture(resources::TextureHandle texture,
                                       gfx::TextureHandle fallback) const

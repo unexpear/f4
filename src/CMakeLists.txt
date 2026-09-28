@@ -159,6 +159,15 @@ f4_enable_sanitizers(f4_graphics)
 add_library(f4_engine STATIC
     engine/world/world_data.cpp
     engine/world/terrain_meshing.cpp
+    engine/world/terrain_queries.cpp
+    engine/world/terrain_regions.cpp
+    engine/world/terrain_boundaries.cpp
+    engine/world/terrain_boundary_walls.cpp
+    engine/world/terrain_solid.cpp
+    engine/world/boundary_replacement.cpp
+    engine/world/boundary_profile_job.cpp
+    engine/world/boundary_composition_job.cpp
+    engine/world/boundary_discovery.cpp
     engine/world/world_streaming.cpp
     engine/rendering/pbr.cpp
     engine/rendering/material.cpp
@@ -181,6 +190,20 @@ target_compile_definitions(f4_engine PRIVATE
 f4_set_warnings(f4_engine)
 f4_set_float_precision(f4_engine)
 f4_enable_sanitizers(f4_engine)
+
+# Explicit profiling target; timings are observations, not portable CTest gates.
+add_executable(f4_streaming_bench EXCLUDE_FROM_ALL app/f4_streaming_bench.cpp)
+target_link_libraries(f4_streaming_bench PRIVATE f4_engine)
+f4_set_warnings(f4_streaming_bench)
+f4_set_float_precision(f4_streaming_bench)
+f4_enable_sanitizers(f4_streaming_bench)
+
+# Portable demo state also receives NullDevice and save-codec unit coverage.
+add_library(f4_streaming_demo_state STATIC demos/streaming_demo_state.cpp demos/streaming_demo_io.cpp)
+target_link_libraries(f4_streaming_demo_state PUBLIC f4_engine)
+f4_set_warnings(f4_streaming_demo_state)
+f4_set_float_precision(f4_streaming_demo_state)
+f4_enable_sanitizers(f4_streaming_demo_state)
 
 # --- SDL platform + OpenGL backend (M7) -----------------------------------
 # The SDL window seam is shared by OpenGL and Vulkan. Epoxy is discovered

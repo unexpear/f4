@@ -920,7 +920,8 @@ auto WebGpuDevice::createPipeline(const PipelineStateDesc& desc)
     if (desc.topology == PrimitiveTopology::TriangleStrip) {
         nativeDesc.primitive.stripIndexFormat = webGpuIndexFormat(desc.stripIndexFormat);
     }
-    nativeDesc.primitive.frontFace = WGPUFrontFace_CCW;
+    nativeDesc.primitive.frontFace = desc.raster.frontClockwise ? WGPUFrontFace_CW
+                                                              : WGPUFrontFace_CCW;
     nativeDesc.primitive.cullMode = webGpuCull(desc.raster.cullMode);
     nativeDesc.primitive.unclippedDepth = desc.raster.depthClampEnable ? WGPU_TRUE : WGPU_FALSE;
     nativeDesc.fragment = &fragmentState;

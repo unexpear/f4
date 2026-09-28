@@ -1006,6 +1006,7 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 }
                 if (!computePipeline) {
                     // Cull face.
+                    glFrontFace(p->rec.desc.raster.frontClockwise ? GL_CW : GL_CCW);
                     const bool wantCull = (p->rec.desc.raster.cullMode != CullMode::None);
                     if (wantCull != impl_->glCullFace_) {
                         if (wantCull) {

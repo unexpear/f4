@@ -1,12 +1,24 @@
 #include "graphics/render_graph/render_graph.h"
 
+#include <algorithm>
+#include <limits>
+
 #include "core/assert.h"
 
 namespace f4::gfx {
 
+namespace {
+constexpr std::uint32_t noPass = std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint32_t writeAccess = ResourceAccessMask::ShaderWrite |
+    ResourceAccessMask::ColorWrite | ResourceAccessMask::DepthWrite |
+    ResourceAccessMask::TransferWrite | ResourceAccessMask::HostWrite;
+} // namespace
+
 auto RenderGraph::declareResource(ResourceDesc desc) -> ResourceId {
     const ResourceId id = static_cast<ResourceId>(resources_.size());
     resources_.push(static_cast<ResourceDesc&&>(desc));
+    compiled_ = false;
+    order_.clear();
     return id;
 }
 
@@ -31,6 +43,8 @@ auto RenderGraph::importFramebuffer(String name, FramebufferHandle framebuffer) 
 auto RenderGraph::declarePass(PassDesc desc) -> std::uint32_t {
     const std::uint32_t idx = static_cast<std::uint32_t>(passes_.size());
     passes_.push(static_cast<PassDesc&&>(desc));
+    compiled_ = false;
+    order_.clear();
     return idx;
 }
 
@@ -39,6 +53,8 @@ auto RenderGraph::clear(IDevice& dev) -> GfxError {
     if (result != GfxError::None) return result;
     resources_.clear();
     passes_.clear();
+    order_.clear();
+    compiled_ = false;
     return GfxError::None;
 }
 
@@ -111,6 +127,9 @@ auto RenderGraph::validatePasses() const -> GfxError {
                                         ResourceAccessMask::HostRead |
                                         ResourceAccessMask::HostWrite;
     for (const PassDesc& pass : passes_) {
+        for (const std::uint32_t dependency : pass.dependsOn) {
+            if (dependency >= passes_.size()) return GfxError::BadDescriptor;
+        }
         std::uint32_t framebufferWrites = 0;
         for (const ResourceId id : pass.reads) {
             if (id >= resources_.size()) {
@@ -143,6 +162,89 @@ auto RenderGraph::validatePasses() const -> GfxError {
             }
         }
     }
+    return GfxError::None;
+}
+
+auto RenderGraph::compile() -> GfxError {
+    if (compiled_) return GfxError::None;
+    order_.clear();
+    if (const GfxError error = validateResources(); error != GfxError::None) return error;
+    if (const GfxError error = validatePasses(); error != GfxError::None) return error;
+
+    struct Hazard {
+        std::uint32_t writer = noPass;
+        Array<std::uint32_t> readers;
+        TextureLayout layout = TextureLayout::Undefined;
+    };
+    Array<Hazard> hazards;
+    hazards.resize(resources_.size());
+    Array<Array<std::uint32_t>> successors;
+    successors.resize(passes_.size());
+    Array<std::size_t> incoming;
+    incoming.resize(passes_.size());
+    const auto addEdge = [&](std::uint32_t from, std::uint32_t to) {
+        successors[from].push(to);
+        ++incoming[to];
+    };
+
+    Array<std::uint8_t> uses;
+    uses.resize(resources_.size());
+    Array<ResourceId> touched;
+    const auto mark = [&](ResourceId resource, std::uint8_t use) {
+        if (uses[resource] == 0) touched.push(resource);
+        uses[resource] |= use;
+    };
+    for (std::size_t i = 0; i < passes_.size(); ++i) {
+        const auto id = static_cast<std::uint32_t>(i);
+        const PassDesc& pass = passes_[i];
+        for (const auto dependency : pass.dependsOn) addEdge(dependency, id);
+        for (const auto resource : pass.reads) mark(resource, 1);
+        for (const auto resource : pass.writes) mark(resource, 2);
+        for (const auto& access : pass.accesses) {
+            auto& hazard = hazards[access.resource];
+            const bool layoutChange = resources_[access.resource].type == ResourceType::Texture &&
+                hazard.layout != access.state.layout;
+            // Layout transitions are exclusive even when both passes only read.
+            mark(access.resource, (access.state.access & writeAccess) != 0 || layoutChange ? 2 : 1);
+            hazard.layout = access.state.layout;
+        }
+        for (const auto resource : touched) {
+            auto& hazard = hazards[resource];
+            if (hazard.writer != noPass) addEdge(hazard.writer, id);
+            if ((uses[resource] & 2) != 0) {
+                for (const auto reader : hazard.readers) addEdge(reader, id);
+                hazard.readers.clear();
+                hazard.writer = id;
+            } else {
+                hazard.readers.push(id);
+            }
+            uses[resource] = 0;
+        }
+        touched.clear();
+    }
+
+    Array<std::uint32_t> ready;
+    const auto enqueue = [&](std::uint32_t id) {
+        ready.push(id);
+        std::push_heap(ready.begin(), ready.end(), std::greater<std::uint32_t>{});
+    };
+    for (std::size_t i = 0; i < passes_.size(); ++i) {
+        if (incoming[i] == 0) enqueue(static_cast<std::uint32_t>(i));
+    }
+    Array<std::uint32_t> order;
+    order.reserve(passes_.size());
+    while (!ready.isEmpty()) {
+        std::pop_heap(ready.begin(), ready.end(), std::greater<std::uint32_t>{});
+        const auto id = ready[ready.size() - 1];
+        ready.pop();
+        order.push(id);
+        for (const auto successor : successors[id]) {
+            if (--incoming[successor] == 0) enqueue(successor);
+        }
+    }
+    if (order.size() != passes_.size()) return GfxError::BadDescriptor;
+    order_ = static_cast<Array<std::uint32_t>&&>(order);
+    compiled_ = true;
     return GfxError::None;
 }
 
@@ -293,7 +395,7 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
     if (cb.isRecording()) {
         return GfxError::BadDescriptor;
     }
-    if (const GfxError error = validatePasses(); error != GfxError::None) {
+    if (const GfxError error = compile(); error != GfxError::None) {
         return error;
     }
     if (const GfxError error = realize(dev); error != GfxError::None) {
@@ -301,10 +403,12 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
     }
     cb.begin();
     Array<ResourceState> nextStates = states_;
-    for (const PassDesc& p : passes_) {
+    for (const auto passId : order_) {
+        const PassDesc& p = passes_[passId];
         for (const PassResourceAccess& access : p.accesses) {
             const ResourceId id = access.resource;
-            if (nextStates[id] == access.state) continue;
+            // Equal layout/access masks do not eliminate a write dependency.
+            if (nextStates[id] == access.state && (access.state.access & writeAccess) == 0) continue;
             if (resources_[id].type == ResourceType::Texture) {
                 cb.textureBarrier(textures_[id], nextStates[id], access.state);
             } else if (resources_[id].type == ResourceType::Buffer) {

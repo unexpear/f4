@@ -227,7 +227,8 @@ void flipCaptureRows(PbrCapture& capture) {
 #if defined(F4_M11_GPU_CAPTURE)
 template <typename Reader>
 [[nodiscard]] auto capturePbrFrame(gfx::IDevice& device, bool shadows, Reader&& reader,
-                                   bool positionOnly = false, bool batchedPair = false)
+                                   bool positionOnly = false, bool batchedPair = false,
+                                   bool mirrorFirst = false)
     -> PbrCapture {
     constexpr std::uint32_t extent = kCaptureExtent;
     gfx::TextureDesc colorDesc;
@@ -314,6 +315,7 @@ template <typename Reader>
                 transform.position.x = index == 0 ? -0.48f : 0.48f;
                 transform.scale = {0.68f, 0.68f, 0.68f};
             }
+            if (mirrorFirst && index == 0) transform.scale.x = -transform.scale.x;
             registry.emplace<engine::MeshRenderer>(
                 object, engine::MeshRenderer{mesh, material, 0, shadows, false});
         }
@@ -321,7 +323,7 @@ template <typename Reader>
         REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) ==
                 gfx::GfxError::None);
         if (batchedPair) {
-            CHECK(renderer.stats().draws == 1);
+            CHECK(renderer.stats().draws == (mirrorFirst ? 2 : 1));
             CHECK(renderer.stats().instances == 2);
         }
         device.waitIdle();
@@ -329,6 +331,16 @@ template <typename Reader>
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
                 gfx::GfxError::None);
         if (device.backend() == gfx::Backend::OpenGL) flipCaptureRows(pixels);
+        if (batchedPair && mirrorFirst) {
+            std::array<std::uint32_t, 2> coverage{};
+            for (std::uint32_t y = 0; y < extent; ++y) {
+                for (std::uint32_t x = 0; x < extent; ++x) {
+                    if (pixels[(y * extent + x) * 4] > 20) ++coverage[x < extent / 2 ? 0 : 1];
+                }
+            }
+            CHECK(coverage[0] > 50);
+            CHECK(coverage[1] > 50);
+        }
     }
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
     CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
@@ -570,9 +582,74 @@ TEST_CASE("M11: material pipelines are specialized for the real mesh layout") {
     CHECK(fullPipeline.isValid());
     CHECK(compactPipeline != fullPipeline);
     CHECK(device.stats().pipelineCount == 2);
+    REQUIRE(cache.ensurePipeline(device, material, compact, true) == gfx::GfxError::None);
+    CHECK(cache.pipelineFor(material, compact, true) != compactPipeline);
+    REQUIRE(cache.ensurePipeline(device, material, compact, true) == gfx::GfxError::None);
+    CHECK(cache.pipelineFor(material, compact) == compactPipeline);
+    CHECK(device.stats().pipelineCount == 3);
     cache.clear(device);
     CHECK(device.stats().pipelineCount == 0);
     CHECK(device.stats().shaderCount == 0);
+}
+
+TEST_CASE("M11: renderer resource capacity fails safely and released slots recover") {
+    gfx::NullDevice device;
+    {
+        ecs::Registry registry(4);
+        engine::Renderer renderer(registry, device);
+        REQUIRE(renderer.init() == gfx::GfxError::None);
+        const auto sourceMesh = makePositionOnlyTriangle();
+        const auto sourceTexture = makeRgbaTexture(1, 1, 255, 255, 255, 255);
+        std::array<resources::MeshHandle, 64> meshes;
+        std::array<resources::TextureHandle, 128> textures;
+        std::array<resources::MaterialHandle, 64> materials;
+        for (auto& mesh : meshes) {
+            mesh = renderer.createMesh(sourceMesh);
+            REQUIRE(mesh.isValid());
+        }
+        for (auto& texture : textures) {
+            texture = renderer.createTexture(sourceTexture);
+            REQUIRE(texture.isValid());
+        }
+        for (std::size_t i = 0; i < materials.size(); ++i) {
+            engine::StandardMaterialDesc desc;
+            desc.tint.x = static_cast<float>(i) / 64.f;
+            materials[i] = renderer.createMaterial(desc);
+            REQUIRE(materials[i].isValid());
+        }
+        const auto fullStats = device.stats();
+        CHECK_FALSE(renderer.createMesh(sourceMesh).isValid());
+        CHECK_FALSE(renderer.createTexture(sourceTexture).isValid());
+        CHECK_FALSE(renderer.createMaterial({}).isValid());
+        const auto imported = renderer.createMaterialFromGltf({}, {});
+        REQUIRE(imported.hasError());
+        CHECK(imported.error() == engine::MaterialImportError::CapacityExceeded);
+        CHECK(device.stats().bufferCount == fullStats.bufferCount);
+        CHECK(device.stats().textureCount == fullStats.textureCount);
+        CHECK(device.stats().bufferBytes == fullStats.bufferBytes);
+        CHECK(renderer.materialCache().liveCount() == 64);
+        engine::StandardMaterialDesc existing;
+        existing.tint.x = 0.f;
+        CHECK(renderer.createMaterial(existing) == materials[0]);
+        renderer.destroyMesh(meshes[0]);
+        renderer.destroyTexture(textures[0]);
+        REQUIRE(renderer.materialCache().destroy(materials[0], device) == gfx::GfxError::None);
+        const auto mesh = renderer.createMesh(sourceMesh);
+        const auto texture = renderer.createTexture(sourceTexture);
+        const auto material = renderer.createMaterial({});
+        REQUIRE(mesh.isValid());
+        REQUIRE(texture.isValid());
+        REQUIRE(material.isValid());
+        CHECK(mesh.index == meshes[0].index);
+        CHECK(mesh.generation != meshes[0].generation);
+        CHECK(texture.index == textures[0].index);
+        CHECK(texture.generation != textures[0].generation);
+        CHECK(material.index == materials[0].index);
+        CHECK(material.generation != materials[0].generation);
+    }
+    CHECK(device.stats().bufferCount == 0);
+    CHECK(device.stats().textureCount == 0);
+    CHECK(device.stats().pipelineCount == 0);
 }
 
 TEST_CASE("M11: renderer owns PBR textures and rejects malformed mip chains") {
@@ -612,6 +689,71 @@ TEST_CASE("M11: renderer supplies missing PBR vertex channels") {
     CHECK_FALSE(renderer.createMesh(invalid).isValid());
 }
 
+TEST_CASE("M11: mesh-aware pipeline preparation matches normal and mirrored draws") {
+    gfx::NullDevice device;
+    ecs::Registry registry(8);
+    engine::Renderer renderer(registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    renderer.pbrSettings().shadowsEnabled = false;
+    const auto mesh = renderer.createMesh(makePositionOnlyTriangle());
+    const auto material = renderer.createMaterial({});
+    REQUIRE(mesh.isValid());
+    REQUIRE(material.isValid());
+    CHECK(renderer.ensureMaterialPipeline(material, {}) == gfx::GfxError::InvalidHandle);
+    CHECK(renderer.ensureMaterialPipeline({}, mesh) == gfx::GfxError::InvalidHandle);
+    const auto baseline = device.stats().pipelineCount;
+    device.failNextPipelineCreation(gfx::GfxError::OutOfMemory);
+    CHECK(renderer.ensureMaterialPipeline(material, mesh) == gfx::GfxError::OutOfMemory);
+    CHECK(device.stats().pipelineCount == baseline);
+    REQUIRE(renderer.ensureMaterialPipeline(material, mesh) == gfx::GfxError::None);
+    REQUIRE(renderer.ensureMaterialPipeline(material, mesh) == gfx::GfxError::None);
+    CHECK(device.stats().pipelineCount == baseline + 1);
+    REQUIRE(renderer.ensureMaterialPipeline(material, mesh, true) == gfx::GfxError::None);
+    REQUIRE(renderer.ensureMaterialPipeline(material, mesh, true) == gfx::GfxError::None);
+    CHECK(device.stats().pipelineCount == baseline + 2);
+
+    // Prepared variants outlive the representative mesh and match a later upload.
+    renderer.destroyMesh(mesh);
+    const auto replacement = renderer.createMesh(makePositionOnlyTriangle());
+    REQUIRE(replacement.isValid());
+    CHECK(renderer.ensureMaterialPipeline(material, mesh) == gfx::GfxError::InvalidHandle);
+    REQUIRE(renderer.ensureMaterialPipeline(material, replacement) == gfx::GfxError::None);
+    const auto cameraEntity = registry.create();
+    engine::Camera camera;
+    camera.eye = {0.f, 0.f, 3.f};
+    registry.emplace<engine::Camera>(cameraEntity, camera);
+    for (float scale : {1.f, -1.f}) {
+        const auto entity = registry.create();
+        auto& transform = registry.emplace<ecs::LocalTransform>(entity);
+        transform.scale = {scale, 1.f, 1.f};
+        registry.emplace<engine::MeshRenderer>(entity,
+            engine::MeshRenderer{replacement, material, 0, false, false});
+    }
+    ecs::updateWorldTransforms(registry);
+    gfx::FramebufferDesc desc;
+    desc.extent = {64, 64};
+    desc.attachments.push(gfx::AttachmentDesc{});
+    const auto target = device.createFramebuffer(desc);
+    REQUIRE(target.hasValue());
+    renderer.pbrSettings().profileTimings = true;
+    REQUIRE(renderer.render(target.value(), cameraEntity, 1.f) == gfx::GfxError::None);
+    CHECK(renderer.stats().draws == 2);
+    CHECK(device.stats().pipelineCount == baseline + 2);
+    CHECK(renderer.stats().graphExecuteUs >= renderer.stats().mainRecordUs);
+    CHECK(renderer.stats().mainRecordUs >= renderer.stats().materialPipelineUs);
+    REQUIRE(renderer.render({}, cameraEntity, 1.f) == gfx::GfxError::InvalidHandle);
+    CHECK(renderer.stats().graphExecuteUs == 0);
+    CHECK(renderer.stats().mainRecordUs == 0);
+    CHECK(renderer.stats().materialPipelineUs == 0);
+    renderer.pbrSettings().profileTimings = false;
+    REQUIRE(renderer.render(target.value(), cameraEntity, 1.f) == gfx::GfxError::None);
+    CHECK(renderer.stats().graphExecuteUs == 0);
+    CHECK(renderer.stats().mainRecordUs == 0);
+    CHECK(renderer.stats().materialPipelineUs == 0);
+    CHECK(device.stats().pipelineCount == baseline + 2);
+    CHECK(device.destroyFramebuffer(target.value()) == gfx::GfxError::None);
+}
+
 TEST_CASE("M11: shadow casters produce a graph-routed shadow and main draw") {
     gfx::NullDevice device;
     ecs::Registry registry(16);
@@ -642,6 +784,13 @@ TEST_CASE("M11: shadow casters produce a graph-routed shadow and main draw") {
     framebufferDesc.attachments.push(gfx::AttachmentDesc{});
     auto framebuffer = device.createFramebuffer(framebufferDesc);
     REQUIRE(framebuffer.hasValue());
+    SUBCASE("shadow pipeline failure survives successful main pass and resets next frame") {
+        device.failNextPipelineCreation(gfx::GfxError::OutOfMemory);
+        CHECK(renderer.render(framebuffer.value(), cameraEntity, 1.0f) ==
+              gfx::GfxError::OutOfMemory);
+        CHECK(device.stats().drawIndexedCalls == 1);
+        device.resetFrameStats();
+    }
     REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) ==
             gfx::GfxError::None);
     CHECK(device.stats().drawIndexedCalls == 2);
@@ -684,6 +833,11 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
             return glGetError() == GL_NO_ERROR ? gfx::GfxError::None
                                                : gfx::GfxError::DeviceLost;
         }, false, true);
+    const auto openGlMirrored = capturePbrFrame(
+        *openGlBase, false, [](gfx::TextureHandle, std::span<std::byte> output) {
+            glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, output.data());
+            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+        }, false, true, true);
     gfx::deleteDevice(openGlBase);
     delete window;
 
@@ -704,6 +858,10 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
                                 std::span<std::byte> output) {
             return vulkan->readTexture(texture, 0, output);
         }, false, true);
+    const auto vkMirrored = capturePbrFrame(
+        *vulkan, false, [vulkan](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return vulkan->readTexture(texture, 0, output);
+        }, false, true, true);
     CHECK(vulkan->validationWarningCount() == 0);
     CHECK(vulkan->validationErrorCount() == 0);
     gfx::deleteDevice(vulkanBase);
@@ -725,6 +883,10 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
                              std::span<std::byte> output) {
             return dx12->readTexture(texture, 0, output);
         }, false, true);
+    const auto dxMirrored = capturePbrFrame(
+        *dx12, false, [dx12](gfx::TextureHandle texture, std::span<std::byte> output) {
+            return dx12->readTexture(texture, 0, output);
+        }, false, true, true);
     CHECK(dx12->validationWarningCount() == 0);
     CHECK(dx12->validationErrorCount() == 0);
     gfx::deleteDevice(dx12Base);
@@ -768,9 +930,14 @@ TEST_CASE("M11: native PBR paths preserve front faces and fill missing vertex ch
     CHECK(litPixelCount(openGlBatched) > 100);
     CHECK(batchedGlVk.matches());
     CHECK(batchedGlDx.matches());
+    CHECK(engine::compareShaderImagesRgba8(openGlMirrored, vkMirrored, 2).matches());
+    CHECK(engine::compareShaderImagesRgba8(openGlMirrored, dxMirrored, 2).matches());
 }
 
 TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {
+    bool mirroredPair = false;
+    SUBCASE("ordinary caster") {}
+    SUBCASE("mixed mirrored casters") { mirroredPair = true; }
     auto windowResult = platform::Window::create({"M11 shadows", 64, 64, false});
     REQUIRE(windowResult.hasValue());
     platform::Window* window = windowResult.value();
@@ -783,7 +950,7 @@ TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {
             glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, output.data());
             return glGetError() == GL_NO_ERROR ? gfx::GfxError::None
                                                : gfx::GfxError::DeviceLost;
-        });
+        }, false, mirroredPair, mirroredPair);
     gfx::deleteDevice(openGlBase);
     delete window;
 
@@ -793,7 +960,7 @@ TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {
     const auto vk = capturePbrFrame(
         *vulkan, true, [vulkan](gfx::TextureHandle texture, std::span<std::byte> output) {
             return vulkan->readTexture(texture, 0, output);
-        });
+        }, false, mirroredPair, mirroredPair);
     CHECK(vulkan->validationWarningCount() == 0);
     CHECK(vulkan->validationErrorCount() == 0);
     gfx::deleteDevice(vulkanBase);
@@ -804,7 +971,7 @@ TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {
     const auto dx = capturePbrFrame(
         *dx12, true, [dx12](gfx::TextureHandle texture, std::span<std::byte> output) {
             return dx12->readTexture(texture, 0, output);
-        });
+        }, false, mirroredPair, mirroredPair);
     CHECK(dx12->validationWarningCount() == 0);
     CHECK(dx12->validationErrorCount() == 0);
     gfx::deleteDevice(dx12Base);
@@ -822,8 +989,8 @@ TEST_CASE("M11: filtered shadow pass executes cleanly on all three backends") {
     INFO("shadow DX12 center=" << static_cast<int>(dxCenter[0]) << ","
                                 << static_cast<int>(dxCenter[1]) << ","
                                 << static_cast<int>(dxCenter[2]));
-    for (std::size_t channel = 0; channel < 3; ++channel) {
-        CHECK(openGlCenter[channel] > 20);
+    if (!mirroredPair) {
+        for (std::size_t channel = 0; channel < 3; ++channel) CHECK(openGlCenter[channel] > 20);
     }
     const auto glVk = engine::compareShaderImagesRgba8(openGl, vk, 8);
     const auto glDx = engine::compareShaderImagesRgba8(openGl, dx, 2);

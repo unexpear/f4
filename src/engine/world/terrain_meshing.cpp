@@ -263,7 +263,7 @@ auto meshVoxelChunk(const VoxelCells& cells, const BlockRegistry& registry,
                                               static_cast<std::uint32_t>(z))]
                     : (options.borderFetch ? options.borderFetch(x, y, z) : 0u);
                 if (registry.find(value) == nullptr) return TerrainMeshError::UnknownBlock;
-                padded[paddedIndex(x, y, z)] = value;
+                padded[paddedIndex(x, y, z)] = options.cellOwned && !options.cellOwned(x, y, z) ? 0u : value;
             }
         }
     }
@@ -446,6 +446,7 @@ auto meshHeightChunk(const HeightTile& tile, ChunkCoord coord,
                      const HeightMeshingOptions& options)
     -> Result<MeshData, TerrainMeshError> {
     if (tile.samples.size() != kHeightSampleCount ||
+        (options.skirtEdges & 0xf0u) != 0 ||
         !std::isfinite(options.skirtDepth) || options.skirtDepth <= 0.0f ||
         (options.transitionFloor.has_value() &&
          !std::isfinite(*options.transitionFloor))) {
@@ -558,25 +559,37 @@ auto meshHeightChunk(const HeightTile& tile, ChunkCoord coord,
     std::vector<std::pair<std::uint32_t, std::uint32_t>> edge;
     edge.reserve(kHeightSamples);
     for (std::uint32_t x = 0; x < kHeightSamples; ++x) edge.emplace_back(x, 0u);
-    if (!appendSkirt(edge, {0.0f, 0.0f, -1.0f})) return TerrainMeshError::InvalidData;
+    if ((options.skirtEdges & 1u) && !appendSkirt(edge, {0.0f, 0.0f, -1.0f})) return TerrainMeshError::InvalidData;
     edge.clear();
     for (std::uint32_t z = 0; z < kHeightSamples; ++z) edge.emplace_back(kHeightQuads, z);
-    if (!appendSkirt(edge, {1.0f, 0.0f, 0.0f})) return TerrainMeshError::InvalidData;
+    if ((options.skirtEdges & 2u) && !appendSkirt(edge, {1.0f, 0.0f, 0.0f})) return TerrainMeshError::InvalidData;
     edge.clear();
     for (std::uint32_t x = kHeightSamples; x-- > 0;) edge.emplace_back(x, kHeightQuads);
-    if (!appendSkirt(edge, {0.0f, 0.0f, 1.0f})) return TerrainMeshError::InvalidData;
+    if ((options.skirtEdges & 4u) && !appendSkirt(edge, {0.0f, 0.0f, 1.0f})) return TerrainMeshError::InvalidData;
     edge.clear();
     for (std::uint32_t z = kHeightSamples; z-- > 0;) edge.emplace_back(0u, z);
-    if (!appendSkirt(edge, {-1.0f, 0.0f, 0.0f})) return TerrainMeshError::InvalidData;
+    if ((options.skirtEdges & 8u) && !appendSkirt(edge, {-1.0f, 0.0f, 0.0f})) return TerrainMeshError::InvalidData;
 
     output.surfaces.push({0, static_cast<std::uint32_t>(output.indices.size()), 0});
     return output;
+}
+
+auto hexLatticePosition(HexCornerCoord lattice, float radius) -> Result<math::Vec2, TerrainMeshError> {
+    if (!std::isfinite(radius) || radius <= 0) return TerrainMeshError::InvalidData;
+    const double x = static_cast<double>(lattice.x2) * 0.8660254037844386 * radius;
+    const double z = static_cast<double>(lattice.y2) * 0.5 * radius;
+    constexpr double limit = std::numeric_limits<float>::max();
+    if (!std::isfinite(x) || !std::isfinite(z) || std::abs(x) > limit || std::abs(z) > limit)
+        return TerrainMeshError::CoordinateOverflow;
+    return math::Vec2{static_cast<float>(x), static_cast<float>(z)};
 }
 
 auto meshHexChunk(const HexTile& tile, ChunkCoord coord,
                   const HexMeshingOptions& options)
     -> Result<MeshData, TerrainMeshError> {
     const std::uint64_t expectedWidth = static_cast<std::uint64_t>(tile.radius) * 2u + 1u;
+    const auto origin = hexChunkOrigin(coord, tile.radius, tile.layout);
+    if (!origin) return TerrainMeshError::CoordinateOverflow;
     if (expectedWidth > std::numeric_limits<std::uint32_t>::max() ||
         tile.width != expectedWidth ||
         tile.cells.size() != static_cast<std::size_t>(tile.width) * tile.width ||
@@ -612,20 +625,40 @@ auto meshHexChunk(const HexTile& tile, ChunkCoord coord,
                     static_cast<float>(lattice.x2) * sqrtThreeOverTwo * options.radius,
                     *height,
                     static_cast<float>(lattice.y2) * 0.5f * options.radius};
+                if (options.worldSpace) {
+                    const auto point = hexLatticePosition({lattice.x2 + 2LL * origin->q + origin->r,
+                                                          lattice.y2 + 3LL * origin->r}, options.radius);
+                    if (!point) return point.error();
+                    corners[cornerIndex] = {point.value().x, *height, point.value().y};
+                }
                 centerHeight += *height;
             }
             centerHeight /= 6.0f;
-            const math::Vec3 center{
+            math::Vec3 center{
                 (static_cast<float>(q) * 1.7320508075688772f +
                  static_cast<float>(r) * sqrtThreeOverTwo) * options.radius,
                 centerHeight,
                 static_cast<float>(r) * 1.5f * options.radius};
+            if (options.worldSpace) {
+                const auto point = hexLatticePosition({2LL * (origin->q + std::int64_t(q)) + origin->r + r,
+                                                      3LL * (origin->r + std::int64_t(r))}, options.radius);
+                if (!point) return point.error();
+                center.x = point.value().x; center.z = point.value().y;
+            }
             const std::uint16_t material = value.terrainType;
 
             for (std::uint32_t cornerIndex = 0; cornerIndex < 6; ++cornerIndex) {
                 const std::uint32_t next = (cornerIndex + 1u) % 6u;
+                if (options.worldSpace) {
+                    const auto a = corners[next], b = corners[cornerIndex];
+                    const double area = (double(a.z) - center.z) * (double(b.x) - center.x) -
+                        (double(a.x) - center.x) * (double(b.z) - center.z);
+                    if (area <= 0) return TerrainMeshError::CoordinateOverflow;
+                }
                 const math::Vec3 normal = math::normalized(
                     math::cross(corners[next] - center, corners[cornerIndex] - center));
+                if (options.worldSpace && (!std::isfinite(normal.x) || !std::isfinite(normal.y) ||
+                    !std::isfinite(normal.z) || normal.y <= 0)) return TerrainMeshError::CoordinateOverflow;
                 assembler.triangle(
                     material,
                     makeHexVertex(center, normal, {0.5f, 0.5f}, value.terrainType, 255),
@@ -655,8 +688,8 @@ auto meshHexChunk(const HexTile& tile, ChunkCoord coord,
                                   value.terrainType, 150));
             }
 
-            const std::int64_t globalQ64 = static_cast<std::int64_t>(coord.x) * tile.width + q;
-            const std::int64_t globalR64 = static_cast<std::int64_t>(coord.z) * tile.width + r;
+            const std::int64_t globalQ64 = static_cast<std::int64_t>(origin->q) + q;
+            const std::int64_t globalR64 = static_cast<std::int64_t>(origin->r) + r;
             if (globalQ64 < std::numeric_limits<std::int32_t>::min() ||
                 globalQ64 > std::numeric_limits<std::int32_t>::max() ||
                 globalR64 < std::numeric_limits<std::int32_t>::min() ||

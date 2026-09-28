@@ -11,6 +11,7 @@
 #include <epoxy/gl.h>
 
 #include "backends/opengl/opengl_device.h"
+#include "demos/demo_bench.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/device/device.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
@@ -28,6 +29,34 @@
 
 using namespace f4;
 using namespace f4::gfx;
+
+TEST_CASE("Demo camera: right movement and mouse deltas follow the view basis") {
+    f4::demo::FreeCamera camera;
+    camera.position = {};
+    camera.pitch = 0.f;
+    std::array<Uint8, SDL_NUM_SCANCODES> keys{};
+    keys[SDL_SCANCODE_D] = 1;
+    camera.update(1.f, keys.data());
+    CHECK(camera.position.x == doctest::Approx(camera.moveSpeed));
+    keys[SDL_SCANCODE_D] = 0;
+    keys[SDL_SCANCODE_A] = 1;
+    camera.update(1.f, keys.data());
+    CHECK(camera.position.x == doctest::Approx(0.f));
+    keys.fill(0);
+    keys[SDL_SCANCODE_W] = 1;
+    camera.update(1.f, keys.data());
+    CHECK(camera.position.z == doctest::Approx(-camera.moveSpeed));
+    keys.fill(0);
+    const float yaw = camera.yaw;
+    SDL_MouseMotionEvent motion{};
+    motion.xrel = 100;
+    motion.yrel = 100;
+    camera.update(0.f, keys.data(), &motion);
+    CHECK(camera.yaw > yaw);
+    CHECK(camera.pitch > 0.f);
+    CHECK(-std::cos(camera.yaw) > 0.f);
+    CHECK(-std::sin(camera.pitch) < 0.f);
+}
 
 namespace {
 

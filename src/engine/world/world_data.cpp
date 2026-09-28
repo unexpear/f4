@@ -4,6 +4,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <limits>
+#include <utility>
 
 #include "core/assert.h"
 #include "core/noise/noise.h"
@@ -587,14 +588,68 @@ auto hexLine(AxialCoord from, AxialCoord to) -> containers::Array<AxialCoord> {
     return output;
 }
 
+auto hexChunkOrigin(ChunkCoord coord, std::uint32_t radius, HexLayout layout)
+    -> std::optional<AxialCoord> {
+    if (radius > 2048u || (layout != HexLayout::LegacySpaced && layout != HexLayout::Tiled)) return std::nullopt;
+    const std::int64_t r = radius;
+    const std::int64_t q = layout == HexLayout::Tiled
+        ? (2 * r + 1) * coord.x + r * coord.z : (2 * r + 1) * coord.x;
+    const std::int64_t s = layout == HexLayout::Tiled
+        ? -r * coord.x + (r + 1) * coord.z : (2 * r + 1) * coord.z;
+    if (q - r < std::numeric_limits<std::int32_t>::min() || q + r > std::numeric_limits<std::int32_t>::max() ||
+        s - r < std::numeric_limits<std::int32_t>::min() || s + r > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+    return AxialCoord{static_cast<std::int32_t>(q), static_cast<std::int32_t>(s)};
+}
+
+auto hexCellAt(math::Vec3 position, float radius) -> std::optional<AxialCoord> {
+    if (!std::isfinite(radius) || radius <= 0.f || !std::isfinite(position.x) ||
+        !std::isfinite(position.y) || !std::isfinite(position.z)) return std::nullopt;
+    const double q = (0.5773502691896258 * position.x - static_cast<double>(position.z) / 3.0) / radius;
+    const double r = (2.0 / 3.0 * position.z) / radius;
+    // Leave rounding headroom before the integer conversion in roundAxial.
+    constexpr double low = static_cast<double>(std::numeric_limits<std::int32_t>::min()) + 1;
+    constexpr double high = static_cast<double>(std::numeric_limits<std::int32_t>::max()) - 1;
+    if (!std::isfinite(q) || !std::isfinite(r) || q < low || q > high || r < low || r > high) return std::nullopt;
+    return roundAxial(q, r);
+}
+
+auto hexChunkAt(AxialCoord cell, std::uint32_t radius, HexLayout layout) -> std::optional<ChunkCoord> {
+    if (radius > 2048u) return std::nullopt;
+    if (layout == HexLayout::LegacySpaced) {
+        const double width = 2.0 * radius + 1.0;
+        const auto nearest = roundAxial(cell.q / width, cell.r / width);
+        const ChunkCoord coord{nearest.q, 0, nearest.r};
+        return hexChunkOrigin(coord, radius, layout) ? std::optional<ChunkCoord>(coord) : std::nullopt;
+    }
+    if (layout != HexLayout::Tiled) return std::nullopt;
+    const double r = radius;
+    const double determinant = 3 * r * r + 3 * r + 1;
+    const auto x = static_cast<std::int64_t>(std::floor(((r + 1) * cell.q - r * cell.r) / determinant));
+    const auto z = static_cast<std::int64_t>(std::floor((r * cell.q + (2 * r + 1) * cell.r) / determinant));
+    // The inverse center lattice is fractional inside a chunk. Test bounded
+    // neighboring centers using exact integer cell ownership, not float ties.
+    for (std::int64_t dz = -1; dz <= 1; ++dz) {
+        for (std::int64_t dx = -1; dx <= 1; ++dx) {
+            if (x + dx < std::numeric_limits<std::int32_t>::min() || x + dx > std::numeric_limits<std::int32_t>::max() ||
+                z + dz < std::numeric_limits<std::int32_t>::min() || z + dz > std::numeric_limits<std::int32_t>::max()) continue;
+            const ChunkCoord coord{static_cast<std::int32_t>(x + dx), 0, static_cast<std::int32_t>(z + dz)};
+            const auto origin = hexChunkOrigin(coord, radius, layout);
+            if (origin && hexDistance(cell, *origin) <= radius) return coord;
+        }
+    }
+    return std::nullopt;
+}
+
 auto generateHexTile(std::uint64_t worldSeed, ChunkCoord coord,
                      const HexPolicyParams& params) -> HexTile {
     HexTile output;
+    const auto origin = hexChunkOrigin(coord, params.radius, params.layout);
     if (params.radius > 2048u || !std::isfinite(params.heightAmplitude) ||
-        !std::isfinite(params.frequency) || params.frequency < 0.0f) {
+        !std::isfinite(params.frequency) || params.frequency < 0.0f || !origin) {
         return output;
     }
     output.radius = params.radius;
+    output.layout = params.layout;
     output.width = params.radius * 2u + 1u;
     output.cells.resize(static_cast<std::size_t>(output.width) * output.width);
     const std::int32_t radius = static_cast<std::int32_t>(params.radius);
@@ -605,8 +660,8 @@ auto generateHexTile(std::uint64_t worldSeed, ChunkCoord coord,
             const AxialCoord cell{q, r};
             const std::optional<std::uint32_t> index = output.index(cell);
             if (!index.has_value()) continue;
-            const std::int64_t globalQ = q + static_cast<std::int64_t>(coord.x) * output.width;
-            const std::int64_t globalR = r + static_cast<std::int64_t>(coord.z) * output.width;
+            const std::int64_t globalQ = q + static_cast<std::int64_t>(origin->q);
+            const std::int64_t globalR = r + static_cast<std::int64_t>(origin->r);
             if (globalQ < std::numeric_limits<std::int32_t>::min() ||
                 globalQ > std::numeric_limits<std::int32_t>::max() ||
                 globalR < std::numeric_limits<std::int32_t>::min() ||
@@ -671,13 +726,39 @@ auto RegionMap::regionFor(std::int32_t worldX, std::int32_t worldZ) const -> Reg
 }
 
 auto RegionMap::policyAt(std::int32_t worldX, std::int32_t worldZ) const -> PolicyKind {
-    const PolicyKind* policy = regions_.find(regionFor(worldX, worldZ));
+    const PolicyKind* policy = std::as_const(*regions_).find(regionFor(worldX, worldZ));
     return policy != nullptr ? *policy : defaultPolicy_;
 }
 
-void RegionMap::set(RegionCoord coord, PolicyKind policy) { regions_.set(coord, policy); }
+auto RegionMap::operator=(const RegionMap& other) -> RegionMap& {
+    if (this != &other) {
+        regions_ = other.regions_;
+        tileExtentMeters_ = other.tileExtentMeters_;
+        defaultPolicy_ = other.defaultPolicy_;
+        ++revision_;
+    }
+    return *this;
+}
 
-auto RegionMap::erase(RegionCoord coord) -> bool { return regions_.erase(coord); }
+void RegionMap::set(RegionCoord coord, PolicyKind policy) {
+    const auto* existing = std::as_const(*regions_).find(coord);
+    if (existing != nullptr && *existing == policy) return;
+    detach();
+    regions_->set(coord, policy);
+    ++revision_;
+}
+
+auto RegionMap::erase(RegionCoord coord) -> bool {
+    if (!std::as_const(*regions_).contains(coord)) return false;
+    detach();
+    regions_->erase(coord);
+    ++revision_;
+    return true;
+}
+
+void RegionMap::detach() {
+    if (regions_.use_count() != 1) regions_ = std::make_shared<Regions>(*regions_);
+}
 
 ChunkStore::ChunkStore(std::size_t capacity) : chunks_(capacity) {
     byCoord_.reserve(capacity);
@@ -822,6 +903,10 @@ auto ChunkStore::publishGenerated(ChunkHandle handle,
         chunk->policy != request.policy || chunk->params != request.params) {
         return false;
     }
+    if (request.policy == PolicyKind::Hex) {
+        const auto& tile = std::get<HexTile>(generated);
+        if (tile.radius != request.params.hex.radius || tile.layout != request.params.hex.layout) return false;
+    }
     chunk->base = std::move(generated);
     chunk->state = ChunkState::CellsReady;
     chunk->dirty = {false, true, true};
@@ -862,17 +947,20 @@ auto ChunkStore::regenerate(ChunkHandle handle) -> bool {
     return generate(handle);
 }
 
+auto validHeightSample(const HeightSample& sample) -> bool {
+    const auto sum = static_cast<std::uint32_t>(sample.materialWeights[0]) +
+                     sample.materialWeights[1] + sample.materialWeights[2] +
+                     sample.materialWeights[3];
+    return std::isfinite(sample.height) && sum == 255;
+}
+
 auto ChunkStore::validCell(const ChunkRecord& chunk, std::uint32_t index,
                            const CellValue& value) const -> bool {
     if (value.kind != chunk.policy) return false;
     switch (chunk.policy) {
     case PolicyKind::Voxel: return index < kVoxelCellCount;
     case PolicyKind::Height: {
-        if (index >= kHeightSampleCount) return false;
-        const auto sum = static_cast<std::uint32_t>(value.height.materialWeights[0]) +
-                         value.height.materialWeights[1] + value.height.materialWeights[2] +
-                         value.height.materialWeights[3];
-        return std::isfinite(value.height.height) && sum == 255;
+        return index < kHeightSampleCount && validHeightSample(value.height);
     }
     case PolicyKind::Hex: {
         const HexTile* tile = std::get_if<HexTile>(&chunk.base);
@@ -966,7 +1054,26 @@ auto ChunkStore::edit(ChunkHandle handle, std::uint32_t index, const CellValue& 
                                    static_cast<std::int32_t>(tile->radius);
             for (const AxialCoord direction : kHexDirections) {
                 if (!tile->contains({q + direction.q, r + direction.r})) {
-                    addNeighbor(direction.q, 0, direction.r);
+                    if (tile->layout == HexLayout::LegacySpaced) {
+                        addNeighbor(direction.q, 0, direction.r);
+                    } else {
+                        const auto origin = hexChunkOrigin(chunk->coord, tile->radius, tile->layout);
+                        if (!origin) return false;
+                        const std::int64_t globalQ = static_cast<std::int64_t>(origin->q) + q + direction.q;
+                        const std::int64_t globalR = static_cast<std::int64_t>(origin->r) + r + direction.r;
+                        if (globalQ < std::numeric_limits<std::int32_t>::min() || globalQ > std::numeric_limits<std::int32_t>::max() ||
+                            globalR < std::numeric_limits<std::int32_t>::min() || globalR > std::numeric_limits<std::int32_t>::max()) continue;
+                        const auto owner = hexChunkAt({static_cast<std::int32_t>(globalQ), static_cast<std::int32_t>(globalR)},
+                                                      tile->radius, tile->layout);
+                        if (owner) {
+                            const ChunkCoord neighbor{owner->x, chunk->coord.y, owner->z};
+                            const auto end = borderNeighbors.begin() + static_cast<std::ptrdiff_t>(borderNeighborCount);
+                            // Several adjacent cells may belong to the same tiled chunk.
+                            if (std::find(borderNeighbors.begin(), end, neighbor) == end) {
+                                addNeighbor(owner->x - chunk->coord.x, 0, owner->z - chunk->coord.z);
+                            }
+                        }
+                    }
                 }
             }
             break;
@@ -1060,6 +1167,20 @@ auto ChunkStore::snapshot(ChunkHandle handle) const -> std::optional<ChunkSnapsh
     return output;
 }
 
+auto ChunkStore::snapshotDeltas(ChunkHandle handle) const
+    -> std::optional<containers::Array<ChunkDelta>> {
+    const ChunkRecord* chunk = chunks_.get(handle);
+    if (chunk == nullptr) return std::nullopt;
+    std::lock_guard lock(chunk->mutex);
+    if (chunk->state < ChunkState::CellsReady) return std::nullopt;
+    containers::Array<ChunkDelta> output;
+    output.reserve(chunk->deltas.size());
+    for (const auto& [index, value] : chunk->deltas) output.push({index, value});
+    std::sort(output.begin(), output.end(),
+              [](const ChunkDelta& a, const ChunkDelta& b) { return a.index < b.index; });
+    return output;
+}
+
 auto ChunkStore::markDirty(ChunkHandle handle, DirtyFlags flags) -> bool {
     ChunkRecord* chunk = chunks_.get(handle);
     if (chunk == nullptr) return false;
@@ -1093,6 +1214,7 @@ namespace {
 
 constexpr std::uint32_t kDeltaChunkId = 0x44433446u; // "F4CD" little-endian
 constexpr std::uint32_t kDeltaVersion = 1;
+constexpr std::uint32_t kTiledHexDeltaVersion = 2;
 
 [[nodiscard]] constexpr auto cellWireBytes(PolicyKind policy) -> std::size_t {
     switch (policy) {
@@ -1163,12 +1285,19 @@ auto ChunkStore::saveDeltas(ChunkHandle handle, memory::MemoryWriter& output) co
     payload.writeValue(copy->version);
     payload.writeValue(static_cast<std::uint32_t>(copy->deltas.size()));
     payload.writeValue(static_cast<std::uint8_t>(copy->policy));
+    const bool tiledHex = copy->policy == PolicyKind::Hex && copy->params.hex.layout == HexLayout::Tiled;
+    if (tiledHex) {
+        payload.writeValue(copy->worldSeed);
+        payload.writeValue(copy->params.hex.radius);
+        payload.writeValue(copy->params.hex.heightAmplitude);
+        payload.writeValue(copy->params.hex.frequency);
+    }
     for (const ChunkDelta& delta : copy->deltas) {
         payload.writeValue(delta.index);
         writeCell(payload, delta.value, copy->policy);
     }
     memory::writeStreamPreamble(output);
-    return memory::writeChunk(output, kDeltaChunkId, kDeltaVersion, payload.bytes().data(),
+    return memory::writeChunk(output, kDeltaChunkId, tiledHex ? kTiledHexDeltaVersion : kDeltaVersion, payload.bytes().data(),
                               payload.bytes().size());
 }
 
@@ -1188,8 +1317,9 @@ auto ChunkStore::loadDeltas(ChunkHandle handle, const memory::Array<std::byte>& 
     memory::MemoryReader stream(input);
     if (!memory::checkStreamPreamble(stream)) return false;
     memory::ChunkView chunkView;
+    const bool tiledHex = chunk->policy == PolicyKind::Hex && chunk->params.hex.layout == HexLayout::Tiled;
     if (!memory::readChunkView(stream, chunkView) || !stream.atEnd() ||
-        chunkView.id != kDeltaChunkId || chunkView.version != kDeltaVersion) {
+        chunkView.id != kDeltaChunkId || chunkView.version != (tiledHex ? kTiledHexDeltaVersion : kDeltaVersion)) {
         return false;
     }
     memory::MemoryReader payload(chunkView.payload, chunkView.payloadSize);
@@ -1203,6 +1333,15 @@ auto ChunkStore::loadDeltas(ChunkHandle handle, const memory::Array<std::byte>& 
         serializedCoord != chunk->coord ||
         serializedPolicy != static_cast<std::uint8_t>(chunk->policy)) {
         return false;
+    }
+    if (tiledHex) {
+        std::uint64_t seed = 0;
+        std::uint32_t radius = 0;
+        float amplitude = 0.f, frequency = 0.f;
+        if (!payload.readValue(seed) || !payload.readValue(radius) ||
+            !payload.readValue(amplitude) || !payload.readValue(frequency) ||
+            seed != chunk->worldSeed || radius != chunk->params.hex.radius ||
+            amplitude != chunk->params.hex.heightAmplitude || frequency != chunk->params.hex.frequency) return false;
     }
     const std::size_t wireBytes = sizeof(std::uint32_t) + cellWireBytes(chunk->policy);
     if (wireBytes == 0 || count > payload.remaining() / wireBytes ||

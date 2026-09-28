@@ -12,6 +12,7 @@
 #include "engine/rendering/shader_parity.h"
 #include "graphics/command/command_buffer.h"
 #include "graphics/device/device.h"
+#include "graphics/render_graph/render_graph.h"
 
 #if defined(F4_M13_OPENGL_SHADER_SOURCE)
 #include "backends/opengl/opengl_device.h"
@@ -128,6 +129,47 @@ auto runNoiseCompute(gfx::IDevice& device, gfx::ShaderDesc shaderDesc) -> NoiseV
     NoiseValues values{};
     REQUIRE(device.readBuffer(output.value(), 0, std::as_writable_bytes(std::span(values))) ==
             gfx::GfxError::None);
+
+    // Exercise the same kernel through the graph, including a WAW dependency
+    // with unchanged state and a forward dependency on an independent pass.
+    gfx::RenderGraph graph;
+    gfx::ResourceDesc graphOutput;
+    graphOutput.type = gfx::ResourceType::Buffer;
+    graphOutput.buffer = bufferDesc;
+    const auto outputId = graph.declareResource(std::move(graphOutput));
+    for (int i = 0; i < 2; ++i) {
+        gfx::PassDesc pass;
+        if (i == 0) pass.dependsOn.push(3);
+        pass.accesses.push({outputId, {gfx::PipelineStageMask::ComputeShader,
+            gfx::ResourceAccessMask::ShaderWrite, gfx::TextureLayout::Undefined}});
+        pass.record = [&](gfx::CommandBuffer& cb) {
+            const auto handle = graph.buffer(outputId);
+            cb.bindPipeline(pipeline.value());
+            cb.bindResource(0, gfx::BindingType::StorageBuffer, handle.index, handle.generation);
+            cb.dispatch(static_cast<std::uint32_t>(kSampleCount));
+        };
+        (void)graph.declarePass(std::move(pass));
+    }
+    gfx::PassDesc readback;
+    readback.accesses.push({outputId, {gfx::PipelineStageMask::Host,
+        gfx::ResourceAccessMask::HostRead, gfx::TextureLayout::Undefined}});
+    (void)graph.declarePass(std::move(readback));
+    (void)graph.declarePass({});
+    for (int frame = 0; frame < 2; ++frame) {
+        REQUIRE(graph.execute(device, commands) == gfx::GfxError::None);
+        REQUIRE(graph.executionOrder().size() == 4);
+        CHECK(graph.executionOrder()[0] == 3);
+        std::size_t barriers = 0;
+        for (const auto& command : commands.commands()) {
+            if (command.kind == gfx::CommandKind::ResourceBarrier) ++barriers;
+        }
+        CHECK(barriers == 3);
+        NoiseValues graphValues{};
+        REQUIRE(device.readBuffer(graph.buffer(outputId), 0,
+            std::as_writable_bytes(std::span(graphValues))) == gfx::GfxError::None);
+        CHECK(std::memcmp(values.data(), graphValues.data(), sizeof(values)) == 0);
+    }
+    CHECK(graph.release(device) == gfx::GfxError::None);
     device.waitIdle();
     CHECK(device.destroyBuffer(output.value()) == gfx::GfxError::None);
     CHECK(device.destroyPipeline(pipeline.value()) == gfx::GfxError::None);

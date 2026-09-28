@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "demos/demo_bench.h"
 #include "demos/demo_triangle.h"
@@ -39,11 +40,10 @@ using namespace f4::demo;
 int main(int argc, char** argv) {
     DemoBench bench("f4 Demo Bench", 1280, 720);
     int initialScene = 0;
-    std::size_t smokeFrames = 0;
-    const char* captureDirectory = nullptr;
+    DemoRunOptions options;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--smoke") == 0) {
-            smokeFrames = 3;
+            options.smokeFramesPerScene = 3;
             if (i + 1 < argc) {
                 char* end = nullptr;
                 const long requestedFrames = std::strtol(argv[i + 1], &end, 10);
@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "Smoke frame count must be positive\n");
                         return 2;
                     }
-                    smokeFrames = static_cast<std::size_t>(requestedFrames);
+                    options.smokeFramesPerScene = static_cast<std::size_t>(requestedFrames);
                     ++i;
                 }
             }
@@ -61,47 +61,68 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--capture-dir requires a path\n");
                 return 2;
             }
-            captureDirectory = argv[++i];
+            options.captureDirectory = argv[++i];
+        } else if (std::strcmp(argv[i], "--static") == 0) {
+            options.staticCapture = true;
+        } else if (std::strcmp(argv[i], "--only-scene") == 0) {
+            options.onlyScene = true;
+        } else if (std::strcmp(argv[i], "--static-view") == 0) {
+            if (i + 1 >= argc) return 2;
+            char* end = nullptr;
+            const long view = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || view < 0 || view > 6) return 2;
+            options.staticView = static_cast<std::uint32_t>(view);
         } else {
             char* end = nullptr;
             const long scene = std::strtol(argv[i], &end, 10);
-            if (end == argv[i] || *end != '\0' || scene < 0) {
+            if (end == argv[i] || *end != '\0' || scene < 0 ||
+                scene > std::numeric_limits<int>::max()) {
                 std::fprintf(stderr,
                              "Usage: demo_bench [scene] [--smoke [frames]] "
-                             "[--capture-dir path]\n");
+                             "[--capture-dir path] [--static] [--only-scene] [--static-view 0..6]\n");
                 return 2;
             }
             initialScene = static_cast<int>(scene);
         }
     }
-    if (captureDirectory != nullptr && smokeFrames == 0) smokeFrames = 3;
+    if ((options.captureDirectory != nullptr || options.staticCapture || options.onlyScene) &&
+        options.smokeFramesPerScene == 0) options.smokeFramesPerScene = 3;
+    if (options.staticView != 0 &&
+        (!options.staticCapture || !options.onlyScene || initialScene != 7)) {
+        std::fprintf(stderr, "--static-view requires cube scene 7, --static and --only-scene\n");
+        return 2;
+    }
 
     // Register all available scenes (in order: 0-8, then 9-17 with Shift)
-    bench.addScene(new TriangleScene());      // 0 / 9
-    bench.addScene(new InstancingScene());    // 1 / 10
-    bench.addScene(new ResizeScene());        // 2 / 11
-    bench.addScene(new CollisionScene());     // 3 / 12
-    bench.addScene(new AssetsScene());        // 4 / 13
-    bench.addScene(new HudScene());           // 5 / 14
-    bench.addScene(new EcsScene());           // 6 / 15
-    bench.addScene(new CubeScene());          // 7 / 16
-    bench.addScene(new TerrainScene());       // 8 / 17
-    bench.addScene(new ParticleScene());      // 9 / 18 (Shift+1)
-    bench.addScene(new BackfaceScene());      // 10 / Shift+2 - 2 opposite triangles cull test, press C/R/Space, rotates
-    bench.addScene(new GizmoScene());         // 11 / Shift+3 - X red Y green Z blue, H to toggle RH/LH, F is asymmetrical
-    bench.addScene(new HierarchyScene());     // 12 / Shift+4 - 4 nested cubes local->world, N to toggle numbers, auto-rotates
-    bench.addScene(new CornellBoxScene());    // 13 / Shift+5 - lit room with two interior boxes
-    bench.addScene(new PbrSphereGridScene()); // 14 / Shift+6 - GGX metallic/roughness grid
-    bench.addScene(new MipmappingScene());    // 15 / Shift+7 - level-zero vs trilinear minification
-    bench.addScene(new ZFightingScene());     // 16 / Shift+8 - increasing coplanar separation
-    bench.addScene(new AlphaOrderScene());    // 17 / Shift+9 - sorted vs reversed transparency
-    bench.addScene(new NormalMapOrientationScene()); // 18 / Tab or CLI - tangent-space Y orientation
-    bench.addScene(new HybridRenderingScene());      // 19 / Tab or CLI - deferred opaque + forward alpha
+    bench.addScene(new TriangleScene(), "One complete RGB triangle; smooth interpolation; no holes.");
+    bench.addScene(new InstancingScene(), "Regular instance grid; no missing cells or shared-transform collapse.");
+    bench.addScene(new ResizeScene(), "Right triangle anchored at screen center; equal legs. Resize is a separate gate.");
+    bench.addScene(new CollisionScene(), "Separated colored bodies at the fixed simulation checkpoint.");
+    bench.addScene(new AssetsScene(), "Texture and geometry intact. This is not full asset-format acceptance.");
+    bench.addScene(new HudScene(), "Complete triangle and legible fixed text; no clipped glyphs.");
+    bench.addScene(new EcsScene(), "Visible triangle grid; per-instance transforms retained; no missing in-frustum items.");
+    bench.addScene(new CubeScene(), "Closed cube; overview shows three faces. Views 1-6 must each show a full face.");
+    bench.addScene(new TerrainScene(), "Voxel, height and hex meshes: closed surfaces, clean seams and no holes.");
+    bench.addScene(new ParticleScene(), "Fixed seeded particle cloud; overlapping billboards; no empty emitter.");
+    bench.addScene(new BackfaceScene(), "Opposite winding controls: front-facing surface visible, rear-facing culled.");
+    bench.addScene(new GizmoScene(), "X red, Y green, Z blue; asymmetric F distinguishes handedness.");
+    bench.addScene(new HierarchyScene(), "Yellow sun, blue planet and gray moon; partial moon occlusion is expected.");
+    bench.addScene(new CornellBoxScene(), "Closed room, red/green walls and two boxes; no missing wall or box faces.");
+    bench.addScene(new PbrSphereGridScene(), "30 spheres, same base color. Roughness increases RIGHT; metallic increases UP.");
+    bench.addScene(new MipmappingScene(), "LEFT: intentional moire. RIGHT: trilinear minification should reduce aliasing.");
+    bench.addScene(new ZFightingScene(), "Separation increases LEFT to RIGHT; coplanar conflict on the left is intentional.");
+    bench.addScene(new AlphaOrderScene(), "LEFT: back-to-front blending. RIGHT: intentionally reversed order.");
+    bench.addScene(new NormalMapOrientationScene(), "LEFT: +Y normal map. RIGHT: deliberately flipped Y; lighting must differ.");
+    bench.addScene(new HybridRenderingScene(), "Opaque depth retained; transparent geometry blended in front and occluded behind.");
 
-    if (initialScene > 0 && initialScene < static_cast<int>(bench.sceneCount()) &&
+    if (initialScene >= static_cast<int>(bench.sceneCount())) {
+        std::fprintf(stderr, "Scene index out of range\n");
+        return 2;
+    }
+    if (initialScene > 0 &&
         !bench.setScene(static_cast<std::size_t>(initialScene))) {
         std::fprintf(stderr, "Failed to initialize scene %d\n", initialScene);
         return 1;
     }
-    return bench.run(smokeFrames, captureDirectory);
+    return bench.run(options);
 }

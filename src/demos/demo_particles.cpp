@@ -251,6 +251,13 @@ void ParticleScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) 
     }
 }
 
+bool ParticleScene::prepareStaticCapture(FreeCamera& camera) {
+    camera.position = {0.f, 0.f, 6.f};
+    camera.yaw = 1.57079633f;
+    camera.pitch = std::atan2(1.5f, 6.f);
+    return true;
+}
+
 void ParticleScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) {
     if (!inited_ || aliveCount_ == 0) return;
     constRing_.beginFrame();

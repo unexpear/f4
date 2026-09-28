@@ -218,6 +218,13 @@ void CornellBoxScene::shutdown(gfx::IDevice* dev) {
 void CornellBoxScene::onResize(std::uint32_t, std::uint32_t) {}
 void CornellBoxScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {}
 
+bool CornellBoxScene::prepareStaticCapture(FreeCamera& camera) {
+    camera.position = {0.0f, 3.0f, 12.0f};
+    camera.yaw = 1.57079633f;
+    camera.pitch = 0.0f;
+    return true;
+}
+
 void CornellBoxScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
                              std::uint32_t width, std::uint32_t height) {
     if (!inited_) return;

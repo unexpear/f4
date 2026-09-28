@@ -8,6 +8,7 @@ namespace f4::demo {
 class PbrSphereGridScene final : public IDemoScene {
 public:
     const char* name() const override { return "PBR Spheres: metallic x roughness"; }
+    bool prepareStaticCapture(FreeCamera& camera) override;
     bool init(gfx::IDevice* device, platform::Window* window) override;
     void shutdown(gfx::IDevice* device) override;
     void onResize(std::uint32_t width, std::uint32_t height) override;

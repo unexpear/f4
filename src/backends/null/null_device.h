@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "graphics/command/command_buffer.h"
 #include "graphics/device/device.h"
 
@@ -56,11 +58,16 @@ public:
     [[nodiscard]] auto dispatchCount() const -> std::uint64_t { return stats_.dispatchCalls; }
     [[nodiscard]] auto bufferBytes() const -> std::uint64_t { return bufferBytes_; }
     [[nodiscard]] auto liveBuffers() const -> std::size_t;
+    void failNextPipelineCreation(GfxError error) { nextPipelineError_ = error; }
+    // One-shot upload fault after N successful buffer creations (headless tests).
+    void failBufferCreationAfter(std::size_t successes) { bufferFailureCountdown_ = successes; }
 
 private:
     struct Impl;
     Impl* impl_;
     GfxError lastError_ = GfxError::None;
+    GfxError nextPipelineError_ = GfxError::None;
+    std::optional<std::size_t> bufferFailureCountdown_;
     DeviceStats stats_;
     std::uint64_t bufferBytes_ = 0;
 };

@@ -18,6 +18,7 @@ struct RenderItem {
     float depth = 0.f; // view-space depth (smaller = nearer)
     bool transparent = false;
     std::uint32_t pipelineSortKey = 0; // material pipeline index for batching
+    bool mirrored = false;
 };
 
 struct RenderBatch {

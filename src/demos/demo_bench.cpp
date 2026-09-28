@@ -1,6 +1,7 @@
 #include "demos/demo_bench.h"
 
 #include <cctype>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -44,8 +45,9 @@ DemoBench::~DemoBench() {
     scenes_.clear();
 }
 
-void DemoBench::addScene(IDemoScene* scene) {
+void DemoBench::addScene(IDemoScene* scene, const char* captureExpectation) {
     scenes_.push(scene);
+    captureExpectations_.push(captureExpectation);
 }
 
 bool DemoBench::setScene(std::size_t index) {
@@ -116,6 +118,17 @@ void DemoBench::handleEvents() {
             running_ = false;
             return;
         }
+        if (staticCapture_) {
+            if ((ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) ||
+                (ev.type == SDL_WINDOWEVENT &&
+                 (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
+                  ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) &&
+                 (ev.window.data1 != static_cast<int>(staticExtent_.width) ||
+                  ev.window.data2 != static_cast<int>(staticExtent_.height)))) {
+                running_ = false;
+            }
+            continue;
+        }
         if (ev.type == SDL_KEYDOWN) {
             if (ev.key.keysym.sym == SDLK_ESCAPE) {
                 if (mouseCaptured_) {
@@ -179,6 +192,9 @@ void DemoBench::updateMetrics(float dt) {
 bool DemoBench::captureBackbuffer(const char* directory,
                                   std::size_t frameInScene) const {
     if (directory == nullptr || currentScene() == nullptr) return true;
+    // Readback is the visual-gate boundary. Drain the submitted frame first so
+    // driver-side command completion cannot affect a single HUD pixel.
+    window_.device()->waitIdle();
     const int width = window_.window()->width();
     const int height = window_.window()->height();
     if (width <= 0 || height <= 0 ||
@@ -252,17 +268,28 @@ bool DemoBench::captureBackbuffer(const char* directory,
     return true;
 }
 
-int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory) {
+int DemoBench::run(const DemoRunOptions& options) {
     if (!window_.ok()) return 1;
+    const auto smokeFramesPerScene = options.smokeFramesPerScene;
+    const char* captureDirectory = options.captureDirectory;
+    staticCapture_ = options.staticCapture;
+    staticExtent_ = {static_cast<std::uint32_t>(window_.window()->width()),
+                     static_cast<std::uint32_t>(window_.window()->height())};
+    if (options.staticView > 6 || (staticCapture_ && smokeFramesPerScene == 0)) return 2;
+    gfx::hud::Overlay staticHud(window_.device());
+    if (staticCapture_ && staticHud.init(1024, 2.0f) != gfx::GfxError::None) return 1;
 
     // Initialize first scene (respect pre-selected scene from main)
     if (!hasCurrent_ && !scenes_.isEmpty() && !setScene(0)) return 1;
 
     // Capture mouse initially
-    SDL_SetRelativeMouseMode(SDL_TRUE);
-    mouseCaptured_ = true;
+    SDL_SetRelativeMouseMode(staticCapture_ ? SDL_FALSE : SDL_TRUE);
+    mouseCaptured_ = !staticCapture_;
     running_ = true;
     std::size_t sceneFrame = 0;
+    bool staticPrepared = false;
+    bool completed = false;
+    const std::array<Uint8, SDL_NUM_SCANCODES> noKeys{};
 
     if (smokeFramesPerScene > 0 && currentScene()) {
         std::printf("Smoke testing scene %zu/%zu: %s\n", current_ + 1, scenes_.size(),
@@ -273,6 +300,35 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
         handleEvents();
         if (!running_) break;
 
+        if (staticCapture_ && !staticPrepared) {
+            camera_ = FreeCamera{};
+            // Fixed simulation warmup makes particles and hierarchy scenes
+            // useful, without tying their state to CPU/GPU speed or live input.
+            for (int step = 0; step < 60; ++step) {
+                currentScene()->update(1.0f / 60.0f, noKeys.data(), nullptr);
+            }
+            if (!currentScene()->prepareStaticCapture(camera_)) return 1;
+            constexpr std::array<const char*, 7> viewNames{
+                "overview", "+Z front", "-Z back", "-X left", "+X right", "+Y top", "-Y bottom"};
+            if (options.staticView != 0) {
+                constexpr std::array<math::Vec3, 6> eyes{{
+                    {0, 0, 6}, {0, 0, -6}, {-6, 0, 0}, {6, 0, 0},
+                    {0, 6, 0.001f}, {0, -6, 0.001f}}};
+                camera_.position = eyes[options.staticView - 1];
+                const auto p = camera_.position;
+                camera_.yaw = std::atan2(p.z, p.x);
+                camera_.pitch = std::atan2(p.y, std::sqrt(p.x * p.x + p.z * p.z));
+            }
+            char title[240]{};
+            std::snprintf(title, sizeof(title), "STATIC | %s | %s", currentScene()->name(),
+                          viewNames[options.staticView]);
+            const gfx::hud::HudLine lines[]{
+                {12, 12, title},
+                {12, 34, captureExpectations_[current_], 0.85f, 0.95f, 0.65f, 1.0f}};
+            staticHud.setLines(lines);
+            staticPrepared = true;
+        }
+
         Uint64 now = SDL_GetPerformanceCounter();
         float dt = static_cast<float>(static_cast<double>(now - prevTicks_) / static_cast<double>(freq_));
         prevTicks_ = now;
@@ -281,16 +337,18 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
         const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
         // Update current scene
-        if (current_ < scenes_.size() && scenes_[current_]) {
+        if (!staticCapture_ && current_ < scenes_.size() && scenes_[current_]) {
             scenes_[current_]->update(dt, keys, nullptr);
         }
 
         // Update camera
         bool sprint = (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]);
-        camera_.update(dt, keys, nullptr, sprint);
+        if (!staticCapture_) camera_.update(dt, keys, nullptr, sprint);
 
-        updateMetrics(dt);
-        diagnostics_.update(static_cast<double>(now) / static_cast<double>(freq_));
+        if (!staticCapture_) {
+            updateMetrics(dt);
+            diagnostics_.update(static_cast<double>(now) / static_cast<double>(freq_));
+        }
 
         // Render
         gfx::CommandBuffer cb;
@@ -303,7 +361,8 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
             scene->renderPasses(cb, camera_, vp.width, vp.height, fb_);
             cb.beginRenderPass(overlayFb_);
             cb.setViewport(vp);
-            hud_.render(cb, vp.width, vp.height);
+            if (staticCapture_) staticHud.render(cb, vp.width, vp.height);
+            else hud_.render(cb, vp.width, vp.height);
             scene->renderHud(cb, vp.width, vp.height);
             cb.endRenderPass();
         } else {
@@ -312,7 +371,8 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
             if (scene != nullptr) {
                 scene->render(cb, camera_, vp.width, vp.height);
             }
-            hud_.render(cb, vp.width, vp.height);
+            if (staticCapture_) staticHud.render(cb, vp.width, vp.height);
+            else hud_.render(cb, vp.width, vp.height);
             if (scene != nullptr) {
                 scene->renderHud(cb, vp.width, vp.height);
             }
@@ -330,8 +390,10 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
 
         if (smokeFramesPerScene > 0 && ++sceneFrame >= smokeFramesPerScene) {
             sceneFrame = 0;
-            if (current_ + 1 >= scenes_.size()) {
+            staticPrepared = false;
+            if (options.onlyScene || current_ + 1 >= scenes_.size()) {
                 running_ = false;
+                completed = true;
             } else if (!setScene(current_ + 1)) {
                 std::fprintf(stderr, "Failed to initialize scene %zu\n", current_ + 1);
                 return 1;
@@ -343,7 +405,7 @@ int DemoBench::run(std::size_t smokeFramesPerScene, const char* captureDirectory
     }
 
     window_.device()->waitIdle();
-    return 0;
+    return staticCapture_ && !completed ? 1 : 0;
 }
 
 } // namespace f4::demo

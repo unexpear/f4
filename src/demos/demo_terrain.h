@@ -14,6 +14,7 @@ public:
     void shutdown(gfx::IDevice* device) override;
     void onResize(std::uint32_t width, std::uint32_t height) override;
     void update(float dt, const Uint8* keys, const SDL_MouseMotionEvent* mouseMotion) override;
+    bool prepareStaticCapture(FreeCamera& camera) override;
     void render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) override;
 
 private:

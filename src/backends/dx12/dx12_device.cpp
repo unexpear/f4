@@ -974,7 +974,7 @@ auto Dx12Device::createPipeline(const PipelineStateDesc& desc)
                                                : (desc.raster.cullMode == CullMode::Front
                                                       ? D3D12_CULL_MODE_FRONT
                                                       : D3D12_CULL_MODE_BACK);
-    pipelineDesc.RasterizerState.FrontCounterClockwise = TRUE;
+    pipelineDesc.RasterizerState.FrontCounterClockwise = !desc.raster.frontClockwise;
     pipelineDesc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     pipelineDesc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
     pipelineDesc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;

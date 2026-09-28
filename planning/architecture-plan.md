@@ -168,7 +168,7 @@ parity does not depend on an optional capability.
 
 ## 8. Development Roadmap
 
-### Implementation audit (2026-09-03)
+### Implementation audit (2026-09-03; personal review 2026-09-05)
 
 Status is based on code and tests in the working tree, not on historical status
 notes later in this document.
@@ -192,11 +192,11 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
-| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
+| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system and deterministic single-queue graph scheduling are complete. Occlusion culling, multithreaded recording, SIMD paths, and async compute remain open; scheduling is not a measured performance improvement or parallel execution. |
 | M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
-| M16 World streaming | ✅ Complete | Policy-aware camera rings use distance/stage-priority workers and bounded main-thread topology/publication. Versioned layout/cell/mesh results reject unloaded or edited work; sparse edits survive unload, including absent shared height neighbors. Resident voxel DDA and height sampling provide collision hooks. M16 also closes the deferred shared-resource reference contract and stores normal voxel bases in deterministic 4-bit/8-bit palettes. |
+| M16 World streaming | ⚠ Partial | Camera rings, priority workers, versioned publication, collision hooks, sparse edits, resource references and palettes are implemented. CPU profiling removed planning snapshot copies, resident-wide neighbor scans and unload base copies. The native OpenGL height-world demo integrates 25 GPU chunks, travel, edits, disk/process reload and visual gates. Terrain pipelines prepare at startup; CPU/upload admission shares a cooperative deadline. Save/load/old CPU world retirement use a bounded worker. Replay uses direct shared validation and reload GPU cleanup is spread across frames. Optional meter-based center footprints retain legacy chunk-count defaults. The 224-capture policy gate covers the full voxel half-region, simultaneous boundaries, rapid mutations, opt-in regional surfaces, hex prism cut walls, cell-aligned voxel cuts and composed-corner display/edit/restoration. Intersecting chunk bounds plus CPU clipping fill the tested hex interior; optional walls close hex cuts to their existing floor. Optional voxel cell masking exposes cut faces while preserving cavities. Published-surface rays share these triangles and region provenance. Explicit boundary requests now support worker-built compositions and incrementally staged whole-view GPU/query replacement, explicit retirement/retargeting and failure retention. Fresh-reference gates cover one/four workers and edit restoration. Scoped Height/Hex residency-derived discovery now drives the native corner route. Paired-profile walls remain the cross-policy height-transition geometry. A reference solid-column contract now assigns Height/Hex boundary and corner ownership, including finite hex floors and nonplanar triangle tops, and fails closed on discontinuous breakpoints, nonmanifold corners, voxel cavities, voxel overhangs and any voxel column. Full-world policy coverage, non-preemptible transition work, general voxel solid queries, hard budgets and large shared-map edits remain open. |
 | M17 Native Metal | ⚠ Partial | The direct Objective-C++ Metal device, SDL `CAMetalLayer`, queue/replay, resources, pipelines, metallib build rules, presentation, readback, retirement, M11/M13 shader families, 130-draw regression, locked M11 image gate, and nine-scene repeated capture runner are implemented. Hosted Apple Clang Debug/Release builds and CPU/build conformance pass, but M17 cannot be accepted until Metal-capable Apple hardware passes diagnostics, parity, presentation/resize, and visual review of all 27 captures. |
 | M18 Browser WebGPU | ✅ Complete | Emscripten 6.0.9 and Emdawnwebgpu provide a browser-native WebGPU RHI with asynchronous setup/pipeline admission, device-loss reporting, negotiated limits/features/formats, canvas resize/presentation, complete resource/binding/render/compute command paths, readback, and deferred reclamation. Native WGSL covers M11, M13, Cornell, all six focused rendering validations, and terrain. Chromium gates zero errors, 130 draws, indexed-strip format conformance, M13 CPU/GPU parity, byte-exact M11 full-frame parity, resize stability, and three identical captures from each of the seven validation scenes plus terrain; every capture was visually inspected. |
 
@@ -561,7 +561,10 @@ Completed delivery and acceptance gates:
 - ✅ Distance/stage-priority job system (delivered by M16); multithreaded command
   recording remains open
 - SIMD math paths
-- Render graph scheduling, async compute
+- ✅ Deterministic single-queue render graph scheduling: explicit pass dependencies,
+  declaration-order resource hazards, cached stable topological compilation,
+  pre-allocation cycle validation, and same-state write barriers
+- Async compute (separate queues, ownership transfers, and overlap remain open)
 
 ### Milestone 13 — Deterministic Noise Library (procgen track) ✅
 - ✅ Value/Perlin/Simplex noise, FBM, and domain warping; every function takes
@@ -632,37 +635,245 @@ Completed delivery and acceptance gates:
   edge edits mirror into resident cardinal/diagonal tiles before remeshing.
 - Hex delivery uses the M14 pointy-top axial/corner lattice for colored top,
   bottom, and exposed side faces; same-policy neighbors suppress shared walls.
+  The 2026-09-06 audit found legacy chunk-layout holes, now resolved for new
+  streamed worlds by the versioned tiled layout described in section 11.4.
 - Twelve focused cases / 16,129 assertions pass on GCC, MSVC, and Clang 18
   ASan+UBSan. `terrain_determinism` locks quantized vertex/index/surface dumps
   across all three toolchains. Three back-face-culled gallery captures are
   pixel-identical with no missing faces, seam gaps, z-fighting, or blinking.
 
-### Milestone 16 — World Streaming (procgen track) ✅
-- ✅ Camera-centered rings select voxel/height/hex residency through RegionMap.
+### Milestone 16 — World Streaming (procgen track; budget acceptance reopened)
+- Camera-centered rings select voxel/height/hex residency through RegionMap.
+  Height/voxel use Cartesian extents. Hex uses inverse pointy-top coordinates,
+  bounded exact cell ownership, geometric centers and configured cell scale;
+  the native tiled-hex camera route verifies unload/return and retained edits.
   Chunk topology stays main-thread-owned; pure cell generation and immutable
   snapshot meshing run on the pulled-forward first-class job system.
-- ✅ Distance then stage priority, deterministic tie ordering, frame-time and
-  operation caps, and `layout → cells → meshes` publication prevent generation
-  or meshing spikes from becoming unbounded main-thread work.
+- ✅ Distance then stage priority, deterministic tie ordering, operation caps,
+  and `layout → cells → meshes` publication are implemented.
+- Fixed: the 2026-09-05 radius-128 planning starvation. Large plans now execute
+  on workers from region snapshots and retain only resident-capacity candidates
+  per policy. Chunk-boundary/region revision changes cancel obsolete plans.
+  Small plans (at most 256 candidates to examine) stay immediate. Positive
+  budgets admit at least one operation per enabled stage; zero budgets pause.
+- Open: integrated worst-case budget profiling. This is a cooperative time
+  budget, not a hard deadline; individual snapshot/topology/publication work
+  is not preemptible. Tests cover progress, cancellation and mutation, not a
+  universal 2 ms ceiling.
+- The [CPU streaming profile](streaming-profile-2026-09-05.md) adds an explicit
+  benchmark and opt-in per-stage timing. Region snapshots now share until
+  mutation, mesh neighborhoods use bounded coordinate lookups, and unload
+  copies only sparse deltas. The 50,000-entry planning setup dropped from
+  about 14 ms to under 0.08 ms in local runs, but first edits with a retained
+  snapshot still took 16-24 ms. These observations do not close budget acceptance.
 - ✅ Handle generation plus monotonic chunk versions reject completions after
   unload/reuse, regeneration, border invalidation, or edits. Shutdown drains
   workers before result storage is destroyed.
+- The [integrated streaming demo](streaming-world-demo.md) now exercises the
+  production renderer, bounded GPU uploads, retirement, a 512 m camera round
+  trip, visible height edits and separate-process disk restoration. Shared
+  equal-height skirts are culled opt-in to prevent draw-order seam speckles;
+  outer skirts remain. Exact terrain pipeline preparation now happens during
+  measured initialization rather than the first visible draw, with a native
+  no-new-pipelines gate. Demo CPU/upload work now shares a 2 ms cooperative
+  deadline (1 ms CPU allowance), retaining mandatory retirement and one-upload
+  progress after expiry. Profiles report deferrals and overruns. A bounded
+  [background I/O worker](streaming-async-io.md) handles saves, reload construction,
+  and old CPU world retirement. Main-thread replay now uses direct shared
+  validation, and reload detaches old draws immediately then retires at most
+  two old meshes per sync call. Progress exceptions and individual operations
+  can still exceed the budget. This closes
+  the missing demo slice, not the hard budget
+  or general multi-policy world-save scope.
 - ✅ Sparse overlays persist across unload/reload. Height edge/corner edits are
   recorded for mirrored neighbors even while those chunks are absent.
-- ✅ Resident terrain queries expose cross-chunk solid-block DDA and the same
-  bilinear height/material sampler used by generation and rendering.
+- The [mixed-policy diagnostic](mixed-policy-boundaries.md) adds concurrent
+  height/voxel/hex inspection, 90 live region/camera mutations, and exact
+  restored CPU mesh/image checks. Portable tests guarantee initial eviction
+  and compare all three policies' edited vertex/index bytes with a fresh-world
+  reference using one/four workers and immediate/off-thread planning. These
+  bounded lifecycle gates pass; visible regional holes and encroachment are
+  not accepted seam behavior. Unequal chunk-count coverage motivated the next
+  increment below.
+- The subsequent [meter-footprint increment](world-space-streaming.md) adds an
+  opt-in closed XZ square for geometric chunk centers, preserving legacy rings.
+  Exhaustive forward-coordinate tests cover signed/scaled layouts, capacity and
+  sub-chunk movement. Native comparison draws 14 height, four voxel and two hex
+  chunks, including the previously omitted voxel half-region. The 112-capture
+  gate retains visible seam defects; fixed diagnostic material groups stabilize
+  cross-policy draw-order ties, not topology or collision ownership.
+- ✅ Resident terrain queries expose cross-chunk solid-block DDA and bilinear
+  height/material sampling. Bilinear interpolation is not the rendered triangle
+  surface on nonplanar height quads; the existing sampling API is preserved.
+- The [published-surface query increment](published-terrain-queries.md) adds a
+  common triangle ray query for height, voxel and hex, returning chunk handle,
+  published mesh version and triangle identity. It retains old published geometry
+  during remeshing, has deterministic exact-distance ties, and does not mask
+  regions or synchronize GPU uploads. This is a reference-query foundation,
+  not completed collision ownership or transition geometry.
+- The opt-in [regional surface increment](regional-surfaces.md) admits owned
+  region intersections of chunk bounds and clips CPU triangles after edit replay.
+  Rendering and published-surface rays use the same masked mesh and expose its
+  region revision. The comparison's hex interior holes are filled; cut walls,
+  height transitions and volume-query ownership are NOT complete. Legacy
+  admission and cell-DDA/bilinear behavior remain unchanged. The policy gate
+  now has 124 captures, retaining the earlier 112 unchanged.
+- The subsequent [hex cut-wall increment](hex-cut-walls.md) adds optional caps
+  from clipped top edges to the existing hex prism floor. Existing coplanar
+  boundary walls are replaced, not duplicated; internal same-policy lines are
+  not capped. The gate now has 136 images with below-surface inspection and
+  32 outward wall probes. This does not connect hex tops to neighboring height
+  terrain or implement voxel cavity closure/general solid collision.
+- The [voxel cut-face increment](voxel-cut-faces.md) adds optional ownership
+  masking before voxel face culling/AO, including padded neighbors. Exposed
+  cell-aligned cuts preserve tunnels and roof undersides without blanket caps.
+  The gate now has 148 images and 90 face/tunnel probes. Hidden edits survive
+  ownership changes. Defaults and legacy cell DDA remain unchanged; height
+  transitions and general solid collision ownership are still open.
+- The [height/hex boundary profile audit](height-hex-boundary-profiles.md)
+  compares actual published top triangles with explicit gaps, overlaps and
+  source provenance. Its east/north charts show up to 24.90/26.15 m height
+  separation and a 1.43e-6 m uncovered hex interval on the north edge. This
+  reference prerequisite is tested; two-policy dependencies and transition
+  geometry are NOT implemented. No epsilon welding hides the measured gap.
+- The [canonical hex endpoint fix](canonical-hex-endpoints.md) resolves that
+  measured interval in regional mode by constructing global corners in one
+  mesh frame, with matching admission bounds and zero render/query translation.
+  Both audited boundaries now require exactly 64 m unique coverage, zero gaps
+  and zero overlaps. Legacy local meshing stays unchanged; precision collapse
+  is rejected, not proof of arbitrary-world closure. Height transitions remain open.
+- The [boundary dependency increment](boundary-dependencies.md) adds bounded
+  immutable captures of published Height/Hex meshes and a main-thread freshness
+  gate for source versions, owner identity, region revisions and contributor
+  arrivals/unloads. The native profile audit uses it. This is explicit pull-based
+  validation, not automatic rescheduling or generated transition geometry.
+- The [boundary profile job increment](boundary-profile-jobs.md) adds an explicitly
+  ticked, single-request controller using the existing worker pool. It rejects
+  stale/superseded completions, retries current sources and retains incomplete
+  coverage as diagnostic data. One job per controller remains outstanding even
+  after replacement/clear. The native audit exercises it; automatic boundary
+  discovery, global budgets and published transition walls remain open.
+- The [isolated boundary wall increment](boundary-wall-geometry.md) generates
+  outward-wound world-space triangles from complete paired profiles, splitting
+  height crossings and recording higher-side ownership. The native audit checks
+  306 generated triangles with culled rays and an actual-triangle diagram.
+  This is not world publication: existing coplanar skirts/caps, top-edge joins,
+  boundary discovery and rendering/query integration still need coordinated work.
+- The [coplanar trim increment](boundary-face-trimming.md) removes a requested
+  tangent strip from coplanar faces on private source copies, retaining outside
+  portions, attributes and original-triangle provenance. The native audit trims
+  310 source triangles while preserving both top profiles exactly. This primitive
+  is not a coordinated source/wall publication transaction or top-edge stitch.
+- The [top-edge stitch increment](boundary-top-stitching.md) exposes canonical
+  wall edge records, including crossings, and subdivides existing source top
+  edges on private copies. The native audit matches all 306 wall-top segments
+  exactly to complete CPU source edges (52 split triangles, 151 added vertices).
+  Unsupported/mismatched cuts fail; this is not GPU transform invariance or a
+  coordinated world publication, and multi-boundary composition remains open.
+- The [immutable replacement increment](boundary-replacement-packages.md) packages
+  one boundary's trimmed/stitched source meshes and walls in a common world-space
+  mesh with original-triangle provenance and retained snapshot dependencies.
+  The native audit checks repeatable payload hashes and 306 combined wall rays.
+  This is a version-stamped package, not installation into WorldStreamer or the
+  renderer. Shared-source multi-boundary composition and GPU swap gates remain open.
+- The [disjoint boundary composer](boundary-composition.md) now carries shared
+  sources through successive trim/stitch passes and emits each source once, with
+  original triangle and wall-boundary provenance. The native audit verifies 228
+  combined wall-ray pairs and 228 complete top-edge matches after both operations.
+  That initial increment rejected all touching requests; endpoint support follows
+  below. That increment did not retain combined dependencies or install geometry;
+  the frozen display increment below adds those dependencies and demo publication.
+- The [endpoint junction increment](boundary-junctions.md) now admits compatible
+  straight/L/three-/four-arm joins, validates sector heights and subdivides shared
+  vertical wall edges. Inconsistent sectors and nonmanifold column configurations
+  fail explicitly; overlaps and unsplit interior contacts remain unsupported.
+  The full native Height/Hex corner passes 306 wall-ray pairs, 306 source top-edge
+  matches and exact opposite pairing of its vertical corner edge. This is CPU
+  geometry acceptance; the following increment adds bounded display acceptance.
+- The [displayed corner increment](displayed-boundary-corners.md) retains the union
+  of source dependencies and stages complete per-policy GPU meshes before hiding
+  their represented originals. The native fixture now displays the composed
+  Height/Hex corner, checks 30 displayed-wall rays, and restores the old image
+  exactly. Buffer-failure tests retain the prior view without leaking staged
+  resources. Render and view queries share a frozen snapshot, including after
+  source edits. The following increment adds replacement after edits.
+- The [live requested-corner increment](live-boundary-corners.md) adds a single
+  immutable worker build at a time, stale completion rejection and staged whole-
+  view GPU/query replacement. The native pending/edit/restored fixture retains the
+  old view until publication and restores exactly; upload fault tests retain old
+  queries/resources. Explicit requests retry when dependencies change. Unavailable
+  corners still retain the old view; automatic retargeting/retirement, incremental
+  upload budgets, general WorldStreamer queries and solid ownership remained open
+  at that checkpoint; count-based upload admission follows below.
+- The [incremental upload increment](incremental-boundary-uploads.md) defaults to
+  two resident/policy upload units and two detached-mesh retirements per tick.
+  Staged entities remain invisible; all resident stamps are checked before a
+  single render/query commit. Stale staging and upload failure keep the prior
+  view. Native partial-staging pixels match the old view exactly. Per-operation
+  latency, boundary retargeting/removal and moving-residency coverage remain open.
+- The [retirement/retargeting increment](boundary-retargeting.md) adds an explicit
+  no-boundaries target. Plain resident terrain stages before old corners retire;
+  returning boundary requests stage before replacing that plain view. World
+  identity and region revisions invalidate pending transactions. Target discovery
+  remains caller-owned; endpoint route captures are not continuous-motion coverage.
+  The [M16 completion checklist](m16-completion-checklist.md) tracks the remaining
+  discovery, publication/ownership, coverage and budget acceptance work.
+- [Bounded boundary discovery](boundary-discovery.md) now enumerates complete
+  Height/Hex edge sets inside caller-selected windows and splits all grid
+  junctions into endpoint arms. Unsupported pairs and limits fail closed;
+  unchanged selections preserve worker progress. The native departure/return
+  fixture uses this selection path. Scoped resident-derived windows now use
+  clipped published mesh bounds for the Height/Hex route; a queued-retarget
+  regression covers three outbound and two return residency positions under
+  Release and MSVC ASan. Unscoped full-world discovery and continuous native
+  visual coverage remain open.
+- [Unchanged resident reuse](boundary-resident-reuse.md) avoids copying/uploading
+  current originals during staged publication. Pending views borrow validated
+  handles without changing their visibility; cancellation leaves their ownership
+  with the accepted view and commit transfers it once. Full-reupload fault tests
+  remain as a reference. This reduces work but is not continuous-motion coverage.
+- [Resident-coverage discovery](resident-coverage-discovery.md) derives a
+  conservative boundary-discovery window from the authoritative current
+  resident chunk footprints and fails closed for absent coverage or unsupported
+  required transitions. An explicit Height/Hex scope uses clipped published
+  mesh bounds and passes the native corner departure/return route; the mixed
+  policy native fixture remains scoped because its full resident union also
+  contains Voxel/Hex. The [accepted surface view](accepted-surface-views.md)
+  packages the demo's accepted resident/composition geometry, routes its
+  displayed query through the same immutable inputs, and adds an explicit
+  WorldStreamer publication/query slot. Successful current demo commits publish
+  into it, but renderer consumers still maintain a parallel local surface owner;
+  the native policy gate now records a deterministic eight-step outbound and
+  inbound residency sweep, retaining the accepted composed view through a
+  temporary no-coverage state and staging plain terrain before departure. Full
+  frame-by-frame movement, travel-time edits/region changes, and full policy
+  coverage remain open.
+- The [solid-column contract](solid-ownership.md) classifies reference volume
+  ownership for Height and Hex boundary planes and corners. Higher tops own the
+  transition band, including the lower edge of the existing paired-profile walls.
+  Discontinuous breakpoints, nonmanifold corners, voxel cavities and voxel
+  overhangs fail closed. Voxel DDA and bilinear sampling are unchanged, and this
+  is not a general voxel solid query or a new WorldStreamer ray API.
 - ✅ Generated voxel bases with at most 16 ids store 4-bit indices; 17–256 ids
   use 8-bit indices; more diverse chunks retain the dense u16 representation.
   Packing order and round trips are deterministic.
 - ✅ M5's deferred cache lifetime contract is closed with typed shared
   retain/release ownership and final-release path eviction.
 
-Ten focused M16 cases cover 126 assertions on scheduling, stage/version gates,
+At the original M16 checkpoint, ten focused cases covered 126 assertions on scheduling, stage/version gates,
 palette packing, ring movement and caps, stale unloads, edit persistence,
 collision, shared resource lifetime, and deterministic regional convergence.
 GCC Debug/Release, MSVC Debug/Release/ASan, and Linux Clang Debug/ASan+UBSan
 pass all six CTest targets. The 20-scene OpenGL bench completed 60 inspected captures
 without missing/blinking faces or regressions in the seven validation scenes.
+
+The [2026-09-05 personal check](personal-check-2026-09-05.md) records five audit
+findings and their fixes: safe renderer capacity failure, orientation-aware
+pipelines/batching, preserved shadow errors, corrected gizmo winding and
+non-starving streaming plans. M16 budget profiling stays open. The table above is authoritative over earlier
+completion checkpoints. [Static screenshot fixtures](static-demo-checks.md)
+now provide 20 overview scenes and six cube views; repeatability is explicitly
+separate from rendering correctness and moving-camera stability.
 
 ### Milestone 17 — Native Metal Backend
 
@@ -975,17 +1186,120 @@ deferred-opaque/forward-transparent composition, and the voxel/height/hex terrai
 gallery each pass three-frame stability and pixel-diversity gates; all captures
 were visually inspected with no missing or blinking faces.
 
-### Current next work (2026-09-03 audit)
+M12 graph scheduling completed on 2026-09-05 as an independent increment while
+Metal hardware acceptance remains unavailable. Compilation uses explicit pass
+dependencies plus unversioned-resource RAW/WAR/WAW and texture-layout hazards.
+Ready passes use the lowest declaration ID first; without explicit dependencies,
+existing declaration order is preserved. Compilation is cached until declarations
+change and rejects invalid edges/cycles before allocations or callbacks. This is
+one serial command stream, not async compute, pass culling, resource aliasing, or
+a claim of improved frame time. Callbacks must declare all uses, share one graph
+ID per imported handle, and declare framebuffer attachment texture uses separately.
 
-1. Register a Metal-capable Apple Silicon runner with the workflow's
-   `self-hosted`, `macOS`, `ARM64`, and `metal` labels.
-2. Dispatch the Metal-hardware acceptance job and admit M17 only after clean API
+The same-state write regression first reproduced two barriers instead of four
+in frame one and zero instead of four in frame two. Equal states now elide a
+barrier only for read-only access, consistent with the
+[Khronos synchronization examples](https://github.khronos.org/Vulkan-Site/guide/latest/synchronization_examples.html).
+Six focused graph cases / 592 assertions cover ordering, 130-pass execution,
+cache invalidation, invalid dependencies, cycles, resource hazards, and retained
+barriers. Native M13 kernels additionally run two graph dispatches across two
+frames, validate the emitted barriers, and require byte-identical readback versus
+direct dispatch on OpenGL, Vulkan, and DX12. Windows GCC Release (451 test cases),
+MSVC Release, and MSVC ASan each pass all six CTest groups. No new Linux/Apple CI or visual
+capture acceptance is claimed by this local increment.
+
+### Current next work (2026-09-12)
+
+1. M16 remains partial. Cross-policy height-transition triangles are the
+   existing paired-profile walls. The [solid-column contract](solid-ownership.md)
+   classifies boundary and corner volume for Height and Hex columns, including
+   finite hex floors and nonplanar triangle tops, and fails closed for
+   discontinuous breakpoints, nonmanifold corners, inconsistent sectors,
+   precision collapse, voxel cavities, voxel overhangs and any voxel column.
+   It does not change voxel-DDA or bilinear sampling, and it is not installed
+   as a WorldStreamer query. Still open: full-world policy coverage, renderer
+   consumption of the engine accepted-view slot, continuous frame-by-frame
+   coverage (including edits and region changes during travel), and budget
+   acceptance for non-preemptible work and large shared-map edits. The opt-in
+   [regional surface mode](regional-surfaces.md) now clips published CPU
+   triangles after edit replay and admits intersecting chunk bounds. It fills
+   the tested hex interior. A separate [hex cut-wall option](hex-cut-walls.md)
+   now closes prism cuts to their existing floor. The [voxel cut-face option](voxel-cut-faces.md)
+   exposes cell-aligned cuts while preserving cavities. Regular meshing jobs
+   still snapshot same-policy neighbors only; transition walls come from the
+   separate paired-profile path.
+   The [reference boundary profiles](height-hex-boundary-profiles.md) now expose
+   both published top subdivisions, coverage counts and local source stamps.
+   The [canonical endpoint fix](canonical-hex-endpoints.md) closes the measured
+   microscopic interval for regional hex meshes. The [dependency capture API](boundary-dependencies.md)
+   now freezes both published sources and validates versions/membership before
+   acceptance. The [profile job controller](boundary-profile-jobs.md) now runs
+   that comparison asynchronously with stale-result retry on explicit ticks.
+   The [isolated wall builder](boundary-wall-geometry.md) now generates triangles
+   from complete paired profiles, including height crossings and per-span ownership.
+   The [coplanar trim primitive](boundary-face-trimming.md) can now remove covered
+   old faces on private copies. The [top-edge splitter](boundary-top-stitching.md)
+   now reconciles existing source edges with canonical wall points in the native
+   fixture. The [immutable replacement package](boundary-replacement-packages.md)
+   now combines one boundary's sources/walls in one world-space frame and retains
+   dependency stamps. The [disjoint composer](boundary-composition.md) now applies
+   separated boundaries to shared source meshes without discarding prior cuts or
+   duplicating sources. The [endpoint junction builder](boundary-junctions.md) now
+   validates compatible sector heights and reconciles vertical corner wall edges.
+   The [displayed corner integration](displayed-boundary-corners.md) now retains
+   combined dependencies, stages per-policy meshes under their freshness gate,
+   suppresses represented originals and switches the demo's displayed-surface
+   queries with the render view. The [live requested-corner controller](live-boundary-corners.md)
+   now rebuilds immutable compositions on a worker, rejects stale results and
+   stages complete resident/render/query replacements after source changes.
+   [Incremental upload admission](incremental-boundary-uploads.md) now spreads
+   resident/policy work and retirement over ticks, preserving hidden staging and
+   whole-view freshness. [Explicit retirement/retargeting](boundary-retargeting.md)
+   now stages plain and composed targets across departure/return. [Bounded discovery](boundary-discovery.md)
+   now selects ownership edges within caller-supplied windows. Next derive those
+   windows from camera/residency coverage, add continuous moving-coverage gates and profile
+   the remaining non-preemptible operations for tighter frame budgets.
+   Incomplete requested corners without a new explicit target still retain
+   the entire prior view; window-local discovery does not establish arbitrary world coverage.
+   Extend shared world queries without silently changing their existing contracts.
+   Default center-selected whole chunks still retain the old behavior.
+   Do not substitute a render-only clip or taller skirts for physical closure.
+   The [shared meter footprint](world-space-streaming.md) is now
+   available as an opt-in geometric-center square; legacy chunk-count rings
+   remain the default. Capacity can still truncate either mode, and center
+   selection is not a mesh-intersection or gap-free coverage guarantee.
+   The 224-capture policy gate includes the full voxel-region comparison,
+   90 unsynchronized live mutations, exact restored CPU/image checks, and new
+   frozen corner before/after, close-up and camera-position comparisons, plus
+   live-request pending/partial-upload/edit/restored captures and explicit
+   plain-terrain departure/composed return with exact restoration.
+   One/four-worker fresh-reference tests cover both footprint modes, eviction and
+   off-thread planning, but do not establish race freedom or arbitrary stress
+   acceptance. Very large meter plans can repeatedly cancel under continuous
+   motion; stale terrain is retained while planning is pending. A moving-camera
+   coverage/budget acceptance gate is still needed. Tiled hex packing within one
+   policy remains fixed at the cell-lattice level, not proven numerically closed.
+   A [versioned published-triangle query](published-terrain-queries.md) now
+   provides a common surface probe for all policies. The old diagnostic records
+   a miss at the hex gap; the opt-in comparison hits there and at 64 interior
+   probes. Neither the static grid nor image repeatability proves watertightness.
+   Composed transition meshes feed the accepted-view ray query. The solid-column
+   classifier is a separate reference contract and does not change cell-DDA or
+   bilinear sampling.
+   Continue profiling non-preemptible operations and large shared-map edits;
+   cooperative progress exceptions still prevent a hard budget claim. M16
+   remains partial; existing height save/upload/reload gates are preserved.
+2. Continue independent M12 work on the available Windows PC: profile the
+   renderer to select the next occlusion, multithreaded recording, or SIMD
+   increment. Async compute needs a separate queue/ownership design and measured
+   evidence of useful overlap; the serial graph scheduler does not close it.
+3. M17 remains partial: the owner confirmed only this PC is available and no
+   Metal runner is registered. When Apple hardware becomes available, register
+   a runner with `self-hosted`, `macOS`, `ARM64`, and `metal` labels.
+4. Dispatch the Metal-hardware acceptance job and admit M17 only after clean API
    and shader diagnostics, swapchain resize/presentation, the locked M11
    full-frame gate, M13 arithmetic parity, and visual inspection of all 27
    repeated captures.
-3. Resume the remaining M12 profiling, occlusion, multithreaded recording, SIMD,
-   render-graph scheduling, and async-compute work after backend conformance is
-   closed, unless profiling identifies a release blocker first.
 
 ## 11. Procgen Deep Dive: Chunk Frame & Cell Policies
 
@@ -1053,9 +1367,13 @@ chosen simple and safe; each carries a documented upgrade path.
   BiomeTable) + 4× u8 material weights normalized to Σ=255 (splat map).
 - **Normals**: central differences; edge samples read NEIGHBOR TILES' rows
   so lighting never reveals tile seams.
-- **Sampling contract**: `worldXZ → bilinear height/biome`. Gameplay
-  (collision, spawning) uses the SAME sampler as rendering — one source of
-  truth, divergence impossible.
+- **Sampling contract**: `worldXZ → bilinear height/biome` remains available
+  over resident samples. It differs from triangle interpolation on nonplanar
+  quads and does not apply regional mesh cuts. Use published-triangle rays for
+  the CPU surface contract; GPU upload may lag publication. Interior Height
+  columns are solid at and below that triangle top. Boundary and corner volume
+  rules, including their fail-closed cases, are in [solid ownership](solid-ownership.md).
+  That reference contract is not a general voxel solid query.
 - **LOD**: fixed 2-triangle quads v1, CDLOD-style skirts to hide level
   cracks (M15); no dynamic tessellation.
 - **Overhangs/caves**: impossible inside a height tile BY DESIGN — such
@@ -1081,6 +1399,13 @@ chosen simple and safe; each carries a documented upgrade path.
   Cells outside the hex-shaped region hold `kInvalidCell`. Irregular island
   maps may instead back onto `HashMap<AxialCoord, Cell>` behind the same
   interface.
+- **Chunk layout (M16 follow-up)**: new `WorldStreamingConfig` defaults to
+  `HexLayout::Tiled`, with axial center basis `(2R+1,-R)` and `(R,R+1)` for
+  chunk X/Z. The radius-R shape and local offset-row indices stay unchanged.
+  Standalone `HexPolicyParams` retains `LegacySpaced` by default for old
+  generation/goldens. Tiled hex deltas use version 2 plus generation identity;
+  legacy hex/voxel/height retain version 1. Cross-layout loads are rejected,
+  not silently migrated. See [compatibility details](hex-streaming-layout.md).
 - **Elevation is stored PER CORNER, not per cell**: a corner lattice where
   every hex shares its six corners with its neighbors guarantees watertight
   prisms — no T-junction cracks, ever. Corner heights come from M13 noise

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <variant>
@@ -98,10 +99,13 @@ struct HeightPolicyParams {
                                      const HeightPolicyParams&) -> bool = default;
 };
 
+enum class HexLayout : std::uint8_t { LegacySpaced, Tiled };
+
 struct HexPolicyParams {
     std::uint32_t radius = 16;
     float heightAmplitude = 8.0f;
     float frequency = 0.03125f;
+    HexLayout layout = HexLayout::LegacySpaced;
     friend constexpr auto operator==(const HexPolicyParams&,
                                      const HexPolicyParams&) -> bool = default;
 };
@@ -204,6 +208,9 @@ struct HeightTile {
     friend auto operator==(const HeightTile& a, const HeightTile& b) -> bool;
 };
 
+// Shared edit/codec validity rule: finite height and normalized byte weights.
+[[nodiscard]] auto validHeightSample(const HeightSample& sample) -> bool;
+
 [[nodiscard]] constexpr auto heightSampleIndex(std::uint32_t x, std::uint32_t z)
     -> std::uint32_t {
     return z * kHeightSamples + x;
@@ -246,6 +253,7 @@ struct HexTile {
     std::uint32_t width = 0;
     containers::Array<HexCell> cells;
     containers::HashMap<HexCornerCoord, float> cornerHeights;
+    HexLayout layout = HexLayout::LegacySpaced;
 
     [[nodiscard]] auto contains(AxialCoord coordinate) const -> bool;
     [[nodiscard]] auto index(AxialCoord coordinate) const -> std::optional<std::uint32_t>;
@@ -267,6 +275,13 @@ inline constexpr std::array<AxialCoord, 6> kHexDirections{{
     -> containers::Array<AxialCoord>;
 [[nodiscard]] auto generateHexTile(std::uint64_t worldSeed, ChunkCoord coord,
                                    const HexPolicyParams& params) -> HexTile;
+// Tiled basis (2R+1,-R), (R,R+1) partitions the cell lattice into radius-R hexes.
+// LegacySpaced retains the original width-stride generation and cell indices.
+[[nodiscard]] auto hexChunkOrigin(ChunkCoord coord, std::uint32_t radius, HexLayout layout)
+    -> std::optional<AxialCoord>;
+[[nodiscard]] auto hexChunkAt(AxialCoord cell, std::uint32_t radius, HexLayout layout)
+    -> std::optional<ChunkCoord>;
+[[nodiscard]] auto hexCellAt(math::Vec3 position, float radius) -> std::optional<AxialCoord>;
 
 struct HexPolicy {
     using Cell = HexCell;
@@ -329,6 +344,10 @@ class RegionMap {
 public:
     explicit RegionMap(std::int32_t tileExtentMeters = 512,
                        PolicyKind defaultPolicy = PolicyKind::Height);
+    // Value-semantic snapshots share immutable storage; mutations detach.
+    // Distinct copies can be read concurrently with edits to the main-thread map.
+    RegionMap(const RegionMap&) = default;
+    auto operator=(const RegionMap& other) -> RegionMap&;
     [[nodiscard]] auto regionFor(std::int32_t worldX, std::int32_t worldZ) const
         -> RegionCoord;
     [[nodiscard]] auto policyAt(std::int32_t worldX, std::int32_t worldZ) const
@@ -336,11 +355,15 @@ public:
     void set(RegionCoord coord, PolicyKind policy);
     auto erase(RegionCoord coord) -> bool;
     [[nodiscard]] auto tileExtentMeters() const -> std::int32_t { return tileExtentMeters_; }
+    [[nodiscard]] auto revision() const -> std::uint64_t { return revision_; }
 
 private:
+    using Regions = containers::HashMap<RegionCoord, PolicyKind>;
+    void detach();
     std::int32_t tileExtentMeters_ = 512;
     PolicyKind defaultPolicy_ = PolicyKind::Height;
-    containers::HashMap<RegionCoord, PolicyKind> regions_;
+    std::shared_ptr<Regions> regions_ = std::make_shared<Regions>();
+    std::uint64_t revision_ = 0;
 };
 
 class ChunkStore {
@@ -367,6 +390,9 @@ public:
     [[nodiscard]] auto cell(ChunkHandle handle, std::uint32_t index) const
         -> std::optional<CellValue>;
     [[nodiscard]] auto snapshot(ChunkHandle handle) const -> std::optional<ChunkSnapshot>;
+    // Sorted edit-only snapshot for unload persistence; never copies base cells.
+    [[nodiscard]] auto snapshotDeltas(ChunkHandle handle) const
+        -> std::optional<containers::Array<ChunkDelta>>;
     auto markDirty(ChunkHandle handle, DirtyFlags flags) -> bool;
     auto markMeshed(ChunkHandle handle, std::uint64_t snapshotVersion) -> bool;
 

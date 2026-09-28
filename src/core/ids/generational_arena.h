@@ -56,6 +56,8 @@ public:
         return Id{index, slot.generation};
     }
 
+    [[nodiscard]] auto full() const -> bool { return freeIndices_.isEmpty(); }
+
     void release(Id id) {
         Slot& slot = checkedSlot(id);
         slot.object()->~T();

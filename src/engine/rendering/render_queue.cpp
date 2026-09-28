@@ -16,6 +16,7 @@ template <typename Tag>
 }
 
 [[nodiscard]] auto compareBatchState(const RenderItem& a, const RenderItem& b) -> int {
+    if (a.mirrored != b.mirrored) return a.mirrored ? 1 : -1;
     if (a.pipelineSortKey != b.pipelineSortKey) {
         return a.pipelineSortKey < b.pipelineSortKey ? -1 : 1;
     }

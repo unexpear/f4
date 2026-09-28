@@ -231,6 +231,14 @@ void CubeScene::shutdown(gfx::IDevice* dev) {
 
 void CubeScene::onResize(std::uint32_t, std::uint32_t) {}
 
+bool CubeScene::prepareStaticCapture(FreeCamera& camera) {
+    angle_ = 0.0f;
+    camera.position = {4.0f, 3.0f, 5.0f};
+    camera.yaw = std::atan2(5.0f, 4.0f);
+    camera.pitch = std::atan2(3.0f, std::sqrt(41.0f));
+    return true;
+}
+
 void CubeScene::update(float dt, const Uint8*, const SDL_MouseMotionEvent*) {
     if (!inited_) return;
     angle_ += dt * 0.7f;

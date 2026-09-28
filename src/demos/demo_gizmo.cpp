@@ -37,11 +37,11 @@ void pushCube(std::vector<Vert>& out, math::Vec3 center, math::Vec3 half, math::
         {cx+hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz+hz, color.x,color.y,color.z},
         {cx+hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},
         // -Y
-        {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz+hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz-hz, color.x,color.y,color.z},
-        {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx-hx,cy-hy,cz+hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz+hz, color.x,color.y,color.z},
+        {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz+hz, color.x,color.y,color.z},
+        {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz+hz, color.x,color.y,color.z},{cx-hx,cy-hy,cz+hz, color.x,color.y,color.z},
         // +Y
-        {cx-hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},
-        {cx-hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},{cx-hx,cy+hy,cz+hz, color.x,color.y,color.z},
+        {cx-hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz-hz, color.x,color.y,color.z},
+        {cx-hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx-hx,cy+hy,cz+hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz+hz, color.x,color.y,color.z},
         // -Z
         {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy-hy,cz-hz, color.x,color.y,color.z},
         {cx-hx,cy-hy,cz-hz, color.x,color.y,color.z},{cx-hx,cy+hy,cz-hz, color.x,color.y,color.z},{cx+hx,cy+hy,cz-hz, color.x,color.y,color.z},
@@ -70,6 +70,22 @@ bool GizmoScene::init(gfx::IDevice* dev, platform::Window*){
     pushCube(verts, {0.5f,0.55f,0.35f}, {0.15f,0.05f,0.05f}, {1,1,0.2f});
     // Middle bar of F (shorter)
     pushCube(verts, {0.45f,0.35f,0.35f}, {0.10f,0.05f,0.05f}, {1,1,0.2f});
+    // Validate the actual uploaded triangles, so smoke/static gates catch a
+    // winding regression even when a particular camera hides the broken face.
+    for (std::size_t box = 0; box < verts.size(); box += 36) {
+        math::Vec3 center{};
+        for (std::size_t i = 0; i < 36; ++i) {
+            const auto& v = verts[box + i];
+            center += math::Vec3{v.x, v.y, v.z} / 36.f;
+        }
+        for (std::size_t i = 0; i < 36; i += 3) {
+            const auto& va = verts[box + i];
+            const auto& vb = verts[box + i + 1];
+            const auto& vc = verts[box + i + 2];
+            const math::Vec3 a{va.x, va.y, va.z}, b{vb.x, vb.y, vb.z}, c{vc.x, vc.y, vc.z};
+            if (math::dot(math::cross(b - a, c - a), a - center) <= 0.f) return false;
+        }
+    }
     gfx::BufferDesc bd; bd.sizeBytes = verts.size()*sizeof(Vert); bd.usage=gfx::BufferUsage::Vertex;
     auto vb=dev->createBuffer(bd, std::span(reinterpret_cast<const std::byte*>(verts.data()), verts.size()*sizeof(Vert)));
     if (!vb.hasValue()) return false;
@@ -95,9 +111,14 @@ bool GizmoScene::init(gfx::IDevice* dev, platform::Window*){
       gfx::VertexInputLayout::VertexAttribute ca; ca.binding=0; ca.location=1; ca.format=gfx::VertexFormat::Float32x3; ca.offsetBytes=12; pd.vertexInput.attributes.push(ca);
     }
     auto pipe=dev->createPipeline(pd); if(!pipe.hasValue()) return false; pipe_=pipe.value();
+    pd.raster.frontClockwise = true;
+    auto mirrored = dev->createPipeline(pd);
+    if (!mirrored.hasValue()) return false;
+    mirroredPipe_ = mirrored.value();
     return true;
 }
 void GizmoScene::shutdown(gfx::IDevice* dev){
+    if(mirroredPipe_.isValid()) dev->destroyPipeline(mirroredPipe_);
     if(pipe_.isValid()) dev->destroyPipeline(pipe_);
     if(fs_.isValid()) dev->destroyShader(fs_);
     if(vs_.isValid()) dev->destroyShader(vs_);
@@ -110,6 +131,13 @@ void GizmoScene::update(float dt, const Uint8* keys, const SDL_MouseMotionEvent*
     hHeld_ = h;
     angle_ += dt * 0.4f;
 }
+bool GizmoScene::prepareStaticCapture(FreeCamera& camera) {
+    camera.position = {2.2f, 2.f, 4.5f};
+    camera.yaw = std::atan2(4.f, 1.7f);
+    camera.pitch = std::atan2(1.5f, std::sqrt(4.f * 4.f + 1.7f * 1.7f));
+    return true;
+}
+
 void GizmoScene::render(gfx::CommandBuffer& cb, const FreeCamera& cam, std::uint32_t w, std::uint32_t h){
     float aspect = h>0? float(w)/float(h):1.f;
     math::Mat4 viewProj = cam.viewProjMatrix(aspect);
@@ -128,7 +156,7 @@ void GizmoScene::render(gfx::CommandBuffer& cb, const FreeCamera& cam, std::uint
     struct Ubo{ math::Mat4 viewProj; math::Mat4 model; };
     Ubo ubo{viewProj, model};
     if(dev_) dev_->writeBuffer(ubo_,0,std::span(reinterpret_cast<const std::byte*>(&ubo), sizeof(ubo)));
-    cb.bindPipeline(pipe_);
+    cb.bindPipeline(isRH_ ? pipe_ : mirroredPipe_);
     cb.bindVertexBuffer(0, vbCube_, sizeof(Vert));
     cb.bindResource(0, gfx::BindingType::UniformBuffer, ubo_.index, ubo_.generation);
     // 9 cubes *36 verts = 324 verts
