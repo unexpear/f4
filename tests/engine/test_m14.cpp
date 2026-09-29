@@ -110,6 +110,91 @@ TEST_CASE("M14: floor division and coordinate hashes preserve negative-space ide
     CHECK(regions.erase({-1, 1}));
 }
 
+TEST_CASE("M14: region snapshots retain independent values and revisions") {
+    RegionMap original(32, PolicyKind::Height);
+    original.set({0, 0}, PolicyKind::Voxel);
+    RegionMap copy(original);
+    const auto revision = original.revision();
+    original.set({0, 0}, PolicyKind::Voxel);
+    CHECK_FALSE(original.erase({4, 4}));
+    CHECK(original.revision() == revision);
+    original.set({0, 0}, PolicyKind::Hex);
+    CHECK(original.revision() == revision + 1);
+    CHECK(copy.policyAt(0, 0) == PolicyKind::Voxel);
+    REQUIRE(copy.erase({0, 0}));
+    CHECK(copy.policyAt(0, 0) == PolicyKind::Height);
+    CHECK(original.policyAt(0, 0) == PolicyKind::Hex);
+
+    RegionMap assigned;
+    const auto assignedRevision = assigned.revision();
+    assigned = original;
+    CHECK(assigned.revision() == assignedRevision + 1);
+    CHECK(assigned.tileExtentMeters() == 32);
+    assigned.set({1, 0}, PolicyKind::Voxel);
+    CHECK(assigned.policyAt(32, 0) == PolicyKind::Voxel);
+    CHECK(original.policyAt(32, 0) == PolicyKind::Height);
+    REQUIRE(original.erase({0, 0}));
+    CHECK(assigned.policyAt(0, 0) == PolicyKind::Hex);
+}
+
+TEST_CASE("M14: worker region snapshots stay coherent during main-map edits") {
+    RegionMap original(1);
+    for (std::int32_t i = 0; i < 1024; ++i) original.set({i, 0}, PolicyKind::Voxel);
+    const RegionMap snapshot(original);
+    std::atomic<bool> started = false;
+    std::atomic<bool> coherent = true;
+    std::thread reader([&] {
+        started.store(true);
+        for (unsigned pass = 0; pass < 16; ++pass) {
+            for (std::int32_t i = 0; i < 1024; ++i) {
+                if (snapshot.policyAt(i, 0) != PolicyKind::Voxel) coherent.store(false);
+            }
+        }
+    });
+    while (!started.load()) std::this_thread::yield();
+    for (std::int32_t i = 0; i < 1024; ++i) original.set({i, 0}, PolicyKind::Hex);
+    reader.join();
+    CHECK(coherent.load());
+    CHECK(original.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(snapshot.policyAt(0, 0) == PolicyKind::Voxel);
+}
+
+TEST_CASE("M14: edit-only snapshots preserve sorted isolated deltas and reject stale handles") {
+    for (const auto policy : {PolicyKind::Voxel, PolicyKind::Height}) {
+        ChunkStore store(1);
+        const auto handle = store.create({}, 42, policy);
+        CHECK_FALSE(store.snapshotDeltas({}).has_value());
+        CHECK_FALSE(store.snapshotDeltas(handle).has_value());
+        REQUIRE(store.queue(handle));
+        CHECK_FALSE(store.snapshotDeltas(handle).has_value());
+        REQUIRE(store.generate(handle));
+        const auto empty = store.snapshotDeltas(handle);
+        REQUIRE(empty.has_value());
+        CHECK(empty->isEmpty());
+        const auto value = policy == PolicyKind::Voxel ? CellValue::voxelValue(301)
+            : CellValue::heightValue(HeightSample{42.f, 0, {255, 0, 0, 0}});
+        REQUIRE(store.edit(handle, 900, value));
+        REQUIRE(store.edit(handle, 2, value));
+        const auto deltas = store.snapshotDeltas(handle);
+        const auto full = store.snapshot(handle);
+        REQUIRE(deltas.has_value());
+        REQUIRE(full.has_value());
+        REQUIRE(deltas->size() == 2);
+        REQUIRE(full->deltas.size() == 2);
+        CHECK((*deltas)[0].index == 2);
+        CHECK((*deltas)[1].index == 900);
+        CHECK((*deltas)[0] == full->deltas[0]);
+        CHECK((*deltas)[1] == full->deltas[1]);
+        REQUIRE(store.edit(handle, 3, value));
+        CHECK(deltas->size() == 2);
+        REQUIRE(store.destroy(handle));
+        const auto replacement = store.create({}, 42, policy);
+        CHECK(replacement.generation != handle.generation);
+        CHECK_FALSE(store.snapshotDeltas(handle).has_value());
+        CHECK((*deltas)[0].value == value);
+    }
+}
+
 TEST_CASE("M14: block registry enforces reserved and game id ranges") {
     BlockRegistry blocks;
     REQUIRE(blocks.find(0) != nullptr);

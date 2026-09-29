@@ -47,7 +47,7 @@ struct FreeCamera {
         float cy = std::cos(yaw), sy = std::sin(yaw);
         float cp = std::cos(pitch), sp = std::sin(pitch);
         math::Vec3 forward = {-cy * cp, -sp, -sy * cp};
-        math::Vec3 right = {-sy, 0.f, cy};
+        math::Vec3 right = {sy, 0.f, -cy};
         math::Vec3 up = {0.f, 1.f, 0.f};
 
         if (keys[SDL_SCANCODE_W]) position += forward * speed;
@@ -58,8 +58,8 @@ struct FreeCamera {
         if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]) position -= up * speed;
 
         if (mouseMotion) {
-            yaw -= mouseMotion->xrel * mouseSensitivity;
-            pitch -= mouseMotion->yrel * mouseSensitivity;
+            yaw += mouseMotion->xrel * mouseSensitivity;
+            pitch += mouseMotion->yrel * mouseSensitivity;
             const float maxPitch = 1.55f;
             if (pitch > maxPitch) pitch = maxPitch;
             if (pitch < -maxPitch) pitch = -maxPitch;
@@ -81,6 +81,15 @@ struct IDemoScene {
                               std::uint32_t /*width*/, std::uint32_t /*height*/,
                               gfx::FramebufferHandle /*target*/) {}
     virtual void renderHud(gfx::CommandBuffer& /*cb*/, std::uint32_t /*width*/, std::uint32_t /*height*/) {}
+    virtual bool prepareStaticCapture(FreeCamera& /*camera*/) { return true; }
+};
+
+struct DemoRunOptions {
+    std::size_t smokeFramesPerScene = 0;
+    const char* captureDirectory = nullptr;
+    bool staticCapture = false;
+    bool onlyScene = false;
+    std::uint32_t staticView = 0; // 0 overview; 1..6 +Z/-Z/-X/+X/+Y/-Y (cube only).
 };
 
 // Demo bench: owns window/device/HUD, manages scene switching
@@ -93,10 +102,10 @@ public:
     DemoBench& operator=(const DemoBench&) = delete;
 
     // Register a scene (takes ownership)
-    void addScene(IDemoScene* scene);
+    void addScene(IDemoScene* scene, const char* captureExpectation = "Inspect geometry, depth and coverage.");
 
     // Run interactively, or visit every scene for a bounded number of frames.
-    int run(std::size_t smokeFramesPerScene = 0, const char* captureDirectory = nullptr);
+    int run(const DemoRunOptions& options = {});
 
     // Switch to scene by index. Keyboard shortcuts cover 0-17; Tab covers all.
     bool setScene(std::size_t index);
@@ -118,6 +127,7 @@ private:
     ::demo::Hud hud_;
     diag::Diagnostics diagnostics_;
     containers::Array<IDemoScene*> scenes_;
+    containers::Array<const char*> captureExpectations_;
     std::size_t current_ = 0;
     bool hasCurrent_ = false;
     FreeCamera camera_;
@@ -125,6 +135,8 @@ private:
     gfx::FramebufferHandle overlayFb_;
     bool mouseCaptured_ = true;
     bool running_ = false;
+    bool staticCapture_ = false;
+    gfx::Extent staticExtent_{};
     Uint64 prevTicks_ = 0;
     Uint64 freq_ = 0;
 

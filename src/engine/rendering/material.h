@@ -31,6 +31,7 @@ enum class MaterialImportError : std::uint8_t {
     TextureIndexOutOfRange,
     InvalidTextureHandle,
     UnsupportedTexCoord,
+    CapacityExceeded,
 };
 
 // Core glTF 2.0 metallic-roughness material. Invalid texture handles resolve
@@ -74,6 +75,7 @@ struct MaterialPipelineVariant {
     std::uint64_t vertexLayoutHash = 0;
     gfx::VertexInputLayout vertexInput;
     gfx::PipelineHandle pipeline{};
+    bool mirrored = false;
 };
 
 // Converts loader-owned glTF indices into renderer-owned texture handles.
@@ -114,15 +116,18 @@ public:
     // Get existing or create a new StandardMaterial (pipeline lazily created by
     // caller via ensurePipeline). If newly created, returns a fresh handle with
     // empty pipeline (caller must create shaders/pipeline and assign).
+    // Returns invalid when all 64 slots are occupied and no existing desc matches.
     auto getOrCreate(const StandardMaterialDesc& desc) -> resources::MaterialHandle;
 
     // M8 compatibility overload using the canonical position/normal/UV/color
     // layout. Renderer uses the mesh-aware overload below.
     auto ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle h) -> gfx::GfxError;
     auto ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle h,
-                        const gfx::VertexInputLayout& vertexInput) -> gfx::GfxError;
+                        const gfx::VertexInputLayout& vertexInput,
+                        bool mirrored = false) -> gfx::GfxError;
     [[nodiscard]] auto pipelineFor(resources::MaterialHandle h,
-                                   const gfx::VertexInputLayout& vertexInput) const
+                                   const gfx::VertexInputLayout& vertexInput,
+                                   bool mirrored = false) const
         -> gfx::PipelineHandle;
 
     // Shadow pipelines share one shader pair and vary only by mesh layout.

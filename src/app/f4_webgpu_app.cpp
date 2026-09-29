@@ -849,6 +849,43 @@ auto validateRendererFrame() -> bool {
                                GfxError::None &&
                            renderer.stats().draws == 1 && renderer.stats().instances == 1;
             }
+            if (rendered) {
+                const auto second = registry.create();
+                auto& left = *registry.get<f4::ecs::LocalTransform>(object);
+                left.position.x = -0.48f;
+                left.scale = {-0.68f, 0.68f, 0.68f};
+                f4::ecs::tagTransformDirty(registry, object);
+                f4::ecs::LocalTransform right;
+                right.position.x = 0.48f;
+                right.scale = {0.68f, 0.68f, 0.68f};
+                registry.emplace<f4::ecs::LocalTransform>(second, right);
+                registry.emplace<f4::engine::MeshRenderer>(
+                    second, f4::engine::MeshRenderer{mesh, material, 0, false, false});
+                f4::ecs::updateWorldTransforms(registry);
+                std::array<std::byte, kRendererCaptureBytes> mirrored{};
+                rendered = renderer.render(framebuffer, cameraEntity, 1.f) == GfxError::None &&
+                           gApp.webGpu->readTexture(color, 0, mirrored) == GfxError::None &&
+                           renderer.stats().draws == 2 && renderer.stats().instances == 2;
+                std::array<std::size_t, 2> coverage{};
+                for (std::uint32_t y = 0; y < kRendererExtent; ++y) {
+                    for (std::uint32_t x = 0; x < kRendererExtent; ++x) {
+                        if (std::to_integer<unsigned>(mirrored[(y * kRendererExtent + x) * 4]) > 20)
+                            ++coverage[x < kRendererExtent / 2 ? 0 : 1];
+                    }
+                }
+                rendered = rendered && coverage[0] > 50 && coverage[1] > 50;
+                registry.destroy(second);
+                *registry.get<f4::ecs::LocalTransform>(object) = {};
+                f4::ecs::tagTransformDirty(registry, object);
+                f4::ecs::updateWorldTransforms(registry);
+                // Reusing the ordinary pipeline must restore winding state and
+                // preserve the established (unmodified) native reference image.
+                rendered = rendered &&
+                           renderer.render(framebuffer, cameraEntity, 1.f) == GfxError::None &&
+                           gApp.webGpu->readTexture(color, 0, mirrored) == GfxError::None &&
+                           mirrored == gApp.rendererCapture;
+                if (!rendered) fail("WebGPU mirrored-instance coverage or winding recovery failed");
+            }
         }
     }
 

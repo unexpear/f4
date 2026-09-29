@@ -57,6 +57,13 @@ auto NullDevice::createBuffer(const BufferDesc& desc, std::span<const std::byte>
     if (initialData.size() > desc.sizeBytes) {
         return GfxError::BadDescriptor; // initial data must fit the buffer
     }
+    if (bufferFailureCountdown_) {
+        if (*bufferFailureCountdown_ == 0) {
+            bufferFailureCountdown_.reset();
+            return GfxError::OutOfMemory;
+        }
+        --*bufferFailureCountdown_;
+    }
     NullBuffer record;
     record.rec.sizeBytes = desc.sizeBytes;
     record.rec.usage = desc.usage;
@@ -106,6 +113,11 @@ auto NullDevice::createShader(const ShaderDesc& desc) -> Result<ShaderHandle, Gf
 }
 
 auto NullDevice::createPipeline(const PipelineStateDesc& desc) -> Result<PipelineHandle, GfxError> {
+    if (nextPipelineError_ != GfxError::None) {
+        const auto error = nextPipelineError_;
+        nextPipelineError_ = GfxError::None;
+        return error;
+    }
     if (desc.layout.pushConstantSizeBytes != 0) return GfxError::BadDescriptor;
     const bool compute = desc.computeShader.isValid();
     const bool hasVertex = desc.vertexShader.isValid();

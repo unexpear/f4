@@ -1506,7 +1506,8 @@ auto VulkanDevice::createPipeline(const PipelineStateDesc& desc)
     raster.depthClampEnable = desc.raster.depthClampEnable ? VK_TRUE : VK_FALSE;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
     raster.cullMode = vkCull(desc.raster.cullMode);
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.frontFace = desc.raster.frontClockwise ? VK_FRONT_FACE_CLOCKWISE
+                                                 : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;

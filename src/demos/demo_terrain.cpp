@@ -279,6 +279,13 @@ void TerrainScene::onResize(std::uint32_t, std::uint32_t) {}
 
 void TerrainScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {}
 
+bool TerrainScene::prepareStaticCapture(FreeCamera& camera) {
+    camera.position = {1.5f, 8.f, 14.f};
+    camera.yaw = 1.57079633f;
+    camera.pitch = std::atan2(9.f, 14.f);
+    return true;
+}
+
 void TerrainScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
                           std::uint32_t width, std::uint32_t height) {
     if (!inited_ || height == 0) return;

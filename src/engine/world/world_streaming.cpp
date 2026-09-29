@@ -1,17 +1,22 @@
 #include "engine/world/world_streaming.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "core/jobs/job_system.h"
+#include "engine/world/terrain_regions.h"
 
 namespace {
 
@@ -69,27 +74,129 @@ struct StreamingKeyLess {
     return static_cast<std::int32_t>(result);
 }
 
-[[nodiscard]] auto worldCenter(std::int32_t coordinate, std::int32_t extent)
-    -> std::optional<std::int32_t> {
-    const std::int64_t center = static_cast<std::int64_t>(coordinate) * extent + extent / 2;
-    if (center < std::numeric_limits<std::int32_t>::min() ||
-        center > std::numeric_limits<std::int32_t>::max()) {
-        return std::nullopt;
+[[nodiscard]] auto cameraCenter(PolicyKind policy, math::Vec3 camera,
+                                const WorldStreamingConfig& config) -> std::optional<ChunkCoord> {
+    if (policy == PolicyKind::Hex) {
+        const auto cell = hexCellAt(camera, config.hexRadius);
+        return cell ? hexChunkAt(*cell, config.policyParams.hex.radius, config.policyParams.hex.layout) : std::nullopt;
     }
-    return static_cast<std::int32_t>(center);
+    const auto extent = chunkExtent(policy, config.policyParams);
+    const auto x = cameraChunk(camera.x, extent);
+    const auto y = policy == PolicyKind::Voxel ? cameraChunk(camera.y, extent) : std::optional<std::int32_t>(0);
+    const auto z = cameraChunk(camera.z, extent);
+    return x && y && z ? std::optional<ChunkCoord>({*x, *y, *z}) : std::nullopt;
+}
+
+[[nodiscard]] auto chunkCenter(StreamingChunkKey key, const WorldStreamingConfig& config)
+    -> std::optional<std::array<long double, 3>> {
+    if (key.policy == PolicyKind::Hex) {
+        const auto origin = hexChunkOrigin(key.coord, config.policyParams.hex.radius, config.policyParams.hex.layout);
+        if (!origin || !std::isfinite(config.hexRadius) || config.hexRadius <= 0.f) return std::nullopt;
+        return std::array<long double, 3>{
+            (2LL * origin->q + origin->r) * 0.8660254037844386468L * config.hexRadius,
+            0.L, origin->r * 1.5L * config.hexRadius};
+    }
+    const auto extent = chunkExtent(key.policy, config.policyParams);
+    return std::array<long double, 3>{static_cast<long double>(key.coord.x) * extent + extent * 0.5L,
+        key.policy == PolicyKind::Voxel ? static_cast<long double>(key.coord.y) * extent + extent * 0.5L : 0.L,
+        static_cast<long double>(key.coord.z) * extent + extent * 0.5L};
+}
+
+struct HorizontalBounds {
+    std::int64_t minX, maxX, minZ, maxZ;
+};
+
+[[nodiscard]] auto terrainOrigin(StreamingChunkKey key, const WorldStreamingConfig& config) -> math::Vec3 {
+    const float x = static_cast<float>(key.coord.x), y = static_cast<float>(key.coord.y), z = static_cast<float>(key.coord.z);
+    if (key.policy == PolicyKind::Voxel) return {x * kVoxelEdge, y * kVoxelEdge, z * kVoxelEdge};
+    if (key.policy == PolicyKind::Height) return {x * kHeightQuads, 0.f, z * kHeightQuads};
+    const auto origin = hexChunkOrigin(key.coord, config.policyParams.hex.radius, config.policyParams.hex.layout);
+    if (!origin) return {};
+    return {static_cast<float>(2LL * origin->q + origin->r) * 0.8660254037844386f * config.hexRadius,
+            0.f, static_cast<float>(origin->r) * 1.5f * config.hexRadius};
+}
+
+[[nodiscard]] auto chunkFootprint(StreamingChunkKey key, const WorldStreamingConfig& config) -> TerrainFootprint {
+    const auto origin = terrainOrigin(key, config);
+    if (key.policy == PolicyKind::Hex) {
+        const auto radius = config.policyParams.hex.radius;
+        if (config.regionalSurfaceOwnership) {
+            const auto axial = hexChunkOrigin(key.coord, radius, config.policyParams.hex.layout);
+            if (!axial) return {NAN, NAN, NAN, NAN};
+            const std::int64_t x2 = 2LL * axial->q + axial->r, z2 = 3LL * axial->r;
+            const std::int64_t rx = 2LL * radius + 1, rz = 3LL * radius + 2;
+            const auto low = hexLatticePosition({x2 - rx, z2 - rz}, config.hexRadius);
+            const auto high = hexLatticePosition({x2 + rx, z2 + rz}, config.hexRadius);
+            if (!low || !high) return {NAN, NAN, NAN, NAN};
+            return {low.value().x, high.value().x, low.value().y, high.value().y};
+        }
+        // Same local corner-lattice arithmetic as meshHexChunk; conservative
+        // rectangular bounds can admit an empty clipped mesh at a hex corner.
+        const float x = static_cast<float>(2ull * radius + 1) * 0.8660254037844386f * config.hexRadius;
+        const float z = static_cast<float>(3ull * radius + 2) * 0.5f * config.hexRadius;
+        return {double(origin.x) - x, double(origin.x) + x, double(origin.z) - z, double(origin.z) + z};
+    }
+    const auto extent = chunkExtent(key.policy, config.policyParams);
+    return {origin.x, double(origin.x) + extent, origin.z, double(origin.z) + extent};
+}
+
+[[nodiscard]] auto horizontalBounds(PolicyKind policy, math::Vec3 camera,
+                                    const WorldStreamingConfig& config)
+    -> std::optional<HorizontalBounds> {
+    constexpr auto lo = std::numeric_limits<std::int32_t>::min();
+    constexpr auto hi = std::numeric_limits<std::int32_t>::max();
+    if (!std::isfinite(camera.x) || !std::isfinite(camera.y) || !std::isfinite(camera.z)) return std::nullopt;
+    if (!config.horizontalHalfExtentMeters) {
+        const auto center = cameraCenter(policy, camera, config);
+        if (!center) return std::nullopt;
+        const std::int64_t radius = config.horizontalRadius;
+        return HorizontalBounds{std::max<std::int64_t>(lo, center->x - radius),
+            std::min<std::int64_t>(hi, center->x + radius),
+            std::max<std::int64_t>(lo, center->z - radius),
+            std::min<std::int64_t>(hi, center->z + radius)};
+    }
+
+    // Invert the same center lattice used for rendering/region selection. The
+    // inverse of an axis-aligned square is a parallelogram for either hex layout.
+    const auto origin = chunkCenter({policy, {}}, config);
+    const auto xStep = chunkCenter({policy, {1, 0, 0}}, config);
+    const auto zStep = chunkCenter({policy, {0, 0, 1}}, config);
+    if (!origin || !xStep || !zStep) return std::nullopt;
+    const long double a = (*xStep)[0] - (*origin)[0], b = (*zStep)[0] - (*origin)[0];
+    const long double c = (*xStep)[2] - (*origin)[2], d = (*zStep)[2] - (*origin)[2];
+    const long double determinant = a * d - b * c;
+    if (!std::isfinite(determinant) || determinant <= 0.L) return std::nullopt;
+    const long double radius = *config.horizontalHalfExtentMeters;
+    long double minX = std::numeric_limits<long double>::infinity(), minZ = minX;
+    long double maxX = -minX, maxZ = -minX;
+    for (const int sx : {-1, 1}) {
+        for (const int sz : {-1, 1}) {
+            const long double x = static_cast<long double>(camera.x) + sx * radius - (*origin)[0];
+            const long double z = static_cast<long double>(camera.z) + sz * radius - (*origin)[2];
+            const long double cx = (d * x - b * z) / determinant;
+            const long double cz = (a * z - c * x) / determinant;
+            minX = std::min(minX, cx); maxX = std::max(maxX, cx);
+            minZ = std::min(minZ, cz); maxZ = std::max(maxZ, cz);
+        }
+    }
+    // One conservative lattice-cell margin protects exact-edge candidates from
+    // inverse rounding. Forward center tests below decide actual admission.
+    minX = std::max(std::floor(minX) - 1.L, static_cast<long double>(lo));
+    minZ = std::max(std::floor(minZ) - 1.L, static_cast<long double>(lo));
+    maxX = std::min(std::ceil(maxX) + 1.L, static_cast<long double>(hi));
+    maxZ = std::min(std::ceil(maxZ) + 1.L, static_cast<long double>(hi));
+    if (minX > maxX || minZ > maxZ) return std::nullopt;
+    return HorizontalBounds{static_cast<std::int64_t>(minX), static_cast<std::int64_t>(maxX),
+        static_cast<std::int64_t>(minZ), static_cast<std::int64_t>(maxZ)};
 }
 
 [[nodiscard]] auto squaredDistance(StreamingChunkKey key, math::Vec3 camera,
-                                   const PolicyParams& params) -> std::uint64_t {
-    const std::int32_t extent = chunkExtent(key.policy, params);
-    const long double centerX = static_cast<long double>(key.coord.x) * extent + extent * 0.5L;
-    const long double centerY = key.policy == PolicyKind::Voxel
-        ? static_cast<long double>(key.coord.y) * extent + extent * 0.5L
-        : 0.0L;
-    const long double centerZ = static_cast<long double>(key.coord.z) * extent + extent * 0.5L;
-    const long double dx = centerX - static_cast<long double>(camera.x);
-    const long double dy = centerY - static_cast<long double>(camera.y);
-    const long double dz = centerZ - static_cast<long double>(camera.z);
+                                   const WorldStreamingConfig& config) -> std::uint64_t {
+    const auto center = chunkCenter(key, config);
+    if (!center) return std::numeric_limits<std::uint64_t>::max();
+    const long double dx = (*center)[0] - static_cast<long double>(camera.x);
+    const long double dy = (*center)[1] - static_cast<long double>(camera.y);
+    const long double dz = (*center)[2] - static_cast<long double>(camera.z);
     const long double distance = dx * dx + dy * dy + dz * dz;
     if (distance >= static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
         return std::numeric_limits<std::uint64_t>::max();
@@ -138,10 +245,10 @@ struct StreamingKeyLess {
     if (snapshot.policy != PolicyKind::Hex) return false;
     const HexTile* tile = std::get_if<HexTile>(&snapshot.base);
     if (tile == nullptr || tile->width == 0) return false;
-    const std::int64_t localQ = static_cast<std::int64_t>(global.q) -
-        static_cast<std::int64_t>(snapshot.coord.x) * tile->width;
-    const std::int64_t localR = static_cast<std::int64_t>(global.r) -
-        static_cast<std::int64_t>(snapshot.coord.z) * tile->width;
+    const auto origin = hexChunkOrigin(snapshot.coord, tile->radius, tile->layout);
+    if (!origin) return false;
+    const std::int64_t localQ = static_cast<std::int64_t>(global.q) - origin->q;
+    const std::int64_t localR = static_cast<std::int64_t>(global.r) - origin->r;
     if (localQ < std::numeric_limits<std::int32_t>::min() ||
         localQ > std::numeric_limits<std::int32_t>::max() ||
         localR < std::numeric_limits<std::int32_t>::min() ||
@@ -157,6 +264,32 @@ struct StreamingKeyLess {
     return tile->cells[*index].terrainType != kInvalidTerrain;
 }
 
+[[nodiscard]] auto heightSkirtEdges(const ChunkSnapshot& center,
+                                   const std::vector<ChunkSnapshot>& neighbors) -> std::uint8_t {
+    std::uint8_t edges = 0x0f;
+    constexpr std::array<ChunkCoord, 4> directions{{{0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}}};
+    for (std::size_t edge = 0; edge < directions.size(); ++edge) {
+        for (const auto& neighbor : neighbors) {
+            if (neighbor.policy != PolicyKind::Height || neighbor.coord.y != center.coord.y ||
+                static_cast<std::int64_t>(neighbor.coord.x) - center.coord.x != directions[edge].x ||
+                static_cast<std::int64_t>(neighbor.coord.z) - center.coord.z != directions[edge].z) continue;
+            bool matches = true;
+            for (std::uint32_t i = 0; i < kHeightSamples; ++i) {
+                const auto cx = edge == 1 ? kHeightQuads : edge == 3 ? 0u : i;
+                const auto cz = edge == 0 ? 0u : edge == 2 ? kHeightQuads : i;
+                const auto nx = edge == 1 ? 0u : edge == 3 ? kHeightQuads : i;
+                const auto nz = edge == 0 ? kHeightQuads : edge == 2 ? 0u : i;
+                const auto a = snapshotHeight(center, heightSampleIndex(cx, cz));
+                const auto b = snapshotHeight(neighbor, heightSampleIndex(nx, nz));
+                if (!a || !b || a->height != b->height) { matches = false; break; }
+            }
+            if (matches) edges &= static_cast<std::uint8_t>(~(1u << edge));
+            break;
+        }
+    }
+    return edges;
+}
+
 } // namespace
 
 auto std::hash<f4::world::StreamingChunkKey>::operator()(
@@ -167,6 +300,210 @@ auto std::hash<f4::world::StreamingChunkKey>::operator()(
 }
 
 namespace f4::world {
+
+struct StreamingBoundarySnapshot::Data {
+    std::size_t meshBytes = 0;
+    StreamingBoundaryRequest request;
+    std::uint64_t revision = 0;
+    std::shared_ptr<const std::byte> owner;
+    std::array<std::vector<StreamingBoundarySource>, 2> sources;
+    std::array<std::vector<MeshData>, 2> meshes;
+    std::array<std::vector<math::Vec3>, 2> origins;
+};
+
+struct StreamingBoundaryReplacement::Data {
+    StreamingBoundarySnapshot snapshot;
+    TerrainBoundaryReplacement geometry;
+};
+
+auto StreamingBoundarySnapshot::meshBytes() const -> std::size_t {
+    return data_ ? data_->meshBytes : 0;
+}
+
+auto StreamingBoundaryReplacement::geometry() const -> const TerrainBoundaryReplacement* {
+    return data_ ? &data_->geometry : nullptr;
+}
+
+auto StreamingBoundaryReplacement::sources(bool positive) const -> std::span<const StreamingBoundarySource> {
+    return data_ ? data_->snapshot.sources(positive) : std::span<const StreamingBoundarySource>{};
+}
+
+auto StreamingBoundarySnapshot::buildReplacement(BoundaryReplacementLimits limits, std::uint16_t negativeMaterial,
+                                                std::uint16_t positiveMaterial) const
+    -> Result<StreamingBoundaryReplacement, BoundaryReplacementError> {
+    if (!data_) return BoundaryReplacementError::InvalidData;
+    std::array<std::vector<TerrainBoundaryMesh>, 2> views;
+    for (unsigned side = 0; side < 2; ++side)
+        for (std::size_t i = 0; i < data_->meshes[side].size(); ++i)
+            views[side].push_back({&data_->meshes[side][i], data_->origins[side][i]});
+    auto built = buildTerrainBoundaryReplacement(views[0], views[1], data_->request.line, limits, negativeMaterial, positiveMaterial);
+    if (!built) return built.error();
+    auto data = std::make_shared<StreamingBoundaryReplacement::Data>();
+    data->snapshot = *this; data->geometry = std::move(built).value();
+    StreamingBoundaryReplacement result; result.data_ = std::move(data);
+    return result;
+}
+
+auto StreamingBoundarySnapshot::profile(std::size_t segmentLimit) const
+    -> Result<containers::Array<TerrainBoundarySpan>, TerrainBoundaryError> {
+    if (!data_) return TerrainBoundaryError::InvalidData;
+    std::array<std::vector<TerrainBoundaryMesh>, 2> views;
+    for (unsigned side = 0; side < 2; ++side)
+        for (std::size_t i = 0; i < data_->meshes[side].size(); ++i)
+            views[side].push_back({&data_->meshes[side][i], data_->origins[side][i]});
+    return compareTerrainBoundaryTops(views[0], views[1], data_->request.line, segmentLimit);
+}
+
+auto StreamingBoundarySnapshot::sources(bool positive) const -> std::span<const StreamingBoundarySource> {
+    if (!data_) return {};
+    return data_->sources[positive ? 1 : 0];
+}
+
+auto StreamingBoundarySnapshot::regionRevision() const -> std::optional<std::uint64_t> {
+    return data_ ? std::optional<std::uint64_t>(data_->revision) : std::nullopt;
+}
+
+struct StreamingBoundaryComposition::Data {
+    std::vector<StreamingBoundarySnapshot> snapshots;
+    std::vector<StreamingBoundarySource> sources;
+    TerrainBoundaryComposition geometry;
+};
+
+auto StreamingBoundaryComposition::build(std::span<const StreamingBoundarySnapshot> snapshots,
+                                         BoundaryCompositionLimits limits, std::size_t snapshotBytes)
+    -> Result<StreamingBoundaryComposition, BoundaryReplacementError> {
+    using Error = BoundaryReplacementError;
+    if (snapshots.empty() || limits.maxBoundaries == 0 || limits.maxBoundaries > 256) return Error::InvalidData;
+    if (snapshots.size() > limits.maxBoundaries) return Error::LimitExceeded;
+    auto data = std::make_shared<Data>();
+    std::vector<TerrainBoundaryMesh> sources;
+    std::vector<std::array<std::vector<std::size_t>, 2>> memberships(snapshots.size());
+    std::vector<TerrainBoundaryRequest> requests;
+    std::size_t bytes = 0;
+    for (std::size_t b = 0; b < snapshots.size(); ++b) {
+        if (!snapshots[b].data_) return Error::InvalidData;
+        const auto& capture = *snapshots[b].data_;
+        const auto& first = *snapshots[0].data_;
+        if (capture.owner != first.owner || capture.revision != first.revision) return Error::InvalidData;
+        for (unsigned side = 0; side < 2; ++side) {
+            for (std::size_t i = 0; i < capture.sources[side].size(); ++i) {
+                const auto& mesh = capture.meshes[side][i];
+                const auto account = [&](std::size_t count, std::size_t size) {
+                    if (count > (snapshotBytes - bytes) / size) return false;
+                    bytes += count * size; return true;
+                };
+                if (!account(mesh.vertices.size(), sizeof(TerrainVertex)) || !account(mesh.indices.size(), sizeof(std::uint32_t)) ||
+                    !account(mesh.surfaces.size(), sizeof(TerrainSurface))) return Error::LimitExceeded;
+                const auto& source = capture.sources[side][i];
+                const auto found = std::find_if(data->sources.begin(), data->sources.end(), [&](const auto& s) { return s.key == source.key; });
+                std::size_t index = static_cast<std::size_t>(found - data->sources.begin());
+                if (found == data->sources.end()) {
+                    if (data->sources.size() == limits.mesh.maxSources) return Error::LimitExceeded;
+                    data->sources.push_back(source);
+                    sources.push_back({&mesh, capture.origins[side][i]});
+                } else if (found->handle != source.handle || found->cellVersion != source.cellVersion ||
+                           found->meshVersion != source.meshVersion || sources[index].translation != capture.origins[side][i]) {
+                    return Error::InvalidData;
+                }
+                memberships[b][side].push_back(index);
+            }
+        }
+        requests.push_back({capture.request.line, memberships[b][0], memberships[b][1]});
+        data->snapshots.push_back(snapshots[b]);
+    }
+    auto built = composeTerrainBoundaryReplacements(sources, requests, limits);
+    if (!built) return built.error();
+    data->geometry = std::move(built).value();
+    StreamingBoundaryComposition result; result.data_ = std::move(data); return result;
+}
+
+auto StreamingBoundaryComposition::geometry() const -> const TerrainBoundaryComposition* {
+    return data_ ? &data_->geometry : nullptr;
+}
+auto StreamingBoundaryComposition::sources() const -> std::span<const StreamingBoundarySource> {
+    return data_ ? std::span<const StreamingBoundarySource>{data_->sources} : std::span<const StreamingBoundarySource>{};
+}
+auto StreamingBoundaryComposition::raycast(math::Vec3 origin, math::Vec3 direction, float maxDistance,
+                                           bool cullBackFaces) const -> std::optional<StreamingBoundaryHit> {
+    if (!data_) return {};
+    auto hit = raycastTerrainMesh(data_->geometry.mesh, origin, direction, maxDistance, {}, cullBackFaces);
+    if (!hit) return {};
+    const auto triangle = hit->triangleIndex;
+    const auto& stamp = data_->geometry.triangles[triangle];
+    const auto& source = data_->sources[stamp.sourceIndex];
+    hit->triangleIndex = stamp.sourceTriangle;
+    return StreamingBoundaryHit{{source.key, source.handle, source.meshVersion, *hit, data_->snapshots[0].regionRevision()},
+        triangle, stamp.wall ? std::optional<std::size_t>{stamp.boundaryIndex} : std::nullopt};
+}
+
+struct StreamingSurfaceView::Data {
+    std::vector<StreamingSurfaceSource> sources;
+    std::optional<StreamingBoundaryComposition> composition;
+};
+
+auto StreamingSurfaceView::build(std::span<const StreamingSurfaceSource> sources,
+                                 std::optional<StreamingBoundaryComposition> composition)
+    -> Result<StreamingSurfaceView, StreamingSurfaceViewError> {
+    if (sources.empty()) return StreamingSurfaceViewError::InvalidData;
+    auto data = std::make_shared<Data>();
+    data->sources.assign(sources.begin(), sources.end());
+    for (const auto& source : data->sources) {
+        if (!source.handle.isValid() || !source.owner || !source.geometry ||
+            !std::isfinite(source.origin.x) || !std::isfinite(source.origin.y) ||
+            !std::isfinite(source.origin.z)) return StreamingSurfaceViewError::InvalidData;
+        const auto duplicate = std::count_if(data->sources.begin(), data->sources.end(),
+            [&](const auto& candidate) { return candidate.key == source.key; });
+        if (duplicate != 1) return StreamingSurfaceViewError::DuplicateSource;
+    }
+    if (composition) {
+        for (const auto& dependency : composition->sources()) {
+            const auto found = std::find_if(data->sources.begin(), data->sources.end(),
+                [&](const auto& source) { return source.key == dependency.key; });
+            if (found == data->sources.end() || found->handle != dependency.handle ||
+                found->meshVersion != dependency.meshVersion)
+                return StreamingSurfaceViewError::MissingCompositionSource;
+        }
+        data->composition = std::move(composition);
+    }
+    StreamingSurfaceView result;
+    result.data_ = std::move(data);
+    return result;
+}
+
+auto StreamingSurfaceView::sources() const -> std::span<const StreamingSurfaceSource> {
+    return data_ ? std::span<const StreamingSurfaceSource>{data_->sources} : std::span<const StreamingSurfaceSource>{};
+}
+
+auto StreamingSurfaceView::composition() const -> const StreamingBoundaryComposition* {
+    return data_ && data_->composition ? &*data_->composition : nullptr;
+}
+
+auto StreamingSurfaceView::raycast(math::Vec3 origin, math::Vec3 direction, float maxDistance,
+                                  bool cullBackFaces) const -> std::optional<StreamingBoundaryHit> {
+    if (!data_) return {};
+    std::optional<StreamingBoundaryHit> closest = data_->composition
+        ? data_->composition->raycast(origin, direction, maxDistance, cullBackFaces)
+        : std::optional<StreamingBoundaryHit>{};
+    for (const auto& source : data_->sources) {
+        if (data_->composition && std::any_of(data_->composition->sources().begin(),
+            data_->composition->sources().end(), [&](const auto& dependency) {
+                return dependency.key == source.key;
+            })) continue;
+        const auto hit = raycastTerrainMesh(*source.geometry, origin, direction, maxDistance,
+                                             source.origin, cullBackFaces);
+        if (!hit) continue;
+        const auto keyTuple = [](const auto& key) {
+            return std::tuple{key.policy, key.coord.x, key.coord.y, key.coord.z};
+        };
+        if (!closest || hit->distance < closest->source.surface.distance ||
+            (hit->distance == closest->source.surface.distance &&
+             keyTuple(source.key) < keyTuple(closest->source.key))) {
+            closest = StreamingBoundaryHit{
+                {source.key, source.handle, source.meshVersion, *hit, source.regionRevision}, 0, {}};
+        }
+    }
+    return closest;
+}
 
 class WorldStreamer::Impl {
 public:
@@ -182,7 +519,10 @@ public:
             std::max<std::size_t>(config_.chunkCapacityPerPolicy, 1);
     }
 
-    ~Impl() { jobs_.shutdown(); }
+    ~Impl() {
+        if (planning_) planning_->cancelled.store(true);
+        jobs_.shutdown();
+    }
 
     struct Entry {
         ChunkHandle handle;
@@ -191,12 +531,31 @@ public:
         bool meshInFlight = false;
         std::optional<std::uint64_t> failedMeshVersion;
         std::optional<MeshData> mesh;
+        std::uint64_t meshVersion = 0;
+        std::optional<std::uint64_t> meshRegionRevision{};
     };
 
     struct Candidate {
         StreamingChunkKey key;
         std::uint64_t distanceSquared = 0;
     };
+
+    struct PlanningWork {
+        PlanningWork(const WorldStreamingConfig& settings, const RegionMap& map,
+                     math::Vec3 eye) : config(settings), regions(map), camera(eye) {}
+        WorldStreamingConfig config;
+        RegionMap regions;
+        math::Vec3 camera;
+        std::atomic<bool> cancelled{false};
+        std::mutex mutex;
+        std::optional<std::vector<Candidate>> result;
+        bool failed = false;
+    };
+
+    [[nodiscard]] static auto nearer(const Candidate& a, const Candidate& b) -> bool {
+        if (a.distanceSquared != b.distanceSquared) return a.distanceSquared < b.distanceSquared;
+        return keyLess(a.key, b.key);
+    }
 
     enum class CompletionKind : std::uint8_t { Cells, Mesh };
 
@@ -209,6 +568,7 @@ public:
         ChunkGenerationRequest generation;
         std::optional<ChunkBase> base;
         std::optional<TerrainMeshBuild> mesh;
+        std::optional<std::uint64_t> regionRevision;
     };
 
     struct MeshWork {
@@ -222,6 +582,10 @@ public:
         std::optional<float> heightTransitionFloor;
         float hexRadius = 1.0f;
         float hexFloorHeight = -8.0f;
+        std::optional<RegionMap> regions;
+        math::Vec3 origin;
+        bool hexCutWalls = false;
+        bool voxelCutFaces = false;
     };
 
     [[nodiscard]] auto storeFor(PolicyKind policy) -> ChunkStore& {
@@ -247,55 +611,151 @@ public:
             std::chrono::steady_clock::now() - start < config_.frameBudget;
     }
 
-    [[nodiscard]] auto desiredChunks(math::Vec3 camera) const -> std::vector<Candidate> {
+    [[nodiscard]] static auto desiredChunks(const WorldStreamingConfig& config,
+                                            const RegionMap& regions, math::Vec3 camera,
+                                            const std::atomic<bool>* cancelled = nullptr)
+        -> std::vector<Candidate> {
         std::vector<Candidate> output;
         if (!std::isfinite(camera.x) || !std::isfinite(camera.y) || !std::isfinite(camera.z)) {
             return output;
         }
         constexpr PolicyKind policies[]{PolicyKind::Voxel, PolicyKind::Height, PolicyKind::Hex};
         for (PolicyKind policy : policies) {
-            const std::int32_t extent = chunkExtent(policy, config_.policyParams);
-            const std::optional<std::int32_t> centerX = cameraChunk(camera.x, extent);
-            const std::optional<std::int32_t> centerZ = cameraChunk(camera.z, extent);
-            const std::optional<std::int32_t> centerY = policy == PolicyKind::Voxel
-                ? cameraChunk(camera.y, extent)
-                : std::optional<std::int32_t>(0);
-            if (!centerX.has_value() || !centerY.has_value() || !centerZ.has_value()) continue;
-            const std::int64_t horizontal = config_.horizontalRadius;
+            std::vector<Candidate> nearest;
+            const auto bounds = horizontalBounds(policy, camera, config);
+            const auto centerY = policy == PolicyKind::Voxel ? cameraChunk(camera.y, kVoxelEdge)
+                                                             : std::optional<std::int32_t>(0);
+            if (!bounds || !centerY) continue;
             const std::int64_t vertical = policy == PolicyKind::Voxel
-                ? static_cast<std::int64_t>(config_.voxelVerticalRadius)
+                ? static_cast<std::int64_t>(config.voxelVerticalRadius)
                 : 0;
-            for (std::int64_t dz = -horizontal; dz <= horizontal; ++dz) {
-                for (std::int64_t dx = -horizontal; dx <= horizontal; ++dx) {
-                    const std::optional<std::int32_t> x = addChunkOffset(*centerX, dx);
-                    const std::optional<std::int32_t> z = addChunkOffset(*centerZ, dz);
-                    if (!x.has_value() || !z.has_value()) continue;
-                    const std::optional<std::int32_t> xCenter = worldCenter(*x, extent);
-                    const std::optional<std::int32_t> zCenter = worldCenter(*z, extent);
-                    if (!xCenter.has_value() || !zCenter.has_value() ||
-                        regions_.policyAt(*xCenter, *zCenter) != policy) {
-                        continue;
-                    }
+            for (std::int64_t z = bounds->minZ; z <= bounds->maxZ; ++z) {
+                for (std::int64_t x = bounds->minX; x <= bounds->maxX; ++x) {
+                    if (cancelled != nullptr && cancelled->load()) return {};
+                    const auto cx = static_cast<std::int32_t>(x), cz = static_cast<std::int32_t>(z);
+                    const auto position = chunkCenter({policy, {cx, 0, cz}}, config);
+                    if (!position) continue;
+                    if (config.horizontalHalfExtentMeters &&
+                        (std::abs((*position)[0] - camera.x) > *config.horizontalHalfExtentMeters ||
+                         std::abs((*position)[2] - camera.z) > *config.horizontalHalfExtentMeters)) continue;
+                    const auto px = std::floor((*position)[0]);
+                    const auto pz = std::floor((*position)[2]);
+                    if (config.regionalSurfaceOwnership) {
+                        const auto mask = terrainRegionMask(chunkFootprint({policy, {cx, 0, cz}}, config), regions, policy);
+                        if (!mask) {
+                            if (mask.error() == TerrainMeshError::CoordinateOverflow) continue;
+                            throw std::runtime_error("Regional chunk footprint invalid or exceeds 4096 region tiles");
+                        }
+                        if (mask.value().rectangles.isEmpty()) continue;
+                    } else if (px < std::numeric_limits<std::int32_t>::min() || px > std::numeric_limits<std::int32_t>::max() ||
+                               pz < std::numeric_limits<std::int32_t>::min() || pz > std::numeric_limits<std::int32_t>::max() ||
+                               regions.policyAt(static_cast<std::int32_t>(px), static_cast<std::int32_t>(pz)) != policy) continue;
                     for (std::int64_t dy = -vertical; dy <= vertical; ++dy) {
+                        if (cancelled != nullptr && cancelled->load()) return {};
                         const std::optional<std::int32_t> y = addChunkOffset(*centerY, dy);
                         if (!y.has_value()) continue;
-                        const StreamingChunkKey key{policy, {*x, *y, *z}};
-                        output.push_back({key, squaredDistance(key, camera, config_.policyParams)});
+                        const StreamingChunkKey key{policy, {cx, *y, cz}};
+                        const Candidate candidate{key, squaredDistance(key, camera, config)};
+                        // Retain only the nearest resident-capacity candidates,
+                        // rather than allocating the entire requested volume.
+                        if (nearest.size() == config.chunkCapacityPerPolicy) {
+                            if (!nearer(candidate, nearest.front())) continue;
+                            std::pop_heap(nearest.begin(), nearest.end(), nearer);
+                            nearest.pop_back();
+                        }
+                        nearest.push_back(candidate);
+                        std::push_heap(nearest.begin(), nearest.end(), nearer);
                     }
                 }
             }
+            output.insert(output.end(), nearest.begin(), nearest.end());
         }
-        std::sort(output.begin(), output.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.distanceSquared != b.distanceSquared) {
-                return a.distanceSquared < b.distanceSquared;
-            }
-            return keyLess(a.key, b.key);
-        });
+        std::sort(output.begin(), output.end(), nearer);
         output.erase(std::unique(output.begin(), output.end(), [](const Candidate& a,
                                                                  const Candidate& b) {
             return a.key == b.key;
         }), output.end());
         return output;
+    }
+
+    auto refreshDesired(math::Vec3 camera) -> bool {
+        if (config_.regionalSurfaceOwnership && (!planValid_ || planRevision_ != regions_.revision())) {
+            // Region changes can alter triangles without changing resident keys.
+            // Bump mesh versions before accepting any in-flight completion.
+            for (const auto& [key, entry] : entries_) {
+                storeFor(key.policy).markDirty(entry.handle, {false, true, true});
+            }
+        }
+        std::array<std::optional<std::int32_t>, 9> centers;
+        constexpr PolicyKind policies[]{PolicyKind::Voxel, PolicyKind::Height, PolicyKind::Hex};
+        for (std::size_t i = 0; i < 3; ++i) {
+            const auto center = cameraCenter(policies[i], camera, config_);
+            if (!center) continue;
+            centers[i * 3] = center->x;
+            centers[i * 3 + 1] = center->y;
+            centers[i * 3 + 2] = center->z;
+        }
+        const std::array<float, 3> exactCamera{camera.x, camera.y, camera.z};
+        if (!planValid_ || centers != planCenters_ || planRevision_ != regions_.revision() ||
+            (config_.horizontalHalfExtentMeters && exactCamera != planCamera_)) {
+            if (planning_) planning_->cancelled.store(true);
+            planning_.reset();
+            planCenters_ = centers;
+            planCamera_ = exactCamera;
+            planRevision_ = regions_.revision();
+            planValid_ = true;
+            long double count = 0.L;
+            for (const auto policy : policies) {
+                if (const auto bounds = horizontalBounds(policy, camera, config_)) {
+                    const long double vertical = policy == PolicyKind::Voxel ? 2.0L * config_.voxelVerticalRadius + 1.L : 1.L;
+                    count += static_cast<long double>(bounds->maxX - bounds->minX + 1) *
+                             static_cast<long double>(bounds->maxZ - bounds->minZ + 1) * vertical;
+                }
+            }
+            const bool finite = std::isfinite(camera.x) && std::isfinite(camera.y) &&
+                                std::isfinite(camera.z);
+            if (count <= 256.0L || !finite) {
+                desired_ = desiredChunks(config_, regions_, camera);
+            } else {
+                auto work = std::make_shared<PlanningWork>(config_, regions_, camera);
+                planning_ = work;
+                if (!jobs_.submit({0, 0}, [work] {
+                    try {
+                        auto result = desiredChunks(work->config, work->regions, work->camera,
+                                                    &work->cancelled);
+                        std::lock_guard lock(work->mutex);
+                        work->result = std::move(result);
+                    } catch (...) {
+                        std::lock_guard lock(work->mutex);
+                        work->failed = true;
+                    }
+                })) {
+                    planning_.reset();
+                    planValid_ = false;
+                    return false;
+                }
+            }
+        }
+        if (planning_) {
+            const auto work = planning_;
+            std::lock_guard lock(work->mutex);
+            if (work->failed) {
+                ++stats_.failedCompletions;
+                planning_.reset();
+                planValid_ = false;
+                return false;
+            }
+            if (!work->result.has_value()) return false;
+            desired_ = std::move(*work->result);
+            planning_.reset();
+        }
+        // Legacy rings replan at chunk boundaries; meter footprints replan on
+        // any camera movement, including changes to nearest-capacity selection.
+        for (Candidate& candidate : desired_) {
+            candidate.distanceSquared = squaredDistance(candidate.key, camera, config_);
+        }
+        std::sort(desired_.begin(), desired_.end(), nearer);
+        return true;
     }
 
     void post(Completion completion) {
@@ -329,23 +789,28 @@ public:
         return submitted;
     }
 
-    [[nodiscard]] auto neighborSnapshots(StreamingChunkKey key) const
+    [[nodiscard]] auto neighborSnapshots(StreamingChunkKey key)
         -> std::vector<ChunkSnapshot> {
         std::vector<ChunkSnapshot> output;
-        for (const auto& [candidateKey, entry] : entries_) {
-            if (candidateKey.policy != key.policy ||
-                std::abs(static_cast<std::int64_t>(candidateKey.coord.x) - key.coord.x) > 1 ||
-                std::abs(static_cast<std::int64_t>(candidateKey.coord.y) - key.coord.y) > 1 ||
-                std::abs(static_cast<std::int64_t>(candidateKey.coord.z) - key.coord.z) > 1) {
-                continue;
+        const std::int32_t minY = key.policy == PolicyKind::Voxel ? -1 : 0;
+        const std::int32_t maxY = key.policy == PolicyKind::Voxel ? 1 : 0;
+        for (std::int32_t dx = -1; dx <= 1; ++dx) {
+            for (std::int32_t dy = minY; dy <= maxY; ++dy) {
+                for (std::int32_t dz = -1; dz <= 1; ++dz) {
+                    const auto x = addChunkOffset(key.coord.x, dx);
+                    const auto y = addChunkOffset(key.coord.y, dy);
+                    const auto z = addChunkOffset(key.coord.z, dz);
+                    if (!x || !y || !z) continue;
+                    ++stats_.neighborQueries;
+                    const auto found = entries_.find({key.policy, {*x, *y, *z}});
+                    if (found == entries_.end()) continue;
+                    auto copy = storeFor(key.policy).snapshot(found->second.handle);
+                    if (copy) output.push_back(std::move(*copy));
+                }
             }
-            const std::optional<ChunkSnapshot> copy = storeFor(key.policy).snapshot(entry.handle);
-            if (copy.has_value()) output.push_back(*copy);
         }
-        std::sort(output.begin(), output.end(), [](const ChunkSnapshot& a,
-                                                   const ChunkSnapshot& b) {
-            return keyLess({a.policy, a.coord}, {b.policy, b.coord});
-        });
+        // x/y/z loop order is the same key order used by meshing before this
+        // bounded lookup path, including overlapping height-border precedence.
         return output;
     }
 
@@ -359,17 +824,27 @@ public:
         work->blocks = blocks_;
         work->heightSkirtDepth = config_.heightSkirtDepth;
         work->heightTransitionFloor = config_.heightTransitionFloor;
+        const bool cullHeightSkirts = config_.cullSharedHeightSkirts;
         work->hexRadius = config_.hexRadius;
         work->hexFloorHeight = config_.hexFloorHeight;
+        if (config_.regionalSurfaceOwnership) work->regions = regions_;
+        work->origin = terrainOrigin(key, config_);
+        if (work->regions && key.policy == PolicyKind::Hex) work->origin = {};
+        work->hexCutWalls = config_.regionalHexCutWalls;
+        work->voxelCutFaces = config_.regionalVoxelCutFaces;
         const jobs::JobPriority priority{entry.distanceSquared, kMeshStage};
-        const bool submitted = jobs_.submit(priority, [this, work, priority] {
+        const bool submitted = jobs_.submit(priority, [this, work, priority, cullHeightSkirts] {
             TerrainMeshingContext context;
             context.blocks = &work->blocks;
             context.voxel.borderFetch = [work](std::int32_t x, std::int32_t y,
                                                 std::int32_t z) -> std::uint16_t {
-                const ChunkCoord coord{floorDiv(x, static_cast<std::int32_t>(kVoxelEdge)),
-                                       floorDiv(y, static_cast<std::int32_t>(kVoxelEdge)),
-                                       floorDiv(z, static_cast<std::int32_t>(kVoxelEdge))};
+                // Voxel border requests are local; offset their chunk quotient
+                // from the meshed center, not from the world origin.
+                const auto chunkX = addChunkOffset(work->key.coord.x, floorDiv(x, static_cast<std::int32_t>(kVoxelEdge)));
+                const auto chunkY = addChunkOffset(work->key.coord.y, floorDiv(y, static_cast<std::int32_t>(kVoxelEdge)));
+                const auto chunkZ = addChunkOffset(work->key.coord.z, floorDiv(z, static_cast<std::int32_t>(kVoxelEdge)));
+                if (!chunkX || !chunkY || !chunkZ) return 0;
+                const ChunkCoord coord{*chunkX, *chunkY, *chunkZ};
                 for (const ChunkSnapshot& neighbor : work->neighborhood) {
                     if (neighbor.coord != coord) continue;
                     const std::uint32_t localX = static_cast<std::uint32_t>(
@@ -382,8 +857,20 @@ public:
                 }
                 return 0;
             };
+            if (work->voxelCutFaces && work->key.policy == PolicyKind::Voxel) {
+                context.voxel.cellOwned = [work](std::int32_t x, std::int32_t, std::int32_t z) {
+                    const std::int64_t wx = std::int64_t(work->key.coord.x) * kVoxelEdge + x;
+                    const std::int64_t wz = std::int64_t(work->key.coord.z) * kVoxelEdge + z;
+                    return wx >= std::numeric_limits<std::int32_t>::min() && wx <= std::numeric_limits<std::int32_t>::max() &&
+                        wz >= std::numeric_limits<std::int32_t>::min() && wz <= std::numeric_limits<std::int32_t>::max() &&
+                        work->regions->policyAt(static_cast<std::int32_t>(wx), static_cast<std::int32_t>(wz)) == PolicyKind::Voxel;
+                };
+            }
             context.height.skirtDepth = work->heightSkirtDepth;
             context.height.transitionFloor = work->heightTransitionFloor;
+            if (cullHeightSkirts && work->center.policy == PolicyKind::Height) {
+                context.height.skirtEdges = heightSkirtEdges(work->center, work->neighborhood);
+            }
             context.height.borderFetch = [work](std::int64_t x, std::int64_t z) -> float {
                 for (const ChunkSnapshot& neighbor : work->neighborhood) {
                     const std::int64_t originX =
@@ -413,6 +900,7 @@ public:
             };
             context.hex.radius = work->hexRadius;
             context.hex.floorHeight = work->hexFloorHeight;
+            context.hex.worldSpace = work->regions.has_value();
             context.hex.hasNeighbor = [work](AxialCoord coordinate) {
                 for (const ChunkSnapshot& neighbor : work->neighborhood) {
                     if (snapshotHexPresent(neighbor, coordinate)) return true;
@@ -426,9 +914,20 @@ public:
             completion.handle = work->handle;
             completion.priority = priority;
             completion.sourceVersion = work->center.version;
+            if (work->regions) completion.regionRevision = work->regions->revision();
             try {
                 auto result = meshChunkSnapshot(work->center, context);
-                if (result.hasValue()) completion.mesh = std::move(result).value();
+                if (result.hasValue()) {
+                    if (work->regions && !(work->voxelCutFaces && work->key.policy == PolicyKind::Voxel)) {
+                        const auto floor = work->hexCutWalls && work->key.policy == PolicyKind::Hex
+                            ? std::optional<float>(work->hexFloorHeight) : std::nullopt;
+                        auto clipped = clipTerrainRegions(result.value().mesh, work->origin, *work->regions, work->key.policy, floor);
+                        if (clipped) {
+                            result.value().mesh = std::move(clipped).value();
+                            completion.mesh = std::move(result).value();
+                        }
+                    } else completion.mesh = std::move(result).value();
+                }
             } catch (...) {
                 completion.mesh = std::nullopt;
             }
@@ -466,14 +965,14 @@ public:
         }
     }
 
-    void persist(const StreamingChunkKey& key, const ChunkSnapshot& snapshot) {
-        if (snapshot.deltas.isEmpty()) {
+    void persist(const StreamingChunkKey& key, const containers::Array<ChunkDelta>& deltas) {
+        if (deltas.isEmpty()) {
             persistence_.erase(key);
             return;
         }
         auto& values = persistence_[key];
         values.clear();
-        for (const ChunkDelta& delta : snapshot.deltas) values[delta.index] = delta.value;
+        for (const ChunkDelta& delta : deltas) values[delta.index] = delta.value;
     }
 
     auto applyPersistence(StreamingChunkKey key, ChunkStore& store, ChunkHandle handle) -> bool {
@@ -537,6 +1036,10 @@ public:
         }
 
         entry.meshInFlight = false;
+        if (completion.regionRevision && *completion.regionRevision != regions_.revision()) {
+            ++stats_.staleCompletions;
+            return false;
+        }
         if (!completion.mesh.has_value()) {
             if (store.version(entry.handle) != completion.sourceVersion) {
                 ++stats_.staleCompletions;
@@ -551,6 +1054,8 @@ public:
             return false;
         }
         entry.failedMeshVersion.reset();
+        entry.meshVersion = completion.mesh->sourceVersion;
+        entry.meshRegionRevision = completion.regionRevision;
         entry.mesh = std::move(completion.mesh->mesh);
         ++stats_.publishedMeshes;
         return true;
@@ -587,7 +1092,18 @@ public:
     auto update(math::Vec3 camera) -> StreamingFrameStats {
         const auto start = std::chrono::steady_clock::now();
         StreamingFrameStats frame;
-        const std::vector<Candidate> desired = desiredChunks(camera);
+        if (config_.frameBudget.count() <= 0) return frame;
+        auto stageStart = start;
+        const auto finishStage = [&](std::chrono::nanoseconds& duration) {
+            if (!config_.profileTimings) return;
+            const auto now = std::chrono::steady_clock::now();
+            duration = std::chrono::duration_cast<std::chrono::nanoseconds>(now - stageStart);
+            stageStart = now;
+        };
+        const bool ready = refreshDesired(camera);
+        finishStage(frame.timings.planning);
+        frame.planningPending = !ready;
+        const auto& desired = desired_;
         std::unordered_map<StreamingChunkKey, std::uint64_t> desiredDistances;
         desiredDistances.reserve(desired.size());
         for (const Candidate& candidate : desired) {
@@ -608,12 +1124,14 @@ public:
             }
             return keyLess(b.key, a.key);
         });
+        finishStage(frame.timings.residency);
         for (const Candidate& candidate : unloads) {
-            if (frame.unloaded >= config_.maxUnloadsPerFrame || !withinBudget(start)) break;
+            if (!ready || frame.unloaded >= config_.maxUnloadsPerFrame ||
+                (frame.unloaded != 0 && !withinBudget(start))) break;
             const auto found = entries_.find(candidate.key);
             if (found == entries_.end()) continue;
             ChunkStore& store = storeFor(candidate.key.policy);
-            const std::optional<ChunkSnapshot> copy = store.snapshot(found->second.handle);
+            const auto copy = store.snapshotDeltas(found->second.handle);
             if (copy.has_value()) persist(candidate.key, *copy);
             dirtyNeighbors(candidate.key);
             store.destroy(found->second.handle);
@@ -621,9 +1139,11 @@ public:
             ++frame.unloaded;
             ++stats_.unloadedChunks;
         }
+        finishStage(frame.timings.unload);
 
         for (const Candidate& candidate : desired) {
-            if (frame.loaded >= config_.maxLoadsPerFrame || !withinBudget(start)) break;
+            if (!ready || frame.loaded >= config_.maxLoadsPerFrame ||
+                (frame.loaded != 0 && !withinBudget(start))) break;
             if (entries_.find(candidate.key) != entries_.end()) continue;
             ChunkStore& store = storeFor(candidate.key.policy);
             if (store.liveCount() >= config_.chunkCapacityPerPolicy) continue;
@@ -646,16 +1166,18 @@ public:
             }
             ++frame.loaded;
         }
+        finishStage(frame.timings.load);
 
         collectCompletions();
         while (!pendingCompletions_.empty() &&
                frame.completionsProcessed < config_.maxPublicationsPerFrame &&
-               withinBudget(start)) {
+               (frame.completionsProcessed == 0 || withinBudget(start))) {
             Completion completion = std::move(pendingCompletions_.front());
             pendingCompletions_.erase(pendingCompletions_.begin());
             if (processCompletion(std::move(completion))) ++frame.published;
             ++frame.completionsProcessed;
         }
+        finishStage(frame.timings.publication);
 
         std::vector<Candidate> meshCandidates;
         for (const auto& [key, entry] : entries_) {
@@ -680,7 +1202,8 @@ public:
             return keyLess(a.key, b.key);
         });
         for (const Candidate& candidate : meshCandidates) {
-            if (frame.meshJobs >= config_.maxMeshJobsPerFrame || !withinBudget(start)) break;
+            if (frame.meshJobs >= config_.maxMeshJobsPerFrame ||
+                (frame.meshJobs != 0 && !withinBudget(start))) break;
             const auto found = entries_.find(candidate.key);
             if (found == entries_.end()) continue;
             std::optional<ChunkSnapshot> copy =
@@ -689,6 +1212,7 @@ public:
             submitMesh(candidate.key, found->second, std::move(*copy));
             if (found->second.meshInFlight) ++frame.meshJobs;
         }
+        finishStage(frame.timings.mesh);
 
         frame.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start);
@@ -700,16 +1224,49 @@ public:
         const ChunkStore& store = storeFor(key.policy);
         return {key, entry.handle, store.state(entry.handle), store.dirty(entry.handle),
                 store.version(entry.handle), entry.distanceSquared,
-                entry.generationInFlight, entry.meshInFlight, entry.mesh.has_value()};
+                entry.generationInFlight, entry.meshInFlight, entry.mesh.has_value(), entry.meshVersion, entry.meshRegionRevision};
+    }
+
+    auto boundaryKeys(const StreamingBoundaryRequest& request) const -> std::vector<StreamingChunkKey> {
+        std::vector<StreamingChunkKey> keys;
+        for (const auto& [key, entry] : entries_) {
+            (void)entry;
+            if (key.policy != request.negative && key.policy != request.positive) continue;
+            const auto f = chunkFootprint(key, config_);
+            const bool x = request.line.axis == TerrainBoundaryAxis::X;
+            const double low = x ? f.minX : f.minZ, high = x ? f.maxX : f.maxZ;
+            const double begin = x ? f.minZ : f.minX, end = x ? f.maxZ : f.maxX;
+            const bool positive = key.policy == request.positive;
+            if (begin >= request.line.end || end <= request.line.begin) continue;
+            if (positive ? low <= request.line.plane && high > request.line.plane
+                         : low < request.line.plane && high >= request.line.plane) keys.push_back(key);
+        }
+        std::sort(keys.begin(), keys.end(), keyLess);
+        return keys;
+    }
+
+    auto boundarySourceReady(StreamingChunkKey key, const Entry& entry) const -> bool {
+        const auto& store = storeFor(key.policy);
+        return entry.mesh && !entry.generationInFlight && !entry.meshInFlight &&
+            store.state(entry.handle) == ChunkState::Meshed && store.version(entry.handle) == entry.meshVersion &&
+            entry.meshRegionRevision == regions_.revision();
     }
 
     WorldStreamingConfig config_;
+    std::shared_ptr<const std::byte> boundaryOwner_ = std::make_shared<const std::byte>();
+    std::vector<Candidate> desired_;
+    std::array<std::optional<std::int32_t>, 9> planCenters_;
+    std::array<float, 3> planCamera_{};
+    std::uint64_t planRevision_ = 0;
+    bool planValid_ = false;
+    std::shared_ptr<PlanningWork> planning_;
     RegionMap regions_;
     BlockRegistry blocks_;
     ChunkStore voxelStore_;
     ChunkStore heightStore_;
     ChunkStore hexStore_;
     std::unordered_map<StreamingChunkKey, Entry> entries_;
+    std::optional<StreamingSurfaceView> acceptedSurfaceView_;
     std::map<StreamingChunkKey, std::map<std::uint32_t, CellValue>, StreamingKeyLess>
         persistence_;
     StreamingStats stats_;
@@ -719,12 +1276,41 @@ public:
     jobs::JobSystem jobs_;
 };
 
-WorldStreamer::WorldStreamer(const WorldStreamingConfig& config)
-    : impl_(std::make_unique<Impl>(config)) {}
+WorldStreamer::WorldStreamer(const WorldStreamingConfig& config) {
+    if (config.regionalVoxelCutFaces && !config.regionalSurfaceOwnership) {
+        throw std::invalid_argument("Regional voxel cut faces require regional surface ownership");
+    }
+    if (config.regionalHexCutWalls && !config.regionalSurfaceOwnership) {
+        throw std::invalid_argument("Regional hex cut walls require regional surface ownership");
+    }
+    if (config.horizontalHalfExtentMeters &&
+        (!std::isfinite(*config.horizontalHalfExtentMeters) || *config.horizontalHalfExtentMeters < 0.f)) {
+        throw std::invalid_argument("Streaming horizontalHalfExtentMeters must be finite and nonnegative");
+    }
+    if (config.regionalSurfaceOwnership) {
+        if (config.regionExtentMeters <= 0 || !std::isfinite(config.hexRadius) || config.hexRadius <= 0.f ||
+            !hexChunkOrigin({}, config.policyParams.hex.radius, config.policyParams.hex.layout)) {
+            throw std::invalid_argument("Regional surfaces require valid region extent and hex layout/scale");
+        }
+        // A translated footprint can touch one more tile per axis than the
+        // origin fixture. Reserve that worst-case margin before starting workers.
+        for (const auto policy : {PolicyKind::Height, PolicyKind::Voxel, PolicyKind::Hex}) {
+            const auto bounds = chunkFootprint({policy, {}}, config);
+            const double nx = std::ceil((bounds.maxX - bounds.minX) / config.regionExtentMeters) + 1;
+            const double nz = std::ceil((bounds.maxZ - bounds.minZ) / config.regionExtentMeters) + 1;
+            if (!std::isfinite(nx * nz) || nx * nz > 4096) {
+                throw std::invalid_argument("Regional surfaces exceed the 4096-tile per-chunk work limit");
+            }
+        }
+    }
+    impl_ = std::make_unique<Impl>(config);
+}
 
 WorldStreamer::~WorldStreamer() = default;
 
 auto WorldStreamer::regions() -> RegionMap& { return impl_->regions_; }
+auto WorldStreamer::regions() const -> const RegionMap& { return impl_->regions_; }
+auto WorldStreamer::identityToken() const -> std::shared_ptr<const std::byte> { return impl_->boundaryOwner_; }
 
 auto WorldStreamer::blocks() -> BlockRegistry& { return impl_->blocks_; }
 
@@ -735,6 +1321,7 @@ auto WorldStreamer::update(math::Vec3 cameraPosition) -> StreamingFrameStats {
 void WorldStreamer::waitForIdle() { impl_->jobs_.waitIdle(); }
 
 auto WorldStreamer::hasPendingWork() const -> bool {
+    if (impl_->planning_ || !impl_->planValid_) return true;
     if (impl_->jobs_.pendingCount() != 0 || !impl_->pendingCompletions_.empty()) return true;
     {
         std::lock_guard lock(impl_->completionMutex_);
@@ -769,6 +1356,64 @@ auto WorldStreamer::residentChunks() const -> containers::Array<StreamingChunkIn
     return output;
 }
 
+auto WorldStreamer::residentTerrainFootprint() const -> std::optional<TerrainFootprint> {
+    TerrainFootprint result{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+    for (const auto& [key, entry] : impl_->entries_) {
+        const auto footprint = chunkFootprint(key, impl_->config_);
+        if (!std::isfinite(footprint.minX) || !std::isfinite(footprint.maxX) ||
+            !std::isfinite(footprint.minZ) || !std::isfinite(footprint.maxZ) ||
+            footprint.minX >= footprint.maxX || footprint.minZ >= footprint.maxZ) continue;
+        result.minX = std::min(result.minX, footprint.minX); result.maxX = std::max(result.maxX, footprint.maxX);
+        result.minZ = std::min(result.minZ, footprint.minZ); result.maxZ = std::max(result.maxZ, footprint.maxZ);
+    }
+    return std::isfinite(result.minX) ? std::optional<TerrainFootprint>(result) : std::nullopt;
+}
+
+auto WorldStreamer::residentTerrainFootprint(PolicyKind first, PolicyKind second) const
+    -> std::optional<TerrainFootprint> {
+    TerrainFootprint result{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+    for (const auto& [key, entry] : impl_->entries_) {
+        if (key.policy != first && key.policy != second) continue;
+        if (!entry.mesh || entry.mesh->indices.isEmpty()) continue;
+        const auto* mesh = &*entry.mesh;
+        const auto origin = meshOrigin(key);
+        for (const auto index : mesh->indices) {
+            if (index >= mesh->vertices.size()) continue;
+            const auto& position = mesh->vertices[index].position;
+            const double x = double(position.x) + origin.x, z = double(position.z) + origin.z;
+            if (!std::isfinite(x) || !std::isfinite(z)) continue;
+            result.minX = std::min(result.minX, x); result.maxX = std::max(result.maxX, x);
+            result.minZ = std::min(result.minZ, z); result.maxZ = std::max(result.maxZ, z);
+        }
+    }
+    return std::isfinite(result.minX) && result.minX < result.maxX && result.minZ < result.maxZ
+        ? std::optional<TerrainFootprint>(result) : std::nullopt;
+}
+
+auto WorldStreamer::publishSurfaceView(const StreamingSurfaceView& view) -> bool {
+    if (!view.current(*this)) return false;
+    impl_->acceptedSurfaceView_ = view;
+    return true;
+}
+
+void WorldStreamer::clearSurfaceView() {
+    impl_->acceptedSurfaceView_.reset();
+}
+
+auto WorldStreamer::acceptedSurfaceView() const -> const StreamingSurfaceView* {
+    return impl_->acceptedSurfaceView_ ? &*impl_->acceptedSurfaceView_ : nullptr;
+}
+
+auto WorldStreamer::raycastAcceptedTerrain(math::Vec3 origin, math::Vec3 direction,
+                                           float maxDistance, bool cullBackFaces) const
+    -> std::optional<StreamingBoundaryHit> {
+    return impl_->acceptedSurfaceView_
+        ? impl_->acceptedSurfaceView_->raycast(origin, direction, maxDistance, cullBackFaces)
+        : std::optional<StreamingBoundaryHit>{};
+}
+
 auto WorldStreamer::chunk(StreamingChunkKey key) const
     -> std::optional<StreamingChunkInfo> {
     const auto found = impl_->entries_.find(key);
@@ -782,6 +1427,115 @@ auto WorldStreamer::mesh(StreamingChunkKey key) const -> const MeshData* {
     return found != impl_->entries_.end() && found->second.mesh.has_value()
         ? &*found->second.mesh
         : nullptr;
+}
+
+auto WorldStreamer::meshOrigin(StreamingChunkKey key) const -> math::Vec3 {
+    if (impl_->config_.regionalSurfaceOwnership && key.policy == PolicyKind::Hex) return {};
+    return terrainOrigin(key, impl_->config_);
+}
+
+auto WorldStreamer::captureBoundary(StreamingBoundaryRequest request, StreamingBoundaryLimits limits) const
+    -> Result<StreamingBoundarySnapshot, StreamingBoundaryError> {
+    if (!impl_->config_.regionalSurfaceOwnership) return StreamingBoundaryError::Unsupported;
+    const auto& line = request.line;
+    constexpr double low = std::numeric_limits<std::int32_t>::min();
+    constexpr double high = double(std::numeric_limits<std::int32_t>::max()) + 1;
+    const auto extent = impl_->regions_.tileExtentMeters();
+    if ((request.negative != PolicyKind::Height || request.positive != PolicyKind::Hex) &&
+        (request.negative != PolicyKind::Hex || request.positive != PolicyKind::Height)) return StreamingBoundaryError::InvalidBoundary;
+    if ((line.axis != TerrainBoundaryAxis::X && line.axis != TerrainBoundaryAxis::Z) ||
+        !std::isfinite(line.plane) || !std::isfinite(line.begin) || !std::isfinite(line.end) ||
+        line.plane <= low || line.plane >= high || line.begin < low || line.end > high ||
+        line.begin >= line.end || std::fmod(line.plane, extent) != 0) return StreamingBoundaryError::InvalidBoundary;
+    const auto regionAt = [extent](double coordinate) {
+        auto index = static_cast<std::int64_t>(std::floor(coordinate / extent));
+        if (double(index * extent) > coordinate) --index;
+        return index;
+    };
+    const auto first = regionAt(line.begin);
+    auto last = regionAt(line.end);
+    if (double(last * extent) == line.end) --last;
+    if (last - first + 1 > 4096) return StreamingBoundaryError::LimitExceeded;
+    for (auto tile = first; tile <= last; ++tile) {
+        const auto tangent = static_cast<std::int32_t>(std::max(low, double(tile * extent)));
+        const auto plane = static_cast<std::int32_t>(line.plane);
+        const auto policyAt = [&](std::int32_t p) {
+            return line.axis == TerrainBoundaryAxis::X ? impl_->regions_.policyAt(p, tangent) : impl_->regions_.policyAt(tangent, p);
+        };
+        if (policyAt(plane - 1) != request.negative || policyAt(plane) != request.positive)
+            return StreamingBoundaryError::InvalidBoundary;
+    }
+    const auto keys = impl_->boundaryKeys(request);
+    if (keys.size() > limits.maxSources) return StreamingBoundaryError::LimitExceeded;
+    std::size_t bytes = 0;
+    for (const auto& key : keys) {
+        const auto& entry = impl_->entries_.at(key);
+        if (!impl_->boundarySourceReady(key, entry)) return StreamingBoundaryError::SourcesPending;
+        const auto account = [&](std::size_t count, std::size_t size) {
+            if (count > (limits.maxMeshBytes - bytes) / size) return false;
+            bytes += count * size;
+            return true;
+        };
+        if (!account(entry.mesh->vertices.size(), sizeof(TerrainVertex)) ||
+            !account(entry.mesh->indices.size(), sizeof(std::uint32_t)) ||
+            !account(entry.mesh->surfaces.size(), sizeof(TerrainSurface))) return StreamingBoundaryError::LimitExceeded;
+    }
+    auto data = std::make_shared<StreamingBoundarySnapshot::Data>();
+    data->meshBytes = bytes;
+    data->request = request; data->revision = impl_->regions_.revision(); data->owner = impl_->boundaryOwner_;
+    for (const auto& key : keys) {
+        const auto& entry = impl_->entries_.at(key);
+        const unsigned side = key.policy == request.positive ? 1 : 0;
+        data->sources[side].push_back({key, entry.handle, impl_->storeFor(key.policy).version(entry.handle), entry.meshVersion});
+        data->meshes[side].push_back(*entry.mesh);
+        data->origins[side].push_back(meshOrigin(key));
+    }
+    StreamingBoundarySnapshot snapshot;
+    snapshot.data_ = std::move(data);
+    return snapshot;
+}
+
+auto WorldStreamer::boundaryCurrent(const StreamingBoundarySnapshot& snapshot) const -> bool {
+    if (!snapshot.data_ || snapshot.data_->owner != impl_->boundaryOwner_ ||
+        snapshot.data_->revision != impl_->regions_.revision()) return false;
+    const auto& data = *snapshot.data_;
+    const auto keys = impl_->boundaryKeys(data.request);
+    if (keys.size() != data.sources[0].size() + data.sources[1].size()) return false;
+    std::array<std::size_t, 2> indices{};
+    for (const auto& key : keys) {
+        const unsigned side = key.policy == data.request.positive ? 1 : 0;
+        if (indices[side] >= data.sources[side].size()) return false;
+        const auto& source = data.sources[side][indices[side]++];
+        const auto& entry = impl_->entries_.at(key);
+        if (source.key != key || source.handle != entry.handle || !impl_->boundarySourceReady(key, entry) ||
+            source.cellVersion != impl_->storeFor(key.policy).version(entry.handle) || source.meshVersion != entry.meshVersion) return false;
+    }
+    return true;
+}
+
+auto WorldStreamer::boundaryCurrent(const StreamingBoundaryReplacement& replacement) const -> bool {
+    return replacement.data_ && boundaryCurrent(replacement.data_->snapshot);
+}
+
+auto WorldStreamer::boundaryCurrent(const StreamingBoundaryComposition& composition) const -> bool {
+    if (!composition.data_) return false;
+    for (const auto& snapshot : composition.data_->snapshots) if (!boundaryCurrent(snapshot)) return false;
+    return true;
+}
+
+auto StreamingSurfaceView::current(const WorldStreamer& world) const -> bool {
+    if (!data_) return false;
+    if (data_->composition && !world.boundaryCurrent(*data_->composition)) return false;
+    for (const auto& source : data_->sources) {
+        const auto current = world.chunk(source.key);
+        if (!current || !current->hasMesh || current->state != ChunkState::Meshed ||
+            current->handle != source.handle || current->version != source.meshVersion ||
+            current->meshVersion != source.meshVersion ||
+            current->meshRegionRevision != source.regionRevision ||
+            world.identityToken() != source.owner)
+            return false;
+    }
+    return true;
 }
 
 auto WorldStreamer::snapshot(StreamingChunkKey key) const
@@ -805,6 +1559,23 @@ auto WorldStreamer::edit(StreamingChunkKey key, std::uint32_t index,
         impl_->recordHeightPersistence(key, index, value);
     }
     return true;
+}
+
+auto WorldStreamer::raycastPublishedTerrain(math::Vec3 origin, math::Vec3 direction,
+                                            float maxDistance, bool cullBackFaces) const
+    -> std::optional<PublishedTerrainHit> {
+    std::optional<PublishedTerrainHit> closest;
+    for (const auto& [key, entry] : impl_->entries_) {
+        if (!entry.mesh) continue;
+        const auto hit = raycastTerrainMesh(*entry.mesh, origin, direction, maxDistance,
+                                           meshOrigin(key), cullBackFaces);
+        if (!hit) continue;
+        if (!closest || hit->distance < closest->surface.distance ||
+            (hit->distance == closest->surface.distance && keyLess(key, closest->key))) {
+            closest = PublishedTerrainHit{key, entry.handle, entry.meshVersion, *hit, entry.meshRegionRevision};
+        }
+    }
+    return closest;
 }
 
 auto WorldStreamer::raycastVoxelTerrain(math::Vec3 origin, math::Vec3 direction,

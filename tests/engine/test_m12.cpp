@@ -17,6 +17,7 @@
 #include "engine/rendering/renderer.h"
 #include "engine/rendering/shader_constants.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
+#include "graphics/render_graph/render_graph.h"
 
 using namespace f4;
 
@@ -55,6 +56,192 @@ void addObject(ecs::Registry& registry, resources::MeshHandle mesh,
 }
 
 } // namespace
+
+TEST_CASE("M12: render graph retains same-state write barriers across passes and frames") {
+    gfx::NullDevice device;
+    gfx::RenderGraph graph;
+    gfx::ResourceDesc buffer;
+    buffer.type = gfx::ResourceType::Buffer;
+    buffer.buffer.sizeBytes = 16;
+    buffer.buffer.usage = gfx::BufferUsage::Storage;
+    const auto bufferId = graph.declareResource(std::move(buffer));
+    gfx::ResourceDesc texture;
+    texture.texture.width = 4;
+    texture.texture.height = 4;
+    const auto textureId = graph.declareResource(std::move(texture));
+    const gfx::ResourceState bufferState{
+        gfx::PipelineStageMask::ComputeShader,
+        gfx::ResourceAccessMask::ShaderRead | gfx::ResourceAccessMask::ShaderWrite,
+        gfx::TextureLayout::Undefined};
+    const gfx::ResourceState textureState{
+        gfx::PipelineStageMask::ColorAttachment,
+        gfx::ResourceAccessMask::ColorWrite, gfx::TextureLayout::ColorAttachment};
+    for (int i = 0; i < 2; ++i) {
+        gfx::PassDesc pass;
+        pass.accesses.push({bufferId, bufferState});
+        pass.accesses.push({textureId, textureState});
+        (void)graph.declarePass(std::move(pass));
+    }
+    gfx::CommandBuffer commands;
+    for (int frame = 0; frame < 2; ++frame) {
+        REQUIRE(graph.execute(device, commands) == gfx::GfxError::None);
+        CHECK(commands.commandCount() == 4);
+        if (commands.commandCount() == 4) {
+            CHECK(commands.commands()[2].before == bufferState);
+            CHECK(commands.commands()[2].after == bufferState);
+            CHECK(commands.commands()[3].before == textureState);
+            CHECK(commands.commands()[3].after == textureState);
+        }
+    }
+    CHECK(graph.release(device) == gfx::GfxError::None);
+}
+
+TEST_CASE("M12: render graph schedules explicit dependencies deterministically without a pass ceiling") {
+    gfx::NullDevice device;
+    gfx::RenderGraph graph;
+    containers::Array<std::uint32_t> recorded;
+    constexpr std::uint32_t count = 130;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        gfx::PassDesc pass;
+        if (i == 0) {
+            pass.dependsOn.push(count - 1);
+            pass.dependsOn.push(count - 1); // Duplicate edges must balance.
+        }
+        pass.record = [i, &recorded](gfx::CommandBuffer&) { recorded.push(i); };
+        CHECK(graph.declarePass(std::move(pass)) == i);
+    }
+    REQUIRE(graph.compile() == gfx::GfxError::None);
+    REQUIRE(graph.executionOrder().size() == count);
+    for (std::uint32_t i = 0; i < count - 1; ++i) CHECK(graph.executionOrder()[i] == i + 1);
+    CHECK(graph.executionOrder()[count - 1] == 0);
+    gfx::CommandBuffer commands;
+    for (int frame = 0; frame < 2; ++frame) {
+        recorded.clear();
+        REQUIRE(graph.execute(device, commands) == gfx::GfxError::None);
+        REQUIRE(recorded.size() == count);
+        for (std::uint32_t i = 0; i < count; ++i) CHECK(recorded[i] == graph.executionOrder()[i]);
+    }
+    CHECK(graph.declarePass({}) == count);
+    CHECK(graph.executionOrder().isEmpty());
+    REQUIRE(graph.compile() == gfx::GfxError::None);
+    REQUIRE(graph.executionOrder().size() == count + 1);
+    CHECK(graph.executionOrder()[count] == count);
+    gfx::ResourceDesc resource;
+    resource.type = gfx::ResourceType::Buffer;
+    resource.buffer.sizeBytes = 16;
+    (void)graph.declareResource(std::move(resource));
+    CHECK(graph.executionOrder().isEmpty());
+    REQUIRE(graph.compile() == gfx::GfxError::None);
+    CHECK(device.stats().bufferCount == 0); // Compilation never materializes resources.
+    CHECK(graph.clear(device) == gfx::GfxError::None);
+    CHECK(graph.executionOrder().isEmpty());
+    CHECK(graph.compile() == gfx::GfxError::None);
+    CHECK(graph.execute(device, commands) == gfx::GfxError::None);
+    CHECK(recorded.size() == count);
+    CHECK(graph.release(device) == gfx::GfxError::None);
+}
+
+TEST_CASE("M12: render graph rejects invalid dependencies before recording or allocation") {
+    for (int mode = 0; mode < 3; ++mode) {
+        gfx::NullDevice device;
+        gfx::RenderGraph graph;
+        gfx::ResourceDesc resource;
+        resource.type = gfx::ResourceType::Buffer;
+        resource.buffer.sizeBytes = 16;
+        (void)graph.declareResource(std::move(resource));
+        bool recorded = false;
+        gfx::PassDesc first;
+        first.dependsOn.push(mode == 0 ? 99u : mode == 1 ? 0u : 1u);
+        first.record = [&recorded](gfx::CommandBuffer&) { recorded = true; };
+        (void)graph.declarePass(std::move(first));
+        gfx::PassDesc second;
+        second.dependsOn.push(0);
+        (void)graph.declarePass(std::move(second));
+        gfx::CommandBuffer commands;
+        CHECK(graph.compile() == gfx::GfxError::BadDescriptor);
+        CHECK(graph.executionOrder().isEmpty());
+        CHECK(graph.execute(device, commands) == gfx::GfxError::BadDescriptor);
+        CHECK_FALSE(recorded);
+        CHECK_FALSE(commands.isRecording());
+        CHECK(commands.commandCount() == 0);
+        CHECK(device.stats().bufferCount == 0);
+    }
+}
+
+TEST_CASE("M12: render graph preserves RAW WAR WAW hazards from declarations and access masks") {
+    for (bool explicitAccess : {false, true}) {
+        for (int hazard = 0; hazard < 3; ++hazard) {
+            gfx::RenderGraph graph;
+            gfx::ResourceDesc resource;
+            resource.type = gfx::ResourceType::Buffer;
+            resource.buffer.sizeBytes = 16;
+            const auto resourceId = graph.declareResource(std::move(resource));
+            for (std::uint32_t i = 0; i < 2; ++i) {
+                const bool write = hazard == 2 || (hazard == 0 ? i == 0 : i == 1);
+                gfx::PassDesc pass;
+                if (i == 0) pass.dependsOn.push(1); // Contradicts the resource hazard.
+                if (explicitAccess) {
+                    pass.accesses.push({resourceId,
+                        {gfx::PipelineStageMask::ComputeShader,
+                         write ? gfx::ResourceAccessMask::ShaderWrite : gfx::ResourceAccessMask::ShaderRead,
+                         gfx::TextureLayout::Undefined}});
+                } else if (write) {
+                    pass.writes.push(resourceId);
+                } else {
+                    pass.reads.push(resourceId);
+                }
+                (void)graph.declarePass(std::move(pass));
+            }
+            CHECK(graph.compile() == gfx::GfxError::BadDescriptor);
+            CHECK(graph.executionOrder().isEmpty());
+        }
+    }
+}
+
+TEST_CASE("M12: render graph allows independent readers but orders the following writer") {
+    gfx::RenderGraph graph;
+    gfx::ResourceDesc resource;
+    resource.type = gfx::ResourceType::Buffer;
+    resource.buffer.sizeBytes = 16;
+    const auto id = graph.declareResource(std::move(resource));
+    gfx::PassDesc first;
+    first.reads.push(id);
+    first.reads.push(id);
+    first.dependsOn.push(1);
+    (void)graph.declarePass(std::move(first));
+    gfx::PassDesc second;
+    second.accesses.push({id, {gfx::PipelineStageMask::ComputeShader,
+        gfx::ResourceAccessMask::ShaderRead, gfx::TextureLayout::Undefined}});
+    (void)graph.declarePass(std::move(second));
+    gfx::PassDesc writer;
+    writer.writes.push(id);
+    writer.reads.push(id); // One read/write use, not a self-dependency.
+    writer.writes.push(id);
+    (void)graph.declarePass(std::move(writer));
+    REQUIRE(graph.compile() == gfx::GfxError::None);
+    REQUIRE(graph.executionOrder().size() == 3);
+    CHECK(graph.executionOrder()[0] == 1);
+    CHECK(graph.executionOrder()[1] == 0);
+    CHECK(graph.executionOrder()[2] == 2);
+}
+
+TEST_CASE("M12: render graph preserves texture layout transitions between readers") {
+    gfx::RenderGraph graph;
+    gfx::ResourceDesc resource;
+    resource.texture.width = 4;
+    resource.texture.height = 4;
+    const auto id = graph.declareResource(std::move(resource));
+    gfx::PassDesc sample;
+    sample.dependsOn.push(1);
+    sample.accesses.push({id, {gfx::PipelineStageMask::FragmentShader,
+        gfx::ResourceAccessMask::ShaderRead, gfx::TextureLayout::ShaderRead}});
+    (void)graph.declarePass(std::move(sample));
+    gfx::PassDesc copy;
+    copy.accesses.push({id, {gfx::PipelineStageMask::Transfer,
+        gfx::ResourceAccessMask::TransferRead, gfx::TextureLayout::TransferSource}});
+    (void)graph.declarePass(std::move(copy));
+    CHECK(graph.compile() == gfx::GfxError::BadDescriptor);
+}
 
 TEST_CASE("M12: render queue batches opaque state and isolates transparent draws") {
     const resources::MeshHandle meshA{1, 2};
@@ -131,6 +318,21 @@ TEST_CASE("M12: render queue orders non-finite depths deterministically") {
     CHECK(queue.items()[0].entity == nonFinite.entity);
     CHECK(queue.items()[1].entity == infinite.entity);
     CHECK(queue.items()[2].entity == finite.entity);
+}
+
+TEST_CASE("M12: mirrored and ordinary instances never share a raster batch") {
+    engine::RenderQueue queue;
+    engine::RenderItem item;
+    queue.push(item);
+    item.mirrored = true;
+    queue.push(item);
+    queue.push(item);
+    queue.sort();
+    containers::Array<engine::RenderBatch> batches;
+    queue.buildBatches(batches);
+    REQUIRE(batches.size() == 2);
+    CHECK(batches[0].itemCount == 1);
+    CHECK(batches[1].itemCount == 2);
 }
 
 TEST_CASE("M12: dynamic upload ring grows transactionally and rotates frame banks") {

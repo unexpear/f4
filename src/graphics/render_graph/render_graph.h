@@ -11,10 +11,9 @@
 
 namespace f4::gfx {
 
-// M8 RenderGraph v1: declared resources and passes, executed in declaration
-// order. No auto-reordering or barrier synthesis yet; those remain M9/M12
-// concerns. Persistent resources live until release()/clear(), while transient
-// resources are released after each submission.
+// Single-queue graph with deterministic dependency scheduling and explicit
+// access-state barriers. Persistent resources live until release()/clear();
+// transient resources are released after each submission.
 
 using containers::Array;
 using containers::String;
@@ -48,6 +47,9 @@ struct PassDesc {
     // writes a framebuffer resource; otherwise called outside any pass (e.g. compute).
     // Keep it small; capture by value where possible.
     std::function<void(CommandBuffer&)> record;
+    // Pass IDs that must execute first (forward references are allowed).
+    // This orders callbacks, not GPU memory: declare accesses for barriers.
+    Array<std::uint32_t> dependsOn;
 };
 
 struct FrameContext {
@@ -70,13 +72,23 @@ public:
     [[nodiscard]] auto resource(ResourceId id) const -> const ResourceDesc& { return resources_[id]; }
     [[nodiscard]] auto pass(std::uint32_t index) const -> const PassDesc& { return passes_[index]; }
 
+    // Resources are unversioned: RAW/WAR/WAW hazards retain declaration order.
+    // Independent ready passes use the lowest declaration ID first. Declare
+    // all callback resource uses, reuse one ID per imported handle, and declare
+    // framebuffer attachment texture uses separately. Untracked side effects
+    // require explicit dependencies; hidden aliases are unsupported. No pass
+    // culling or async compute.
+    [[nodiscard]] auto compile() -> GfxError;
+    // Empty until compile succeeds; invalidated by any new declaration/clear.
+    [[nodiscard]] auto executionOrder() const -> const Array<std::uint32_t>& { return order_; }
+
     // Releases materialized resources, then removes all declarations.
     [[nodiscard]] auto clear(IDevice& dev) -> GfxError;
 
-    // Executes passes in declaration order. For each pass, if it writes a
+    // Compiles, then executes passes in dependency order. If a pass writes a
     // framebuffer resource, a BeginRenderPass/EndRenderPass is wrapped around
-    // record(). Otherwise record() is invoked bare. After all passes, the
-    // supplied CommandBuffer is begun, ended, and submitted by the graph.
+    // record(). Otherwise record() is invoked bare. The supplied CommandBuffer
+    // is begun before recording, then ended and submitted by the graph.
     [[nodiscard]] auto execute(IDevice& dev, CommandBuffer& cb) -> GfxError;
 
     // Materializes all declared resources (createTexture/createBuffer/createFramebuffer).
@@ -96,6 +108,8 @@ private:
 
     Array<ResourceDesc> resources_;
     Array<PassDesc> passes_;
+    Array<std::uint32_t> order_;
+    bool compiled_ = false;
     // Materialized handles and ownership flags, parallel to resources_.
     Array<TextureHandle> textures_;
     Array<BufferHandle> buffers_;

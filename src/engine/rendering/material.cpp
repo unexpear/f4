@@ -325,6 +325,7 @@ auto MaterialCache::find(const StandardMaterialDesc& desc) const -> resources::M
 
 auto MaterialCache::getOrCreate(const StandardMaterialDesc& desc) -> resources::MaterialHandle {
     if (const auto existing = find(desc); existing.isValid()) return existing;
+    if (arena_.full()) return {};
     StandardMaterial material;
     material.desc = desc;
     const auto handle = arena_.acquire(static_cast<StandardMaterial&&>(material));
@@ -382,11 +383,11 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
 }
 
 auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle handle,
-                                   const gfx::VertexInputLayout& vertexInput)
+                                   const gfx::VertexInputLayout& vertexInput, bool mirrored)
     -> gfx::GfxError {
     StandardMaterial* material = arena_.get(handle);
     if (material == nullptr) return gfx::GfxError::InvalidHandle;
-    if (pipelineFor(handle, vertexInput).isValid()) return gfx::GfxError::None;
+    if (pipelineFor(handle, vertexInput, mirrored).isValid()) return gfx::GfxError::None;
     if (const auto error = ensureShaders(dev); error != gfx::GfxError::None) return error;
 
     gfx::PipelineStateDesc pipeline;
@@ -396,6 +397,7 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
     pipeline.topology = gfx::PrimitiveTopology::TriangleList;
     pipeline.raster.cullMode = material->desc.doubleSided ? gfx::CullMode::None
                                                           : gfx::CullMode::Back;
+    pipeline.raster.frontClockwise = mirrored;
     pipeline.depthStencil.depthTestEnable = true;
     const bool blended = material->desc.transparent ||
                          material->desc.alphaMode == MaterialAlphaMode::Blend;
@@ -418,19 +420,21 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
     variant.vertexLayoutHash = hashLayout(vertexInput);
     variant.vertexInput = vertexInput;
     variant.pipeline = result.value();
+    variant.mirrored = mirrored;
     material->variants.push(static_cast<MaterialPipelineVariant&&>(variant));
     if (!material->pipeline.isValid()) material->pipeline = result.value();
     return gfx::GfxError::None;
 }
 
 auto MaterialCache::pipelineFor(resources::MaterialHandle handle,
-                                const gfx::VertexInputLayout& vertexInput) const
+                                const gfx::VertexInputLayout& vertexInput, bool mirrored) const
     -> gfx::PipelineHandle {
     const StandardMaterial* material = arena_.get(handle);
     if (material == nullptr) return {};
     const std::uint64_t hash = hashLayout(vertexInput);
     for (const MaterialPipelineVariant& variant : material->variants) {
-        if (variant.vertexLayoutHash == hash && layoutsEqual(variant.vertexInput, vertexInput)) {
+        if (variant.mirrored == mirrored && variant.vertexLayoutHash == hash &&
+            layoutsEqual(variant.vertexInput, vertexInput)) {
             return variant.pipeline;
         }
     }

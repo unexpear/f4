@@ -1,6 +1,7 @@
 #include "engine/rendering/renderer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -471,6 +472,7 @@ auto Renderer::init() -> gfx::GfxError {
 }
 
 auto Renderer::createMesh(const resources::Mesh& mesh) -> resources::MeshHandle {
+    if (meshArena_.full()) return {};
     auto gpuResult = createGpuMesh(device_, mesh);
     if (!gpuResult.hasValue()) return {};
     GpuMesh gpu = static_cast<GpuMesh&&>(gpuResult.value());
@@ -498,6 +500,7 @@ void Renderer::destroyMesh(resources::MeshHandle handle) {
 }
 
 auto Renderer::createTexture(const resources::Texture& texture) -> resources::TextureHandle {
+    if (textureArena_.full()) return {};
     if (texture.mips.isEmpty() || resources::isBlockCompressed(texture.format)) return {};
     gfx::TextureFormat format{};
     if (!translateTextureFormat(texture.format, format)) return {};
@@ -566,17 +569,31 @@ auto Renderer::createMaterialFromGltf(
     -> Result<resources::MaterialHandle, MaterialImportError> {
     auto converted = materialFromGltf(material, textures);
     if (!converted.hasValue()) return converted.error();
-    return createMaterial(converted.value());
+    const auto handle = createMaterial(converted.value());
+    if (!handle.isValid()) return MaterialImportError::CapacityExceeded;
+    return handle;
 }
 
 auto Renderer::ensureMaterialPipeline(resources::MaterialHandle handle) -> gfx::GfxError {
     return materials_.ensurePipeline(device_, handle);
 }
 
+auto Renderer::ensureMaterialPipeline(resources::MaterialHandle handle,
+                                       resources::MeshHandle mesh, bool mirrored) -> gfx::GfxError {
+    const auto* entry = meshMap_.find(mesh);
+    if (entry == nullptr) return gfx::GfxError::InvalidHandle;
+    return materials_.ensurePipeline(device_, handle, entry->instancedLayout, mirrored);
+}
+
 void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntity,
                       float aspect) {
-    stats_ = {};
     recordError_ = gfx::GfxError::None;
+    recordMain(commandBuffer, cameraEntity, aspect);
+}
+
+void Renderer::recordMain(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntity,
+                          float aspect) {
+    stats_ = {};
     if (!inited_) {
         recordError_ = gfx::GfxError::BadDescriptor;
         return;
@@ -609,14 +626,22 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
             ++stats_.frustumCulled;
             continue;
         }
-        if (const auto error = materials_.ensurePipeline(
-                device_, renderer.material, entry->instancedLayout);
+        const bool mirrored = world.matrix.determinant() < 0.0f;
+        const auto pipelineStart = pbrSettings_.profileTimings
+            ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto pipelineError = materials_.ensurePipeline(
+            device_, renderer.material, entry->instancedLayout, mirrored);
+        if (pbrSettings_.profileTimings) {
+            stats_.materialPipelineUs += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - pipelineStart).count();
+        }
+        if (const auto error = pipelineError;
             error != gfx::GfxError::None) {
             recordError_ = error;
             continue;
         }
         const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(renderer.material, entry->instancedLayout);
+            materials_.pipelineFor(renderer.material, entry->instancedLayout, mirrored);
         if (!pipeline.isValid()) continue;
         RenderItem item;
         item.entity = entity;
@@ -629,6 +654,7 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         if (!std::isfinite(item.depth)) item.depth = std::numeric_limits<float>::max();
         item.transparent = renderer.transparent || isBlended(material->desc);
         item.pipelineSortKey = pipeline.index;
+        item.mirrored = mirrored;
         queue_.push(item);
     }
     queue_.sort();
@@ -651,7 +677,7 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         const StandardMaterial* material = materials_.get(item.material);
         if (entry == nullptr || material == nullptr) continue;
         const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(item.material, entry->instancedLayout);
+            materials_.pipelineFor(item.material, entry->instancedLayout, item.mirrored);
         if (!pipeline.isValid()) continue;
 
         instanceStaging_.clear();
@@ -797,6 +823,9 @@ void Renderer::recordShadow(gfx::CommandBuffer& commandBuffer) {
 
 auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEntity,
                       float aspect) -> gfx::GfxError {
+    stats_.mainRecordUs = 0;
+    stats_.materialPipelineUs = 0;
+    stats_.graphExecuteUs = 0;
     if (!inited_) return gfx::GfxError::BadDescriptor;
     if (!framebuffer.isValid()) return gfx::GfxError::InvalidHandle;
     if (const auto error = graph_.clear(device_); error != gfx::GfxError::None) return error;
@@ -851,11 +880,23 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         });
     }
     mainPass.record = [this, cameraEntity, aspect](gfx::CommandBuffer& commandBuffer) {
-        record(commandBuffer, cameraEntity, aspect);
+        const auto start = pbrSettings_.profileTimings
+            ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        recordMain(commandBuffer, cameraEntity, aspect);
+        if (pbrSettings_.profileTimings) {
+            stats_.mainRecordUs = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - start).count();
+        }
     };
     (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(mainPass));
     gfx::CommandBuffer commandBuffer;
+    const auto executeStart = pbrSettings_.profileTimings
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const gfx::GfxError submitError = graph_.execute(device_, commandBuffer);
+    if (pbrSettings_.profileTimings) {
+        stats_.graphExecuteUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - executeStart).count();
+    }
     frameShadowsActive_ = false;
     return submitError != gfx::GfxError::None ? submitError : recordError_;
 }

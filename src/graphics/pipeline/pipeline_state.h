@@ -116,6 +116,7 @@ struct DepthStencilState {
 struct RasterState {
     CullMode cullMode = CullMode::Back;
     bool depthClampEnable = false;
+    bool frontClockwise = false; // Canonical front winding is CCW; reflections use CW.
 };
 
 struct ColorAttachmentState {

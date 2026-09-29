@@ -3,12 +3,15 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <set>
+#include <tuple>
 
 #include <doctest/doctest.h>
 
 #include "backends/null/null_device.h"
 #include "engine/rendering/gpu_mesh.h"
 #include "engine/world/terrain_meshing.h"
+#include "engine/world/terrain_queries.h"
 
 namespace {
 
@@ -160,6 +163,46 @@ TEST_CASE("M15: voxel greedy meshing culls interiors and preserves winding") {
     CHECK(surroundedResult.value().vertices.isEmpty());
     CHECK(surroundedResult.value().indices.isEmpty());
     CHECK(borderCalls == 34u * 34u * 34u - 32u * 32u * 32u);
+}
+
+TEST_CASE("M15: voxel ownership cuts preserve cavities, overhangs and the masked AO reference") {
+    BlockRegistry blocks;
+    auto cells = emptyVoxels();
+    for (auto& cell : cells.values) cell = 2;
+    // An opening through the cut plane, ending at x=8, under a solid roof.
+    for (unsigned y = 5; y < 10; ++y) for (unsigned z = 5; z < 11; ++z) for (unsigned x = 8; x < 24; ++x) cells.values[voxelIndex(x, y, z)] = 0;
+    const auto unchanged = cells;
+    VoxelMeshingOptions options;
+    options.borderFetch = [](std::int32_t, std::int32_t, std::int32_t) -> std::uint16_t { return 2; };
+    options.cellOwned = [](std::int32_t x, std::int32_t, std::int32_t) { return x >= 0 && x < 16; };
+    const auto cut = meshVoxelChunk(cells, blocks, options);
+    REQUIRE(cut.hasValue());
+    CHECK(cells == unchanged);
+    auto reference = cells;
+    for (unsigned y = 0; y < 32; ++y) for (unsigned z = 0; z < 32; ++z) for (unsigned x = 16; x < 32; ++x) reference.values[voxelIndex(x, y, z)] = 0;
+    VoxelMeshingOptions referenceOptions;
+    referenceOptions.borderFetch = [](std::int32_t x, std::int32_t, std::int32_t) -> std::uint16_t { return x >= 0 && x < 16 ? 2 : 0; };
+    const auto expected = meshVoxelChunk(reference, blocks, referenceOptions);
+    REQUIRE(expected.hasValue());
+    CHECK(meshDigest(cut.value()) == meshDigest(expected.value()));
+    checkTriangleWinding(cut.value());
+    auto hit = raycastTerrainMesh(cut.value(), {18, 4.5f, 8.5f}, {-1, 0, 0}, 16, {}, true);
+    REQUIRE(hit.has_value());
+    CHECK(hit->distance == 2);
+    CHECK(hit->normal == math::Vec3{1, 0, 0});
+    hit = raycastTerrainMesh(cut.value(), {18, 7.5f, 8.5f}, {-1, 0, 0}, 16, {}, true);
+    REQUIRE(hit.has_value());
+    CHECK(hit->distance == 10); // No blanket cap across the tunnel mouth.
+    hit = raycastTerrainMesh(cut.value(), {14.5f, 7, 8.5f}, {0, 1, 0}, 8, {}, true);
+    REQUIRE(hit.has_value());
+    CHECK(hit->position.y == 10);
+    CHECK(hit->normal == math::Vec3{0, -1, 0});
+    options.cellOwned = [](std::int32_t, std::int32_t, std::int32_t) { return false; };
+    const auto empty = meshVoxelChunk(cells, blocks, options);
+    REQUIRE(empty.hasValue());
+    CHECK(empty.value().indices.isEmpty());
+    cells.values[0] = 65535;
+    CHECK(meshVoxelChunk(cells, blocks, options).error() == TerrainMeshError::UnknownBlock);
 }
 
 TEST_CASE("M15: voxel materials constrain greedy merges and AO is baked per corner") {
@@ -373,6 +416,54 @@ TEST_CASE("M15: all policy meshes convert to the same RHI record and upload") {
         engine::destroyGpuMesh(device, gpu.value());
     }
     CHECK(device.liveBuffers() == 0);
+}
+
+TEST_CASE("M15: canonical hex positions share global corners in every neighboring direction") {
+    for (float scale : {0.125f, 3.3f, 8.f}) {
+        for (const ChunkCoord anchor : {ChunkCoord{}, ChunkCoord{-3, 0, 2}}) {
+            std::set<std::tuple<float, float, float>> centerCorners;
+            for (unsigned neighbor = 0; neighbor <= 6; ++neighbor) {
+                ChunkCoord key = anchor;
+                if (neighbor != 0) { key.x += kHexDirections[neighbor - 1].q; key.z += kHexDirections[neighbor - 1].r; }
+                const auto tile = generateHexTile(123, key, {.radius = 2, .layout = HexLayout::Tiled});
+                const auto origin = hexChunkOrigin(key, 2, HexLayout::Tiled);
+                REQUIRE(origin.has_value());
+                const auto built = meshHexChunk(tile, key, {.radius = scale, .floorHeight = -8, .hasNeighbor = {}, .worldSpace = true});
+                REQUIRE(built.hasValue());
+                std::set<std::tuple<float, float, float>> positions;
+                for (const auto& v : built.value().vertices) {
+                    CHECK(std::isfinite(v.normal.x)); CHECK(std::isfinite(v.normal.y)); CHECK(std::isfinite(v.normal.z));
+                    positions.emplace(v.position.x, v.position.y, v.position.z);
+                }
+                unsigned shared = 0;
+                for (int r = -2; r <= 2; ++r) for (int q = -2; q <= 2; ++q) {
+                    if (!tile.contains({q, r})) continue;
+                    for (unsigned corner = 0; corner < 6; ++corner) {
+                        const auto lattice = hexCorner({origin->q + q, origin->r + r}, corner);
+                        const auto expected = std::tuple{static_cast<float>(double(lattice.x2) * 0.8660254037844386 * scale),
+                            *tile.corner({q, r}, corner), static_cast<float>(double(lattice.y2) * 0.5 * scale)};
+                        CHECK(positions.contains(expected));
+                        if (neighbor == 0) centerCorners.insert(expected);
+                        else if (centerCorners.contains(expected)) ++shared;
+                    }
+                }
+                if (neighbor != 0) CHECK(shared > 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("M15: canonical hex construction rejects overflow and collapsed float geometry") {
+    CHECK_FALSE(hexLatticePosition({}, 0));
+    CHECK_FALSE(hexLatticePosition({}, -1));
+    CHECK_FALSE(hexLatticePosition({}, std::numeric_limits<float>::quiet_NaN()));
+    CHECK(hexLatticePosition({100, 100}, std::numeric_limits<float>::max()).error() == TerrainMeshError::CoordinateOverflow);
+    const ChunkCoord far{100000000, 0, 100000000};
+    const auto tile = generateHexTile(123, far, {.radius = 2, .layout = HexLayout::Tiled});
+    const auto built = meshHexChunk(tile, far, {.radius = 8, .floorHeight = -8, .hasNeighbor = {}, .worldSpace = true});
+    CHECK(built.error() == TerrainMeshError::CoordinateOverflow);
+    // The local legacy path does not acquire a new world-coordinate limitation.
+    CHECK(meshHexChunk(tile, far, {.radius = 8, .floorHeight = -8, .hasNeighbor = {}}).hasValue());
 }
 
 TEST_CASE("M15: snapshot meshing applies overlays and rejects stale publication") {

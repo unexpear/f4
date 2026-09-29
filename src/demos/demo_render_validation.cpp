@@ -397,6 +397,28 @@ void PbrSphereGridScene::shutdown(gfx::IDevice* device) {
 void PbrSphereGridScene::onResize(std::uint32_t, std::uint32_t) {}
 void PbrSphereGridScene::update(float, const Uint8*, const SDL_MouseMotionEvent*) {}
 
+bool PbrSphereGridScene::prepareStaticCapture(FreeCamera& camera) {
+    if (!initialized_) return false;
+    camera.position = {0.0f, 2.15f, 7.5f};
+    camera.yaw = 1.57079633f;
+    camera.pitch = 0.0f;
+    // Separate the rows for inspection; the interactive fixture keeps its
+    // original layout and the Metal/WebGPU reference captures are unchanged.
+    std::array<std::array<float, 6>, 30> instances{};
+    for (std::uint32_t row = 0; row < 5; ++row) {
+        for (std::uint32_t column = 0; column < 6; ++column) {
+            instances[row * 6 + column] = {
+                (static_cast<float>(column) - 2.5f) * 1.25f,
+                -0.35f + static_cast<float>(row) * 1.25f, 0.0f,
+                static_cast<float>(row) / 4.0f,
+                0.06f + 0.94f * static_cast<float>(column) / 5.0f,
+                0.55f};
+        }
+    }
+    return device_->writeBuffer(instanceBuffer_, 0, std::as_bytes(std::span(instances))) ==
+        gfx::GfxError::None;
+}
+
 void PbrSphereGridScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
                                 std::uint32_t width, std::uint32_t height) {
     if (!initialized_) return;

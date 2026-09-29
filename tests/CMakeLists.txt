@@ -1,5 +1,32 @@
 include(FetchContent)
 
+if(TARGET f4_streaming_demo)
+    add_test(NAME streaming_demo_capture
+        COMMAND ${CMAKE_COMMAND}
+            "-DDEMO=$<TARGET_FILE:f4_streaming_demo>"
+            "-DOUTPUT_DIR=${CMAKE_BINARY_DIR}/streaming-demo-captures"
+            -P "${PROJECT_SOURCE_DIR}/cmake/streaming_demo_smoke.cmake")
+    set_tests_properties(streaming_demo_capture PROPERTIES
+        LABELS "graphics;visual;streaming" RUN_SERIAL TRUE TIMEOUT 330)
+    add_test(NAME streaming_policy_capture
+        COMMAND ${CMAKE_COMMAND}
+            "-DDEMO=$<TARGET_FILE:f4_streaming_demo>"
+            "-DOUTPUT_DIR=${CMAKE_BINARY_DIR}/streaming-policy-captures"
+            -P "${PROJECT_SOURCE_DIR}/cmake/streaming_policy_smoke.cmake")
+    set_tests_properties(streaming_policy_capture PROPERTIES
+        LABELS "graphics;visual;streaming" RUN_SERIAL TRUE TIMEOUT 330)
+endif()
+
+if(TARGET demo_bench)
+    add_test(NAME static_demo_capture
+        COMMAND ${CMAKE_COMMAND}
+            "-DDEMO=$<TARGET_FILE:demo_bench>"
+            "-DOUTPUT_DIR=${CMAKE_BINARY_DIR}/static-demo-captures"
+            -P "${PROJECT_SOURCE_DIR}/cmake/static_demo_smoke.cmake")
+    set_tests_properties(static_demo_capture PROPERTIES
+        LABELS "graphics;visual" RUN_SERIAL TRUE TIMEOUT 300)
+endif()
+
 FetchContent_Declare(doctest
     SYSTEM
     EXCLUDE_FROM_ALL
@@ -51,10 +78,19 @@ add_executable(f4_tests
     engine/test_m13.cpp
     engine/test_m14.cpp
     engine/test_m15.cpp
+    engine/test_terrain_queries.cpp
+    engine/test_terrain_regions.cpp
+    engine/test_terrain_boundaries.cpp
+    engine/test_terrain_boundary_walls.cpp
+    engine/test_terrain_solid.cpp
+    engine/test_boundary_profile_job.cpp
+    engine/test_boundary_discovery.cpp
+    engine/test_boundary_replacement.cpp
     engine/test_m16.cpp
+    engine/test_streaming_demo.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::doctest)
+target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine f4_streaming_demo_state doctest::doctest)
 target_compile_definitions(f4_tests PRIVATE
     F4_UFBX_TEST_DATA_DIR="${ufbx_SOURCE_DIR}/data"
     F4_TINYUSDZ_TEST_DATA_DIR="${tinyusdz_SOURCE_DIR}/models"

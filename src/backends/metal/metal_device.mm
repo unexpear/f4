@@ -1087,7 +1087,8 @@ auto MetalDevice::submit(CommandBuffer& commandBuffer) -> GfxError {
                     [render setRenderPipelineState:pipeline->render];
                     [render setDepthStencilState:pipeline->depthStencil];
                     [render setCullMode:metalCull(pipeline->rec.desc.raster.cullMode)];
-                    [render setFrontFacingWinding:MTLWindingCounterClockwise];
+                    [render setFrontFacingWinding:pipeline->rec.desc.raster.frontClockwise
+                        ? MTLWindingClockwise : MTLWindingCounterClockwise];
                     [render setDepthClipMode:pipeline->rec.desc.raster.depthClampEnable
                                                  ? MTLDepthClipModeClamp
                                                  : MTLDepthClipModeClip];

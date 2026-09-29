@@ -13,6 +13,7 @@ public:
     void onResize(std::uint32_t width, std::uint32_t height) override;
     void update(float dt, const Uint8* keys, const SDL_MouseMotionEvent* mouseMotion) override;
     void render(gfx::CommandBuffer& cb, const FreeCamera& camera, std::uint32_t width, std::uint32_t height) override;
+    bool prepareStaticCapture(FreeCamera& camera) override;
 
 private:
     gfx::BufferHandle vb_;

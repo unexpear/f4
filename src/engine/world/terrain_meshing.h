@@ -44,6 +44,7 @@ enum class TerrainMeshError : std::uint8_t {
     MissingBlockRegistry,
     UnknownBlock,
     CoordinateOverflow,
+    RegionLimitExceeded,
 };
 
 // Converts MeshData to the canonical M11 position/normal/UV/color vertex
@@ -55,6 +56,10 @@ struct VoxelMeshingOptions {
     // Local chunk coordinates. The mesher requests only the one-cell border
     // [-1, 32] and always uses the supplied center VoxelCells for [0, 31].
     VoxelFetch borderFetch;
+    // Optional ownership mask over the same local [-1,32] padded coordinates.
+    // Applied to center AND border cells before face culling/AO, without changing
+    // input cells. Rejected cells behave as air; original block ids are validated.
+    std::function<bool(std::int32_t, std::int32_t, std::int32_t)> cellOwned{};
 };
 
 using HeightFetch = std::function<float(std::int64_t, std::int64_t)>;
@@ -64,6 +69,8 @@ struct HeightMeshingOptions {
     std::optional<float> transitionFloor;
     // Global sample coordinates; used for the one-sample normal border.
     HeightFetch borderFetch;
+    // Bits 0..3 select -Z/+X/+Z/-X skirts. Default preserves standalone meshes.
+    std::uint8_t skirtEdges = 0x0f;
 };
 
 using HexNeighborFetch = std::function<bool(AxialCoord)>;
@@ -72,7 +79,15 @@ struct HexMeshingOptions {
     float floorHeight = -8.0f;
     // Global axial coordinates. A present neighbor suppresses the shared wall.
     HexNeighborFetch hasNeighbor;
+    // Construct positions directly from global integer corners in one frame.
+    // Caller must use zero mesh translation. Default preserves local meshes.
+    bool worldSpace = false;
 };
+
+// Canonical global lattice construction, rounded once to the mesh float format.
+// Shared by world-space hex vertices and their conservative admission bounds.
+[[nodiscard]] auto hexLatticePosition(HexCornerCoord lattice, float radius)
+    -> Result<math::Vec2, TerrainMeshError>;
 
 [[nodiscard]] auto meshVoxelChunk(const VoxelCells& cells,
                                   const BlockRegistry& registry,
