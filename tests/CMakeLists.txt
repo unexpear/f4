@@ -83,6 +83,7 @@ add_executable(f4_tests
     engine/test_terrain_boundaries.cpp
     engine/test_terrain_boundary_walls.cpp
     engine/test_terrain_solid.cpp
+    engine/test_streaming_solid.cpp
     engine/test_boundary_profile_job.cpp
     engine/test_boundary_discovery.cpp
     engine/test_boundary_replacement.cpp

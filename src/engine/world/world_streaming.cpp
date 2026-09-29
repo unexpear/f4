@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <span>
+
 #include "core/jobs/job_system.h"
 #include "engine/world/terrain_regions.h"
 
@@ -288,6 +290,74 @@ struct HorizontalBounds {
         }
     }
     return edges;
+}
+
+auto mapSolidError(TerrainSolidError error) -> StreamingSolidError {
+    switch (error) {
+    case TerrainSolidError::InvalidData: return StreamingSolidError::InvalidData;
+    case TerrainSolidError::IncompleteProfile: return StreamingSolidError::IncompleteProfile;
+    case TerrainSolidError::PrecisionLoss: return StreamingSolidError::PrecisionLoss;
+    case TerrainSolidError::DiscontinuousHeight: return StreamingSolidError::DiscontinuousHeight;
+    case TerrainSolidError::NonmanifoldCorner: return StreamingSolidError::NonmanifoldCorner;
+    case TerrainSolidError::InconsistentSector: return StreamingSolidError::InconsistentSector;
+    case TerrainSolidError::HexFloorInversion: return StreamingSolidError::HexFloorInversion;
+    case TerrainSolidError::UnsupportedUnderside: return StreamingSolidError::UnsupportedUnderside;
+    case TerrainSolidError::UnsupportedVoxel: return StreamingSolidError::UnsupportedVoxel;
+    case TerrainSolidError::VoxelCavity: return StreamingSolidError::VoxelCavity;
+    case TerrainSolidError::VoxelOverhang: return StreamingSolidError::VoxelOverhang;
+    }
+    return StreamingSolidError::InvalidData;
+}
+
+auto solidResult(Result<TerrainSolidSample, TerrainSolidError> result)
+    -> Result<TerrainSolidSample, StreamingSolidError> {
+    if (!result) return mapSolidError(result.error());
+    return result.value();
+}
+
+auto onRegionPlane(double coordinate, double extent) -> bool {
+    if (!std::isfinite(coordinate) || !(extent > 0)) return false;
+    const double quot = coordinate / extent;
+    if (!std::isfinite(quot)) return false;
+    auto index = static_cast<std::int64_t>(std::floor(quot));
+    if (static_cast<double>(index) * extent > coordinate) --index;
+    return static_cast<double>(index) * extent == coordinate;
+}
+
+auto narrowFloor(double value) -> std::optional<std::int32_t> {
+    if (!std::isfinite(value) || value < std::numeric_limits<std::int32_t>::min() ||
+        value > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    const double floored = std::floor(value);
+    if (floored < std::numeric_limits<std::int32_t>::min() ||
+        floored > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(floored);
+}
+
+auto integralPlane(double plane) -> std::optional<std::int32_t> {
+    if (!std::isfinite(plane) || plane < std::numeric_limits<std::int32_t>::min() ||
+        plane > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    const auto narrowed = static_cast<std::int32_t>(plane);
+    return static_cast<double>(narrowed) == plane ? std::optional<std::int32_t>(narrowed) : std::nullopt;
+}
+
+auto segmentBegin(double tangent, double extent) -> std::optional<double> {
+    if (!std::isfinite(tangent) || !(extent > 0)) return std::nullopt;
+    const double quot = tangent / extent;
+    if (!std::isfinite(quot)) return std::nullopt;
+    auto index = static_cast<std::int64_t>(std::floor(quot));
+    if (static_cast<double>(index) * extent > tangent) --index;
+    const double begin = static_cast<double>(index) * extent;
+    const double end = static_cast<double>(index + 1) * extent;
+    if (!std::isfinite(begin) || !std::isfinite(end) || !(begin < end) || tangent < begin || tangent > end) {
+        return std::nullopt;
+    }
+    return begin;
 }
 
 } // namespace
@@ -1092,7 +1162,10 @@ public:
     auto update(math::Vec3 camera) -> StreamingFrameStats {
         const auto start = std::chrono::steady_clock::now();
         StreamingFrameStats frame;
-        if (config_.frameBudget.count() <= 0) return frame;
+        if (config_.frameBudget.count() <= 0) {
+            frame.budgetClosed = true;
+            return frame;
+        }
         auto stageStart = start;
         const auto finishStage = [&](std::chrono::nanoseconds& duration) {
             if (!config_.profileTimings) return;
@@ -1126,8 +1199,11 @@ public:
         });
         finishStage(frame.timings.residency);
         for (const Candidate& candidate : unloads) {
-            if (!ready || frame.unloaded >= config_.maxUnloadsPerFrame ||
-                (frame.unloaded != 0 && !withinBudget(start))) break;
+            if (!ready || frame.unloaded >= config_.maxUnloadsPerFrame) break;
+            if (frame.unloaded != 0 && !withinBudget(start)) {
+                frame.budgetDeferred = true;
+                break;
+            }
             const auto found = entries_.find(candidate.key);
             if (found == entries_.end()) continue;
             ChunkStore& store = storeFor(candidate.key.policy);
@@ -1142,8 +1218,11 @@ public:
         finishStage(frame.timings.unload);
 
         for (const Candidate& candidate : desired) {
-            if (!ready || frame.loaded >= config_.maxLoadsPerFrame ||
-                (frame.loaded != 0 && !withinBudget(start))) break;
+            if (!ready || frame.loaded >= config_.maxLoadsPerFrame) break;
+            if (frame.loaded != 0 && !withinBudget(start)) {
+                frame.budgetDeferred = true;
+                break;
+            }
             if (entries_.find(candidate.key) != entries_.end()) continue;
             ChunkStore& store = storeFor(candidate.key.policy);
             if (store.liveCount() >= config_.chunkCapacityPerPolicy) continue;
@@ -1177,6 +1256,10 @@ public:
             if (processCompletion(std::move(completion))) ++frame.published;
             ++frame.completionsProcessed;
         }
+        if (!pendingCompletions_.empty() && frame.completionsProcessed > 0 &&
+            frame.completionsProcessed < config_.maxPublicationsPerFrame && !withinBudget(start)) {
+            frame.budgetDeferred = true;
+        }
         finishStage(frame.timings.publication);
 
         std::vector<Candidate> meshCandidates;
@@ -1202,8 +1285,11 @@ public:
             return keyLess(a.key, b.key);
         });
         for (const Candidate& candidate : meshCandidates) {
-            if (frame.meshJobs >= config_.maxMeshJobsPerFrame ||
-                (frame.meshJobs != 0 && !withinBudget(start))) break;
+            if (frame.meshJobs >= config_.maxMeshJobsPerFrame) break;
+            if (frame.meshJobs != 0 && !withinBudget(start)) {
+                frame.budgetDeferred = true;
+                break;
+            }
             const auto found = entries_.find(candidate.key);
             if (found == entries_.end()) continue;
             std::optional<ChunkSnapshot> copy =
@@ -1244,6 +1330,9 @@ public:
         std::sort(keys.begin(), keys.end(), keyLess);
         return keys;
     }
+
+    [[nodiscard]] auto classifyPublishedSolid(double x, double y, double z) const
+        -> Result<TerrainSolidSample, StreamingSolidError>;
 
     auto boundarySourceReady(StreamingChunkKey key, const Entry& entry) const -> bool {
         const auto& store = storeFor(key.policy);
@@ -1602,6 +1691,217 @@ auto WorldStreamer::raycastVoxelTerrain(math::Vec3 origin, math::Vec3 direction,
             const BlockDesc* block = impl_->blocks_.find(value->voxel);
             return block != nullptr && block->solid ? value->voxel : 0;
         });
+}
+
+auto WorldStreamer::Impl::classifyPublishedSolid(double x, double y, double z) const
+    -> Result<TerrainSolidSample, StreamingSolidError> {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return StreamingSolidError::InvalidSample;
+    const double extent = regions_.tileExtentMeters();
+    if (!(extent > 0)) return StreamingSolidError::InvalidSample;
+    const bool onX = onRegionPlane(x, extent);
+    const bool onZ = onRegionPlane(z, extent);
+
+    const auto policyOf = [&](std::int32_t wx, std::int32_t wz) { return regions_.policyAt(wx, wz); };
+    std::array<PolicyKind, 4> cornerPolicies{};
+    PolicyKind interior = PolicyKind::Height;
+    PolicyKind negative = PolicyKind::Height;
+    PolicyKind positive = PolicyKind::Height;
+    std::optional<std::int32_t> planeX;
+    std::optional<std::int32_t> planeZ;
+    if (onX && onZ) {
+        planeX = integralPlane(x);
+        planeZ = integralPlane(z);
+        if (!planeX || !planeZ || *planeX == std::numeric_limits<std::int32_t>::min() ||
+            *planeZ == std::numeric_limits<std::int32_t>::min()) {
+            return StreamingSolidError::InvalidSample;
+        }
+        cornerPolicies = {policyOf(*planeX, *planeZ), policyOf(*planeX - 1, *planeZ),
+                          policyOf(*planeX - 1, *planeZ - 1), policyOf(*planeX, *planeZ - 1)};
+        for (const auto policy : cornerPolicies) {
+            if (policy == PolicyKind::Voxel) return StreamingSolidError::UnsupportedVoxel;
+        }
+    } else if (onX || onZ) {
+        const auto plane = integralPlane(onX ? x : z);
+        const auto tangent = narrowFloor(onX ? z : x);
+        if (!plane || !tangent || *plane == std::numeric_limits<std::int32_t>::min()) {
+            return StreamingSolidError::InvalidSample;
+        }
+        if (onX) {
+            planeX = plane;
+            negative = policyOf(*plane - 1, *tangent);
+            positive = policyOf(*plane, *tangent);
+        } else {
+            planeZ = plane;
+            negative = policyOf(*tangent, *plane - 1);
+            positive = policyOf(*tangent, *plane);
+        }
+        if (negative == PolicyKind::Voxel || positive == PolicyKind::Voxel) {
+            return StreamingSolidError::UnsupportedVoxel;
+        }
+    } else {
+        const auto ix = narrowFloor(x);
+        const auto iz = narrowFloor(z);
+        if (!ix || !iz) return StreamingSolidError::InvalidSample;
+        interior = policyOf(*ix, *iz);
+        if (interior == PolicyKind::Voxel) return StreamingSolidError::UnsupportedVoxel;
+    }
+
+    struct Hit { PolicyKind policy; double height, cx, cz; };
+    std::vector<Hit> hits;
+    for (const auto& [key, entry] : entries_) {
+        if (!entry.mesh) continue;
+        const auto& mesh = *entry.mesh;
+        if (mesh.indices.size() % 3 != 0) return StreamingSolidError::InvalidData;
+        const math::Vec3 origin = config_.regionalSurfaceOwnership && key.policy == PolicyKind::Hex
+            ? math::Vec3{} : terrainOrigin(key, config_);
+        for (std::size_t index = 0; index < mesh.indices.size(); index += 3) {
+            std::array<TerrainTopSample, 3> samples;
+            for (int corner = 0; corner < 3; ++corner) {
+                const auto vertex = mesh.indices[index + static_cast<std::size_t>(corner)];
+                if (vertex >= mesh.vertices.size()) return StreamingSolidError::InvalidData;
+                const auto& position = mesh.vertices[vertex].position;
+                samples[static_cast<std::size_t>(corner)] = {
+                    double(position.x) + origin.x, double(position.y) + origin.y, double(position.z) + origin.z};
+            }
+            const auto& a = samples[0];
+            const auto& b = samples[1];
+            const auto& c = samples[2];
+            const double area = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+            if (!(area > 0)) continue;
+            const auto signedArea = [](double px, double pz, const TerrainTopSample& q, const TerrainTopSample& r) {
+                return (q.z - pz) * (r.x - px) - (q.x - px) * (r.z - pz);
+            };
+            if (signedArea(x, z, b, c) < 0 || signedArea(x, z, c, a) < 0 || signedArea(x, z, a, b) < 0) continue;
+            const auto sampled = sampleUpwardTriangleHeight(a, b, c, x, z);
+            if (!sampled) return mapSolidError(sampled.error());
+            hits.push_back({key.policy, sampled.value(), (a.x + b.x + c.x) / 3.0, (a.z + b.z + c.z) / 3.0});
+        }
+    }
+
+    const auto columnFor = [&](PolicyKind policy, double top) -> Result<TerrainSolidColumn, StreamingSolidError> {
+        if (policy == PolicyKind::Hex) {
+            if (!std::isfinite(config_.hexFloorHeight)) return StreamingSolidError::InvalidData;
+            return TerrainSolidColumn{policy, top, double(config_.hexFloorHeight)};
+        }
+        return TerrainSolidColumn{policy, top, std::nullopt};
+    };
+    const auto uniqueTop = [&](PolicyKind policy) -> Result<double, StreamingSolidError> {
+        std::optional<double> top;
+        for (const auto& hit : hits) {
+            if (hit.policy != policy) return StreamingSolidError::AmbiguousSurface;
+            if (!top) top = hit.height;
+            else if (*top != hit.height) return StreamingSolidError::AmbiguousSurface;
+        }
+        if (!top) return StreamingSolidError::NoPublishedSurface;
+        return *top;
+    };
+
+    if (!onX && !onZ) {
+        const auto top = uniqueTop(interior);
+        if (!top) return top.error();
+        const auto column = columnFor(interior, top.value());
+        if (!column) return column.error();
+        return solidResult(classifyTerrainColumn(column.value(), y));
+    }
+
+    if (onX && onZ) {
+        std::array<std::optional<double>, 4> tops;
+        std::optional<double> unassigned;
+        for (const auto& hit : hits) {
+            const bool east = hit.cx > double(*planeX);
+            const bool west = hit.cx < double(*planeX);
+            const bool north = hit.cz > double(*planeZ);
+            const bool south = hit.cz < double(*planeZ);
+            std::optional<unsigned> sector;
+            if (east && north) sector = 0;
+            else if (west && north) sector = 1;
+            else if (west && south) sector = 2;
+            else if (east && south) sector = 3;
+            if (!sector) {
+                if (unassigned && *unassigned != hit.height) return StreamingSolidError::AmbiguousSurface;
+                unassigned = hit.height;
+                continue;
+            }
+            if (hit.policy != cornerPolicies[*sector]) return StreamingSolidError::AmbiguousSurface;
+            if (tops[*sector] && *tops[*sector] != hit.height) return StreamingSolidError::AmbiguousSurface;
+            tops[*sector] = hit.height;
+        }
+        std::array<TerrainSolidColumn, 4> columns;
+        for (std::size_t i = 0; i < 4; ++i) {
+            if (!tops[i]) return StreamingSolidError::NoPublishedSurface;
+            const auto column = columnFor(cornerPolicies[i], *tops[i]);
+            if (!column) return column.error();
+            columns[i] = column.value();
+        }
+        if (unassigned) {
+            const bool matched = std::any_of(tops.begin(), tops.end(), [&](const auto& top) {
+                return top && *top == *unassigned;
+            });
+            if (!matched) return StreamingSolidError::AmbiguousSurface;
+        }
+        return solidResult(classifyTerrainCornerSolid(columns, y));
+    }
+
+    for (const auto& hit : hits) {
+        if (hit.policy != negative && hit.policy != positive) return StreamingSolidError::AmbiguousSurface;
+    }
+    const double tangent = onX ? z : x;
+    const auto begin = segmentBegin(tangent, extent);
+    if (!begin) return StreamingSolidError::InvalidSample;
+    const double end = *begin + extent;
+    if (!std::isfinite(end) || !(end > *begin)) return StreamingSolidError::InvalidSample;
+    const TerrainBoundaryLine line{onX ? TerrainBoundaryAxis::X : TerrainBoundaryAxis::Z, onX ? x : z, *begin, end};
+    std::vector<std::pair<StreamingChunkKey, TerrainBoundaryMesh>> negativeMeshes;
+    std::vector<std::pair<StreamingChunkKey, TerrainBoundaryMesh>> positiveMeshes;
+    for (const auto& [key, entry] : entries_) {
+        if (!entry.mesh || (key.policy != negative && key.policy != positive)) continue;
+        const auto footprint = chunkFootprint(key, config_);
+        if (!std::isfinite(footprint.minX) || !std::isfinite(footprint.maxX) ||
+            !std::isfinite(footprint.minZ) || !std::isfinite(footprint.maxZ)) {
+            continue;
+        }
+        const double low = onX ? footprint.minX : footprint.minZ;
+        const double high = onX ? footprint.maxX : footprint.maxZ;
+        const double tangentLow = onX ? footprint.minZ : footprint.minX;
+        const double tangentHigh = onX ? footprint.maxZ : footprint.maxX;
+        if (!(tangentLow < line.end && tangentHigh > line.begin)) continue;
+        const math::Vec3 origin = config_.regionalSurfaceOwnership && key.policy == PolicyKind::Hex
+            ? math::Vec3{} : terrainOrigin(key, config_);
+        const TerrainBoundaryMesh view{&*entry.mesh, origin};
+        if (key.policy == negative && low < line.plane && high >= line.plane) negativeMeshes.push_back({key, view});
+        if (key.policy == positive && low <= line.plane && high > line.plane) positiveMeshes.push_back({key, view});
+    }
+    const auto byKey = [](const auto& a, const auto& b) { return keyLess(a.first, b.first); };
+    std::sort(negativeMeshes.begin(), negativeMeshes.end(), byKey);
+    std::sort(positiveMeshes.begin(), positiveMeshes.end(), byKey);
+    std::vector<TerrainBoundaryMesh> negativeViews;
+    std::vector<TerrainBoundaryMesh> positiveViews;
+    negativeViews.reserve(negativeMeshes.size());
+    positiveViews.reserve(positiveMeshes.size());
+    for (const auto& mesh : negativeMeshes) negativeViews.push_back(mesh.second);
+    for (const auto& mesh : positiveMeshes) positiveViews.push_back(mesh.second);
+    const auto profile = compareTerrainBoundaryTops(negativeViews, positiveViews, line);
+    if (!profile) {
+        return profile.error() == TerrainBoundaryError::SegmentLimitExceeded
+            ? StreamingSolidError::IncompleteProfile : StreamingSolidError::InvalidData;
+    }
+    const auto floorFor = [&](PolicyKind policy) -> Result<std::optional<double>, StreamingSolidError> {
+        if (policy != PolicyKind::Hex) return std::optional<double>{};
+        if (!std::isfinite(config_.hexFloorHeight)) return StreamingSolidError::InvalidData;
+        return std::optional<double>{double(config_.hexFloorHeight)};
+    };
+    const auto negativeFloor = floorFor(negative);
+    const auto positiveFloor = floorFor(positive);
+    if (!negativeFloor) return negativeFloor.error();
+    if (!positiveFloor) return positiveFloor.error();
+    return solidResult(classifyTerrainBoundarySolid(TerrainBoundarySolidQuery{
+        line, std::span<const TerrainBoundarySpan>(profile.value().data(), profile.value().size()),
+        negative, positive, negativeFloor.value(), positiveFloor.value(), tangent, y}));
+}
+
+auto WorldStreamer::classifyPublishedSolid(double x, double y, double z) const
+    -> Result<TerrainSolidSample, StreamingSolidError> {
+    return impl_->classifyPublishedSolid(x, y, z);
 }
 
 auto WorldStreamer::sampleHeightTerrain(float worldX, float worldZ) const

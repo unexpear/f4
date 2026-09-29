@@ -852,8 +852,9 @@ Completed delivery and acceptance gates:
   ownership for Height and Hex boundary planes and corners. Higher tops own the
   transition band, including the lower edge of the existing paired-profile walls.
   Discontinuous breakpoints, nonmanifold corners, voxel cavities and voxel
-  overhangs fail closed. Voxel DDA and bilinear sampling are unchanged, and this
-  is not a general voxel solid query or a new WorldStreamer ray API.
+  overhangs fail closed. `WorldStreamer::classifyPublishedSolid` uses that
+  contract for published Height/Hex columns. Voxel DDA and bilinear sampling
+  are unchanged. This is not a general voxel solid query or a surface-ray API.
 - ✅ Generated voxel bases with at most 16 ids store 4-bit indices; 17–256 ids
   use 8-bit indices; more diverse chunks retain the dense u16 representation.
   Packing order and round trips are deterministic.
@@ -1216,8 +1217,10 @@ capture acceptance is claimed by this local increment.
    finite hex floors and nonplanar triangle tops, and fails closed for
    discontinuous breakpoints, nonmanifold corners, inconsistent sectors,
    precision collapse, voxel cavities, voxel overhangs and any voxel column.
-   It does not change voxel-DDA or bilinear sampling, and it is not installed
-   as a WorldStreamer query. Still open: full-world policy coverage, renderer
+   `WorldStreamer::classifyPublishedSolid` installs that classifier for published
+   Height/Hex columns, boundary planes and corners. It does not change voxel-DDA
+   or bilinear sampling. Voxel samples return `UnsupportedVoxel` and no owner.
+   Still open: full-world policy coverage, renderer
    consumption of the engine accepted-view slot, continuous frame-by-frame
    coverage (including edits and region changes during travel), and budget
    acceptance for non-preemptible work and large shared-map edits. The opt-in
@@ -1284,7 +1287,7 @@ capture acceptance is claimed by this local increment.
    a miss at the hex gap; the opt-in comparison hits there and at 64 interior
    probes. Neither the static grid nor image repeatability proves watertightness.
    Composed transition meshes feed the accepted-view ray query. The solid-column
-   classifier is a separate reference contract and does not change cell-DDA or
+   classifier is installed as `classifyPublishedSolid` and does not change cell-DDA or
    bilinear sampling.
    Continue profiling non-preemptible operations and large shared-map edits;
    cooperative progress exceptions still prevent a hard budget claim. M16

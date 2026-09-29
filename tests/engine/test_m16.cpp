@@ -1071,7 +1071,10 @@ TEST_CASE("M16: camera rings honor frame caps and unload obsolete residency") {
     WorldStreamingConfig stoppedConfig = config;
     stoppedConfig.frameBudget = std::chrono::microseconds(0);
     WorldStreamer stopped(stoppedConfig);
-    CHECK(stopped.update({0.0f, 0.0f, 0.0f}).loaded == 0);
+    const auto closed = stopped.update({0.0f, 0.0f, 0.0f});
+    CHECK(closed.loaded == 0);
+    CHECK(closed.budgetClosed);
+    CHECK_FALSE(closed.budgetDeferred);
     CHECK(stopped.residentCount() == 0);
 
     config.maxLoadsPerFrame = 2;
@@ -1097,6 +1100,24 @@ TEST_CASE("M16: camera rings honor frame caps and unload obsolete residency") {
     REQUIRE(settle(streamer, {192.0f, 0.0f, 0.0f}, 9));
     CHECK_FALSE(streamer.chunk({PolicyKind::Height, {-1, 0, 0}}).has_value());
     CHECK(streamer.chunk({PolicyKind::Height, {3, 0, 0}}).has_value());
+}
+
+TEST_CASE("M16: cooperative budget deferral is visible and does not preempt admitted work") {
+    auto config = testConfig(PolicyKind::Height, 2);
+    config.frameBudget = std::chrono::microseconds(1);
+    config.maxLoadsPerFrame = 64;
+    config.maxUnloadsPerFrame = 64;
+    config.maxPublicationsPerFrame = 64;
+    config.maxMeshJobsPerFrame = 64;
+    WorldStreamer streamer(config);
+    const auto frame = streamer.update({});
+    CHECK_FALSE(frame.budgetClosed);
+    CHECK_FALSE(frame.planningPending);
+    if (frame.loaded > 0 && frame.loaded < 25 && frame.loaded < config.maxLoadsPerFrame) {
+        CHECK(frame.budgetDeferred);
+    }
+    CHECK(frame.loaded >= 1);
+    CHECK(streamer.residentCount() == frame.loaded);
 }
 
 TEST_CASE("M16: large rings plan off-thread and make progress under a tiny budget") {

@@ -13,6 +13,7 @@
 #include "engine/world/terrain_regions.h"
 #include "engine/world/terrain_queries.h"
 #include "engine/world/terrain_boundaries.h"
+#include "engine/world/terrain_solid.h"
 #include "engine/world/boundary_replacement.h"
 #include "engine/world/world_data.h"
 
@@ -74,6 +75,11 @@ struct StreamingStageTimes {
 
 struct StreamingFrameStats {
     bool planningPending = false;
+    // frameBudget <= 0 admits nothing. This is not a measured deadline.
+    bool budgetClosed = false;
+    // A later candidate was left queued because the cooperative budget elapsed.
+    // The operation already admitted in that stage was not preempted.
+    bool budgetDeferred = false;
     std::uint32_t loaded = 0;
     std::uint32_t unloaded = 0;
     std::uint32_t completionsProcessed = 0;
@@ -194,6 +200,25 @@ private:
     struct Data;
     std::shared_ptr<const Data> data_;
     friend class WorldStreamer;
+};
+
+// Coverage failures are distinct from the reference classifier errors, which
+// pass through with the same names and meanings as TerrainSolidError.
+enum class StreamingSolidError : std::uint8_t {
+    InvalidSample,
+    NoPublishedSurface,
+    AmbiguousSurface,
+    InvalidData,
+    IncompleteProfile,
+    PrecisionLoss,
+    DiscontinuousHeight,
+    NonmanifoldCorner,
+    InconsistentSector,
+    HexFloorInversion,
+    UnsupportedUnderside,
+    UnsupportedVoxel,
+    VoxelCavity,
+    VoxelOverhang,
 };
 
 enum class StreamingSurfaceViewError {
@@ -325,6 +350,18 @@ public:
         -> std::optional<VoxelRayHit>;
     [[nodiscard]] auto sampleHeightTerrain(float worldX, float worldZ) const
         -> std::optional<HeightSample>;
+
+    // Published-column volume query for the solid-ownership contract.
+    // Height and Hex interiors use the upward published triangle
+    // (sampleUpwardTriangleHeight), not bilinear sampling. A sample on one
+    // region plane uses classifyTerrainBoundarySolid; a sample on both planes
+    // uses classifyTerrainCornerSolid. Voxel policy returns UnsupportedVoxel
+    // and never an owner. Does not change raycastVoxelTerrain, sampleHeightTerrain,
+    // or voxel DDA. Uses the retained published mesh, including while a remesh
+    // is in flight. A non-solid success leaves policy at Height and sector at 0;
+    // those fields name the owner only when solid is true.
+    [[nodiscard]] auto classifyPublishedSolid(double x, double y, double z) const
+        -> Result<TerrainSolidSample, StreamingSolidError>;
 
 private:
     class Impl;

@@ -1,8 +1,9 @@
 # Solid-Column Ownership (2026-09-28)
 
 Reference volume contract for the boundary and corner columns this tree can
-already describe. M16 stays partial. This does not install a new WorldStreamer
-query, change voxel DDA, or change bilinear height sampling.
+already describe. M16 stays partial. `WorldStreamer::classifyPublishedSolid`
+uses this contract for published Height/Hex columns. It does not change voxel
+DDA or bilinear height sampling, and it does not give voxel columns an owner.
 
 ## Contract
 
@@ -44,8 +45,20 @@ ownership, buried samples below the wall band, discontinuous breakpoints, hex
 floors, corner resolution, nonmanifold joins, inconsistent sectors, precision
 collapse, nonplanar tops versus bilinear height, and the named voxel failures.
 
+## Streaming query
+
+`classifyPublishedSolid` reads retained published meshes, including while a
+remesh is in flight. Interior Height/Hex samples use `sampleUpwardTriangleHeight`
+on the upward published triangle. A sample on one region plane uses
+`classifyTerrainBoundarySolid` over the paired profile of that region edge. A
+sample on both planes uses `classifyTerrainCornerSolid`. A voxel policy, or a
+Height/Hex edge against voxel, returns `UnsupportedVoxel` and no owner.
+`classifyVoxelStack` is unchanged and is not a streaming column walker.
+
 ## Still Open
 
 Full-world policy coverage, renderer use of the engine accepted-view slot,
-continuous moving coverage, budget acceptance, and a general voxel solid query
-remain open. Surface rays are not this contract.
+continuous frame-by-frame native coverage (including edits and region changes
+during travel), a hard budget for non-preemptible work, and a general voxel
+solid query remain open. Scoped Height/Hex discovery still omits unsupported
+edges instead of failing the whole window. Surface rays are not this contract.

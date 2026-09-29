@@ -44,9 +44,12 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    boundary/corner behavior, including nonplanar triangle tops, finite hex floors,
    precision limits, discontinuous breakpoints and unsupported intersections.
    Voxel cavities and overhangs are named and fail closed; a bottom-anchored voxel
-   stack is still unsupported. Surface rays remain a different API and do not
-   establish this volume contract. Installing the classifier as the streaming
-   collision query, and any general voxel solid query, remain open.
+   stack is still unsupported.    Surface rays remain a different API and do not
+   establish this volume contract. `WorldStreamer::classifyPublishedSolid` now
+   installs that classifier on the streaming collision path for published
+   Height/Hex columns, including boundary planes and corners. Voxel samples
+   fail closed with `UnsupportedVoxel` and never return an owner. A general
+   voxel solid query remains open.
 5. Moving coverage: test continuous camera/residency changes, edits, region changes,
    stale jobs and source arrivals/unloads. The resident-scope controller now has a
    focused queued-retarget regression across three outbound and two return
@@ -74,12 +77,19 @@ No completion box is checked merely because this checklist or a fixture exists.
 
 ## Current Increment
 
-[Solid-column ownership](solid-ownership.md) classifies Height/Hex boundary and
-corner volume against the existing paired-profile walls. Higher tops own the
-transition band. Discontinuous breakpoints, nonmanifold corners, inconsistent
-sectors, precision collapse, hex floors at or above the top, voxel cavities and
-voxel overhangs fail closed with no owner. Voxel DDA and bilinear sampling are
-unchanged. M16 remains partial.
+[Solid-column ownership](solid-ownership.md) is now the streaming collision
+query. `classifyPublishedSolid` classifies published Height/Hex interiors from
+the upward triangle, and boundary or corner samples through the reference
+classifiers. A cooperative frame can report `budgetClosed` when admission is
+off and `budgetDeferred` when a later candidate waits; neither is a hard
+deadline, and the admitted operation is not preempted. Unscoped discovery still
+fails closed when a resident window contains an unsupported transition. Scoped
+Height/Hex discovery still omits those edges. Focused tests cover triangle-top
+disagreement with bilinear sampling, an edit that stays on the retained mesh
+until republication, camera travel that keeps then drops a resident column, a
+region change that does not keep the previous owner, hex floor closure, voxel
+fail-closed samples, and Height/Hex boundary agreement with the reference
+classifier. M16 remains partial.
 
 [Bounded boundary discovery](boundary-discovery.md) adds ownership-driven request
 selection within caller-supplied windows. [Resident reuse](boundary-resident-reuse.md)
