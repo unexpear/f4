@@ -108,7 +108,7 @@ struct TerrainTopSample {
 // Names a vertical voxel stack and always fails closed. Bottom to top.
 // Two or more solid runs: VoxelOverhang. One run that starts above an air
 // cell: VoxelCavity. A bottom-anchored run, or no solid cells: UnsupportedVoxel.
-// No occupancy result is returned.
+// Never returns an owner. That is the contract, not a completed voxel solid.
 [[nodiscard]] auto classifyVoxelStack(std::span<const bool> solidFromBottom)
     -> Result<TerrainSolidSample, TerrainSolidError>;
 

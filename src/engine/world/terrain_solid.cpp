@@ -66,12 +66,17 @@ auto classifyColumns(std::span<const Column> columns, double height) -> Result<T
             for (int i = 0; i < 4; ++i) count += inside[i] != inside[(i + 1) % 4];
             return count;
         };
+        // More than two solid/empty transitions around the ring. One contiguous
+        // solid arc has two; three or four means the corner is nonmanifold.
         for (std::size_t i = 1; i < tops.size(); ++i) {
             if (changes((tops[i - 1] + tops[i]) * 0.5) > 2) return Error::NonmanifoldCorner;
         }
         if (changes(height) > 2) return Error::NonmanifoldCorner;
     }
 
+    // Equal tops keep the first containing index. That matches the canonical
+    // sector only because columns are ordered negative then positive, or
+    // NE, NW, SW, SE. Reordering the span would silently change ties.
     int owner = -1;
     for (std::size_t i = 0; i < columns.size(); ++i) {
         if (!contains(columns[i], height)) continue;
@@ -272,6 +277,7 @@ auto sampleUpwardTriangleHeight(const TerrainTopSample& a, const TerrainTopSampl
     return height;
 }
 
+// UnsupportedVoxel, VoxelCavity, and VoxelOverhang never return an owner.
 auto classifyVoxelStack(std::span<const bool> solidFromBottom) -> Result<TerrainSolidSample, TerrainSolidError> {
     using Error = TerrainSolidError;
     if (solidFromBottom.empty()) return Error::InvalidData;
