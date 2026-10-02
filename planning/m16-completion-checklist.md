@@ -24,9 +24,10 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    selection are implemented. A Height/Hex scope still derives its active
    window from current camera-selected residency and clipped published meshes.
    An unsupported edge inside that window fails the request for both scoped
-   and unscoped callers. Full-world policy coverage remains open: failing
-   closed does not support the transition, and the mixed-policy native corner's
-   Height/Hex rectangle can still contain Voxel/Hex. Derive required boundaries from actual region
+   and unscoped callers. Scoped resident composition submits the pair-adjacency
+   rectangle, so the mixed-policy corner can stage Height/Hex without putting
+   the Voxel/Hex edge in the window. Full-world policy coverage remains open.
+   Derive required boundaries from actual region
    ownership and residency, split endpoints/crossings consistently, and
    distinguish no boundaries from unsupported, incomplete or failed discovery.
    Never silently drop a required transition on failure or truncate a boundary
@@ -61,9 +62,12 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    surface freshness and job state, retains the last accepted composed view when
    source coverage is temporarily unavailable, stages plain terrain before
    departure, and restores the corner exactly. The two-process gate passed with
-   byte-identical movement evidence and 112 captures per run while scoped
-   discovery omitted unsupported edges. This increment fails those windows
-   closed and does not re-claim that visual route. Continuous
+   byte-identical movement evidence and 112 captures per run. After scoped
+   discovery stopped omitting unsupported edges, the Height/Hex request uses
+   the pair-adjacency rectangle. The two-process native policy gate was re-run
+   on this checkout and passed: 112 captures per run, repeat and cross-process
+   hashes match, and the corner departure/return route restores the image.
+   A window that contains the Voxel/Hex edge still fails closed. Continuous
    frame-by-frame native coverage, edits during travel, and region changes during
    travel remain open.
 6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
@@ -102,13 +106,13 @@ freshness checks. [Resident-coverage discovery](resident-coverage-discovery.md)
 now derives a conservative window from the current camera-selected resident
 set and fails closed when coverage is absent or includes unsupported required
 transitions. The explicit Height/Hex scope uses clipped published mesh bounds.
-That scope fails closed on an unsupported edge inside those bounds, matching
-unscoped discovery. The mixed-policy native corner is not full-world coverage:
-its Height/Hex resident rectangle can include a Voxel/Hex edge and now fails
-closed there.
-The queued-retarget regression is the Height/Hex-only route. Release composed-job
-tests passed in this increment; MSVC ASan was not re-run. The earlier native
-stepped-residency route omitted unsupported edges and is not current evidence.
+Discovery of those bounds fails closed when they contain an unsupported edge.
+`policyPairCompositionWindow` selects the resident pair-adjacency rectangle for
+the composition request. The two-process native policy gate passed again after
+that selection (112 captures per run). MSVC ASan was not re-run. Renderer
+consumers still keep a local surface package: plain sync can replace it when
+the new package is not current, while the engine slot keeps the prior
+publication, so displayed raycasts do not read the slot. That swap is still open.
 Subsequent increments must update this checklist and the architecture plan
 without weakening the acceptance requirements.
 

@@ -34,4 +34,12 @@ enum class BoundaryDiscoveryError {
                                             std::optional<std::pair<PolicyKind, PolicyKind>> scope = {})
     -> Result<std::vector<StreamingBoundaryRequest>, BoundaryDiscoveryError>;
 
+// Rectangle of tiles that share a resident edge of this policy pair inside
+// meshBounds. A foreign tile in that rectangle is left inside it so discovery
+// fails closed. When the rectangle contains no pair edge, one in-pair tile is
+// returned so a uniform interior stays an empty success. meshBounds itself is
+// returned when it names no usable tile.
+[[nodiscard]] auto policyPairCompositionWindow(const RegionMap& regions, TerrainFootprint meshBounds,
+                                               PolicyKind first, PolicyKind second) -> TerrainFootprint;
+
 } // namespace f4::world

@@ -124,6 +124,32 @@ TEST_CASE("Composed jobs: resident coverage derives the discovery window and fai
     REQUIRE(pairJob.result(world));
 }
 
+TEST_CASE("Composed jobs: scoped resident window keeps the height/hex corner and rejects a voxel edge") {
+    auto config = settings();
+    WorldStreamer world(config);
+    world.regions().set({0, 0}, PolicyKind::Hex);
+    world.regions().set({-1, 0}, PolicyKind::Voxel);
+    REQUIRE(settle(world));
+    const auto mesh = world.residentTerrainFootprint(PolicyKind::Height, PolicyKind::Hex);
+    REQUIRE(mesh);
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
+    CHECK(discoverTerrainBoundaries(world.regions(), *mesh, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    const auto window = policyPairCompositionWindow(world.regions(), *mesh, PolicyKind::Height, PolicyKind::Hex);
+    const auto edges = discoverTerrainBoundaries(world.regions(), window, {}, scope);
+    REQUIRE(edges);
+    CHECK_FALSE(edges.value().empty());
+    const TerrainFootprint containingVoxel{std::min(window.minX, -32.0), std::max(window.maxX, 96.0),
+                                           std::min(window.minZ, 0.0), std::max(window.maxZ, 64.0)};
+    CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    jobs::JobSystem pool(1);
+    BoundaryCompositionJob job(pool);
+    CHECK_FALSE(job.requestResidentWindow(world, PolicyKind::Height, PolicyKind::Hex));
+    CHECK(job.status().state != BoundaryCompositionState::Failed);
+    CHECK(job.status().discoveryError == std::nullopt);
+}
+
 TEST_CASE("Composed jobs: resident scope retargets across camera residency movement") {
     auto config = settings();
     WorldStreamer world(config); world.regions().set({0, 0}, PolicyKind::Hex);

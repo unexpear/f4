@@ -76,7 +76,8 @@ auto BoundaryCompositionJob::requestResidentWindow(const WorldStreamer& world, P
         status_.state = BoundaryCompositionState::Failed; status_.discoveryError = discoveryError_;
         return discoveryError_;
     }
-    auto discovered = discoverTerrainBoundaries(world.regions(), *footprint,
+    const auto window = policyPairCompositionWindow(world.regions(), *footprint, first, second);
+    auto discovered = discoverTerrainBoundaries(world.regions(), window,
         {maxTiles, buildLimits_.maxBoundaries}, std::pair{first, second});
     if (!discovered) {
         clear(); discoveryError_ = discovered.error();

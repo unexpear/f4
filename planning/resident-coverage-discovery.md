@@ -52,9 +52,9 @@ were observed in this settled route.
 The unscoped union is intentionally conservative and can include unrelated
 policy transitions. Scoped Height/Hex discovery fails that same window instead
 of omitting the unsupported edge. The mixed diagnostic world's Height/Hex mesh
-rectangle can still contain a Voxel/Hex edge, so the native corner route is
-not full-world coverage. The queued controller regression does
-not close continuous native visual coverage. Continuous camera movement, accepted
-world/query publication outside the demo adapter, solid ownership/collision
-semantics, and integrated operation-time budgets remain open. No assets were
-modified.
+rectangle can still contain a Voxel/Hex edge. The composition request uses the
+pair-adjacency rectangle, which leaves that edge outside the window, and the
+native policy gate passed again with 112 captures per run. A rectangle that
+contains the foreign edge still fails closed. Continuous camera movement,
+accepted world/query publication outside the demo adapter, and integrated
+operation-time budgets remain open. No assets were modified.

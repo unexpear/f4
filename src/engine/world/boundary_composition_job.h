@@ -42,9 +42,9 @@ public:
     // checked by update() before a composition is accepted.
     auto requestResidentWindow(const WorldStreamer& world, std::size_t maxTiles = 4096)
         -> std::optional<BoundaryDiscoveryError>;
-    // Restrict the derived resident bounds and discovery to a policy pair.
-    // An unsupported transition inside those bounds still fails the request.
-    // Terrain outside the derived bounds is not covered.
+    // Discover the resident policy pair. The mesh rectangle can contain a
+    // foreign edge, so the request uses the pair-adjacency rectangle instead.
+    // Discovery still fails that rectangle when a foreign tile sits inside it.
     auto requestResidentWindow(const WorldStreamer& world, PolicyKind first, PolicyKind second,
                                std::size_t maxTiles = 4096) -> std::optional<BoundaryDiscoveryError>;
     // Explicitly target plain resident terrain. Unlike clear(), this asks the

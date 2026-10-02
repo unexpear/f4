@@ -52,8 +52,9 @@ queryable as retained geometry until explicitly replaced or cleared. This does
 not change the legacy voxel-DDA, bilinear or current-CPU
 `raycastPublishedTerrain()` APIs. The demo publishes successful current plain
 and composed commits, while partial stale incremental states retain the prior
-engine publication. The remaining integration work is to make every renderer
-consumer use the engine slot directly rather than maintaining a parallel local
-surface owner.
+engine publication. Displayed raycasts still read the demo's local surface
+package. Plain sync replaces that package even when it is not current, while
+the engine slot keeps the previous publication. Pointing those raycasts at the
+slot would change that not-current query, so the parallel owner remains.
 
 M16 remains partial.
