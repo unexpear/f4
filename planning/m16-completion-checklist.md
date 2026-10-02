@@ -64,12 +64,16 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    departure, and restores the corner exactly. The two-process gate passed with
    byte-identical movement evidence and 112 captures per run. After scoped
    discovery stopped omitting unsupported edges, the Height/Hex request uses
-   the pair-adjacency rectangle. The two-process native policy gate was re-run
-   on this checkout and passed: 112 captures per run, repeat and cross-process
-   hashes match, and the corner departure/return route restores the image.
-   A window that contains the Voxel/Hex edge still fails closed. Continuous
-   frame-by-frame native coverage, edits during travel, and region changes during
-   travel remain open.
+   the pair-adjacency rectangle. The eight-step native sweep now also records
+   a published hex column that stays solid across the home and first outbound
+   anchors, drops with `NoPublishedSurface` once that chunk unloads, an away
+   height edit that stays on the old mesh until republication, and a region
+   change that does not keep the previous owner. The edit and region are
+   restored before the return image. The two-process gate was re-run on this
+   checkout and passed: 112 captures per run, and `corner_motion_residency.csv`
+   matches across processes. A window that contains the Voxel/Hex edge still
+   fails closed. Coverage of every rendered frame, rather than these settled
+   anchors, remains open.
 6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
    publication, conversion/upload and retirement. Count limits do not bound the
    cost of one operation. Large shared-map edits and continuous-movement planning
@@ -108,8 +112,10 @@ set and fails closed when coverage is absent or includes unsupported required
 transitions. The explicit Height/Hex scope uses clipped published mesh bounds.
 Discovery of those bounds fails closed when they contain an unsupported edge.
 `policyPairCompositionWindow` selects the resident pair-adjacency rectangle for
-the composition request. The two-process native policy gate passed again after
-that selection (112 captures per run). MSVC ASan was not re-run. Renderer
+the composition request. The eight-step native sweep in that gate now records
+column stability, edit retention, region-change ownership, and unload. The
+two-process gate passed again (112 captures per run). Every rendered frame is
+still not covered. MSVC ASan was not re-run. Renderer
 consumers still keep a local surface package: plain sync can replace it when
 the new package is not current, while the engine slot keeps the prior
 publication, so displayed raycasts do not read the slot. That swap is still open.

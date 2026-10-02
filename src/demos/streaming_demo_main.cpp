@@ -766,7 +766,50 @@ public:
         demo::FreeCamera camera, const Bytes& original) {
         std::ofstream movement(output_ / "corner_motion_residency.csv");
         require(bool(movement), "Cannot write continuous corner residency evidence");
-        movement << "direction,step,anchor_x,anchor_z,residents,accepted_current,job_state\n";
+        movement << "direction,step,anchor_x,anchor_z,residents,accepted_current,job_state,"
+                    "probe_x,probe_z,probe_y,probe_status,probe_policy,probe_solid\n";
+        const auto probeText = [&](double x, double y, double z) {
+            const auto sample = world_->classifyPublishedSolid(x, y, z);
+            if (!sample.hasValue()) {
+                return std::to_string(static_cast<unsigned>(sample.error())) + ",,";
+            }
+            return std::string("ok,") + std::to_string(static_cast<unsigned>(sample.value().policy)) + "," +
+                (sample.value().solid ? "1" : "0");
+        };
+        std::optional<std::pair<double, double>> hexColumn;
+        for (int z = 4; z < 60 && !hexColumn; z += 8) {
+            for (int x = 4; x < 60; x += 8) {
+                const auto sample = world_->classifyPublishedSolid(x + 0.2, -8.0, z + 0.2);
+                if (sample.hasValue() && sample.value().solid && sample.value().policy == world::PolicyKind::Hex) {
+                    hexColumn = {x + 0.2, z + 0.2};
+                    break;
+                }
+            }
+        }
+        require(hexColumn.has_value(), "Home travel has no stable published hex column");
+        int stableHex = 0, droppedHex = 0;
+        bool hexDropped = false;
+        const auto noteHexColumn = [&](const char* direction) {
+            const auto sample = world_->classifyPublishedSolid(hexColumn->first, -8.0, hexColumn->second);
+            const bool track = std::string(direction) == "outbound" || std::string(direction) == "home";
+            if (!sample.hasValue()) {
+                if (track) {
+                    require(sample.error() == world::StreamingSolidError::NoPublishedSurface,
+                        "Travel lost the hex column without unloading its published surface");
+                    hexDropped = true;
+                    ++droppedHex;
+                }
+            } else if (track) {
+                require(!hexDropped, "Outbound travel reloaded a column after unloading it");
+                require(sample.value().solid && sample.value().policy == world::PolicyKind::Hex,
+                    "Resident hex column changed owner during camera steps");
+                ++stableHex;
+            }
+            return probeText(hexColumn->first, -8.0, hexColumn->second);
+        };
+        movement << "home,0,0,0," << world_->residentCount() << ','
+            << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ",,"
+            << hexColumn->first << ',' << hexColumn->second << ",-8," << noteHexColumn("home") << '\n';
         const auto settleSources = [&](math::Vec3 anchor) {
             diagnosticAnchor_ = anchor;
             for (unsigned tick = 0; tick < 128; ++tick) {
@@ -809,10 +852,13 @@ public:
                 }
                 movement << direction << ',' << step << ',' << anchor.x << ',' << anchor.z << ','
                     << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
-                    << static_cast<unsigned>(job.status().state) << '\n';
+                    << static_cast<unsigned>(job.status().state) << ','
+                    << hexColumn->first << ',' << hexColumn->second << ",-8," << noteHexColumn(direction) << '\n';
             }
         };
         walkSources({}, {512, 0, 512}, "outbound");
+        require(stableHex >= 2, "Travel did not keep a resident hex column across camera steps");
+        require(droppedHex >= 1, "Travel did not drop the hex column when its chunk unloaded");
         settleSources({512, 0, 512});
         require(!job.requestResidentWindow(*world_, world::PolicyKind::Height, world::PolicyKind::Hex),
             "Away resident boundary discovery failed");
@@ -831,6 +877,75 @@ public:
         const auto hit = view_->raycastDisplayedTerrain({544, 100, 544}, {0, -1, 0}, 200);
         require(hit && !hit->boundary && hit->source.key.policy == world::PolicyKind::Height,
             "Departed view did not publish plain height query geometry");
+        const math::Vec3 awayAnchor{512, 0, 512};
+        const world::StreamingChunkKey awayKey{world::PolicyKind::Height, {8, 0, 8}};
+        require(world_->chunk(awayKey).has_value(), "Away travel is missing the height column chunk");
+        const auto readHeight = [&](std::uint32_t index) {
+            const auto snapshot = world_->snapshot(awayKey);
+            require(snapshot.has_value(), "Away height column is not readable");
+            const auto* tile = std::get_if<world::HeightTile>(&snapshot->base);
+            require(tile != nullptr, "Away column chunk is not a height tile");
+            auto value = world::CellValue::heightValue(tile->samples[index]);
+            for (const auto& delta : snapshot->deltas) if (delta.index == index) value = delta.value;
+            return value;
+        };
+        const std::uint32_t quad[]{world::heightSampleIndex(8, 8), world::heightSampleIndex(9, 8),
+                                   world::heightSampleIndex(8, 9), world::heightSampleIndex(9, 9)};
+        world::CellValue originalSamples[4];
+        for (int i = 0; i < 4; ++i) originalSamples[i] = readHeight(quad[i]);
+        const auto above = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(above.hasValue() && !above.value().solid && above.value().policy == world::PolicyKind::Height,
+            "Away height column was not an empty sample above its published top");
+        for (int i = 0; i < 4; ++i) {
+            auto raised = originalSamples[i];
+            raised.height.height = 400.f;
+            require(world_->edit(awayKey, quad[i], raised), "Cannot edit the away height column");
+        }
+        const auto retained = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(retained.hasValue() && retained.value().solid == above.value().solid &&
+                retained.value().policy == above.value().policy,
+            "Height edit changed the published column before republication");
+        movement << "edit,retained,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,200," << probeText(520.2, 200.0, 520.7) << '\n';
+        const auto waitColumn = [&](double x, double y, double z, world::PolicyKind policy, bool solid, const char* failure) {
+            for (unsigned tick = 0; tick < 128; ++tick) {
+                world_->update(awayAnchor); world_->waitForIdle();
+                const auto sample = world_->classifyPublishedSolid(x, y, z);
+                if (!world_->hasPendingWork() && sample.hasValue() && sample.value().policy == policy &&
+                    sample.value().solid == solid) return;
+            }
+            throw std::runtime_error(failure);
+        };
+        waitColumn(520.2, 200.0, 520.7, world::PolicyKind::Height, true,
+            "Republished height edit did not raise the published column");
+        movement << "edit,republished,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,200," << probeText(520.2, 200.0, 520.7) << '\n';
+        for (int i = 0; i < 4; ++i) require(world_->edit(awayKey, quad[i], originalSamples[i]), "Cannot restore the away height edit");
+        const auto stillRaised = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(stillRaised.hasValue() && stillRaised.value().solid,
+            "Restoring the height edit changed the published column before republication");
+        waitColumn(520.2, 200.0, 520.7, world::PolicyKind::Height, false,
+            "Restoring the height edit did not return the published column");
+        world_->regions().set({8, 8}, world::PolicyKind::Hex);
+        const auto transitioning = world_->classifyPublishedSolid(520.2, -1000.0, 520.7);
+        require(!(transitioning.hasValue() && transitioning.value().policy == world::PolicyKind::Height),
+            "Region change kept the previous height owner");
+        movement << "region,transition,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-1000," << probeText(520.2, -1000.0, 520.7) << '\n';
+        waitColumn(520.2, -8.0, 520.7, world::PolicyKind::Hex, true,
+            "Region change did not publish the new hex owner");
+        const auto belowFloor = world_->classifyPublishedSolid(520.2, -9.0, 520.7);
+        require(belowFloor.hasValue() && !belowFloor.value().solid, "Changed hex column stayed solid below its floor");
+        movement << "region,settled,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-8," << probeText(520.2, -8.0, 520.7) << '\n';
+        require(world_->regions().erase({8, 8}), "Cannot restore the away height region");
+        const auto reverting = world_->classifyPublishedSolid(520.2, -1000.0, 520.7);
+        require(!(reverting.hasValue() && reverting.value().policy == world::PolicyKind::Hex),
+            "Restoring the region kept the hex owner on the old mesh");
+        waitColumn(520.2, -1000.0, 520.7, world::PolicyKind::Height, true,
+            "Restored region did not publish the height column again");
+        movement << "region,restored,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-1000," << probeText(520.2, -1000.0, 520.7) << '\n';
         walkSources({512, 0, 512}, {}, "inbound");
         settleSources({});
         require(!job.requestResidentWindow(*world_, world::PolicyKind::Height, world::PolicyKind::Hex),
