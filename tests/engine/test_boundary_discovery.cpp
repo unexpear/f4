@@ -62,16 +62,28 @@ TEST_CASE("Boundary discovery: limits and unsupported transitions never return p
     CHECK(discoverTerrainBoundaries(uniform, {0, 65, 0, 64}).error() == BoundaryDiscoveryError::LimitExceeded);
 }
 
-TEST_CASE("Boundary discovery: explicit composition scope excludes unrelated policy edges") {
+TEST_CASE("Boundary discovery: scoped Height/Hex fails closed on unsupported edges") {
     RegionMap map(64); map.set({0, 0}, PolicyKind::Hex); map.set({1, 0}, PolicyKind::Voxel);
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
+    const auto reversed = std::pair{PolicyKind::Hex, PolicyKind::Height};
+    const auto onlyHeightHex = discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {}, scope);
+    REQUIRE(onlyHeightHex); REQUIRE(onlyHeightHex.value().size() == 1);
+    checkEdge(onlyHeightHex.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
+    const auto reversedOnly = discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {}, reversed);
+    REQUIRE(reversedOnly); REQUIRE(reversedOnly.value().size() == 1);
+    checkEdge(reversedOnly.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
     CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}).error() == BoundaryDiscoveryError::UnsupportedTransition);
-    const auto scoped = discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {},
-                                                    std::pair{PolicyKind::Height, PolicyKind::Hex});
-    REQUIRE(scoped); REQUIRE(scoped.value().size() == 1);
-    checkEdge(scoped.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
-    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {},
+    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {}, reversed).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {},
                                     std::pair{PolicyKind::Height, PolicyKind::Voxel}).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
+    auto uniformVoxel = discoverTerrainBoundaries(map, {64, 128, 0, 64}, {}, scope);
+    REQUIRE(uniformVoxel); CHECK(uniformVoxel.value().empty());
+    auto perimeter = discoverTerrainBoundaries(map, {64, 128, 0, 64});
+    REQUIRE(perimeter); CHECK(perimeter.value().empty());
 }
 
 TEST_CASE("Boundary discovery: signed domain and adjacent floating endpoints are exact") {
@@ -125,5 +137,8 @@ TEST_CASE("Boundary discovery: all two-policy neighborhoods preserve ownership a
             }
         }
         CHECK(discoverTerrainBoundaries(map, {-32, 64, -32, 64}).error() == BoundaryDiscoveryError::UnsupportedTransition);
+        CHECK(discoverTerrainBoundaries(map, {-32, 64, -32, 64}, {},
+                                        std::pair{PolicyKind::Height, PolicyKind::Hex}).error() ==
+              BoundaryDiscoveryError::UnsupportedTransition);
     }
 }

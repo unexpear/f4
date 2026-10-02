@@ -238,11 +238,29 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
 
     const auto full = world.residentTerrainFootprint();
     REQUIRE(full.has_value());
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
     CHECK(discoverTerrainBoundaries(world.regions(), *full).error() == BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(world.regions(), *full, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
     const auto scoped = world.residentTerrainFootprint(PolicyKind::Height, PolicyKind::Hex);
     REQUIRE(scoped.has_value());
-    const auto edges = discoverTerrainBoundaries(world.regions(), *scoped, {},
-                                                 std::pair{PolicyKind::Height, PolicyKind::Hex});
+    const TerrainFootprint containingVoxel{std::min(scoped->minX, -32.0), std::max(scoped->maxX, 96.0),
+                                           std::min(scoped->minZ, 0.0), std::max(scoped->maxZ, 64.0)};
+    CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    const auto unscopedResident = discoverTerrainBoundaries(world.regions(), *scoped);
+    const auto residentScoped = discoverTerrainBoundaries(world.regions(), *scoped, {}, scope);
+    if (!unscopedResident.hasValue()) {
+        CHECK(unscopedResident.error() == BoundaryDiscoveryError::UnsupportedTransition);
+        REQUIRE_FALSE(residentScoped.hasValue());
+        CHECK(residentScoped.error() == BoundaryDiscoveryError::UnsupportedTransition);
+    } else {
+        REQUIRE(residentScoped.hasValue());
+        CHECK(residentScoped.value().size() == unscopedResident.value().size());
+    }
+    const auto edges = discoverTerrainBoundaries(world.regions(), {32.0, 128.0, 0.0, 96.0}, {}, scope);
     REQUIRE(edges.hasValue());
     const StreamingBoundaryRequest* boundary = nullptr;
     for (const auto& edge : edges.value()) {

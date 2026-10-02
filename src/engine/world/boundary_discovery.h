@@ -23,12 +23,12 @@ enum class BoundaryDiscoveryError {
 // Enumerate every Height/Hex ownership edge strictly inside the supplied XZ
 // window, clipped to its tangent range. Split at every region-grid vertex so
 // junctions only meet at endpoints. Deterministic Z/X tile order, X edge first.
-// An empty success means no transition INSIDE this window, not source coverage.
-// This pure snapshot operation neither examines residency nor selects a view.
-// Unsupported policy pairs fail the entire result, never return a partial set.
-// When scope is supplied, only that explicit policy pair is enumerated; this
-// is a caller-selected composition scope, not a claim that other transitions
-// in the window are supported or covered.
+// An empty success means no supported transition INSIDE this window, not source
+// coverage. This pure snapshot operation neither examines residency nor selects
+// a view. An unsupported policy pair inside the window fails the entire result
+// and never returns a partial set, whether or not the caller passed a scope.
+// A scope enumerates only that supported pair. It does not omit an unsupported
+// edge, and it is not coverage of anything outside the window.
 [[nodiscard]] auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint window,
                                             BoundaryDiscoveryLimits limits = {},
                                             std::optional<std::pair<PolicyKind, PolicyKind>> scope = {})

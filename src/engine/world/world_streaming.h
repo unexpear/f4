@@ -296,7 +296,8 @@ public:
     [[nodiscard]] auto residentTerrainFootprint() const -> std::optional<TerrainFootprint>;
     // Same union restricted to the two policies that a transition composer
     // can consume, using their published mesh bounds after ownership clipping.
-    // This is a caller-selected composition scope, not full-world coverage.
+    // The rectangle can still contain an unsupported edge; discovery fails
+    // closed on that edge. This is not full-world coverage.
     [[nodiscard]] auto residentTerrainFootprint(PolicyKind first, PolicyKind second) const
         -> std::optional<TerrainFootprint>;
     // Accepted render/query publication. Publishing validates the complete

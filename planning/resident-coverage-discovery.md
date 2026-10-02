@@ -50,10 +50,10 @@ were observed in this settled route.
 ## Remaining Work
 
 The unscoped union is intentionally conservative and can include unrelated
-policy transitions. The mixed diagnostic world demonstrates why the native
-corner route uses its explicit Height/Hex scope: broadening it to the full
-union correctly exposes an unsupported Voxel/Hex edge. The scope is explicit
-and does not claim full-world coverage. The queued controller regression does
+policy transitions. Scoped Height/Hex discovery fails that same window instead
+of omitting the unsupported edge. The mixed diagnostic world's Height/Hex mesh
+rectangle can still contain a Voxel/Hex edge, so the native corner route is
+not full-world coverage. The queued controller regression does
 not close continuous native visual coverage. Continuous camera movement, accepted
 world/query publication outside the demo adapter, solid ownership/collision
 semantics, and integrated operation-time budgets remain open. No assets were

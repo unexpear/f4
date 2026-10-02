@@ -60,5 +60,8 @@ Height/Hex edge against voxel, returns `UnsupportedVoxel` and no owner.
 Full-world policy coverage, renderer use of the engine accepted-view slot,
 continuous frame-by-frame native coverage (including edits and region changes
 during travel), a hard budget for non-preemptible work, and a general voxel
-solid query remain open. Scoped Height/Hex discovery still omits unsupported
-edges instead of failing the whole window. Surface rays are not this contract.
+solid query remain open. Discovery fails closed on an unsupported edge inside
+the window whether or not the caller scoped the query to Height/Hex. The
+mixed-policy native corner still derives a Height/Hex resident rectangle; that
+rectangle can contain a Voxel/Hex edge, so the route fails closed instead of
+composing those boundaries. Surface rays are not this contract.

@@ -44,11 +44,11 @@ auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint f, Bou
     const auto append = [&](TerrainBoundaryLine line, PolicyKind negative, PolicyKind positive)
         -> std::optional<BoundaryDiscoveryError> {
         if (negative == positive) return {};
+        const bool supported = (negative == PolicyKind::Height && positive == PolicyKind::Hex) ||
+                               (negative == PolicyKind::Hex && positive == PolicyKind::Height);
+        if (!supported) return BoundaryDiscoveryError::UnsupportedTransition;
         if (scope && !((negative == scope->first && positive == scope->second) ||
                        (negative == scope->second && positive == scope->first))) return {};
-        if (!((negative == PolicyKind::Height && positive == PolicyKind::Hex) ||
-              (negative == PolicyKind::Hex && positive == PolicyKind::Height)))
-            return BoundaryDiscoveryError::UnsupportedTransition;
         if (result.size() == limits.maxBoundaries) return BoundaryDiscoveryError::LimitExceeded;
         result.push_back({line, negative, positive});
         return {};

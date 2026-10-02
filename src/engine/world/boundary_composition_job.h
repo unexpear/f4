@@ -43,8 +43,8 @@ public:
     auto requestResidentWindow(const WorldStreamer& world, std::size_t maxTiles = 4096)
         -> std::optional<BoundaryDiscoveryError>;
     // Restrict the derived resident bounds and discovery to a policy pair.
-    // This explicit composer scope does not claim that other transitions in
-    // the same geographic envelope are supported or covered.
+    // An unsupported transition inside those bounds still fails the request.
+    // Terrain outside the derived bounds is not covered.
     auto requestResidentWindow(const WorldStreamer& world, PolicyKind first, PolicyKind second,
                                std::size_t maxTiles = 4096) -> std::optional<BoundaryDiscoveryError>;
     // Explicitly target plain resident terrain. Unlike clear(), this asks the
