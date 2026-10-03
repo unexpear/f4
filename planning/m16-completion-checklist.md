@@ -72,14 +72,16 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    restored before the return image. The two-process gate was re-run on this
    checkout and passed: 112 captures per run, and `corner_motion_residency.csv`
    matches across processes. A window that contains the Voxel/Hex edge still
-   fails closed. Coverage of every rendered frame, rather than these settled
-   anchors, remains open. Presenting each world-update tick of this sweep and
-   writing one residency row per tick failed the two-process hash: admission is
-   wall-clock budgeted, so the processes rendered different tick counts (159
-   versus 170 rows) even though each tick's home column was solid or
-   `NoPublishedSurface` and in-flight edits did not adopt the new owner early.
-   Those rows are not gate evidence. The hashed evidence remains the settled
-   anchors.
+   fails closed. The corner-sweep world on this verify path sets
+   `deterministicAdmission`: the wall clock is skipped and each world update
+   stops at the per-frame count caps. That is a fixed work-unit cap, not a
+   hard realtime deadline. The interactive demo config does not set the flag
+   and still uses the cooperative wall-clock budget. `corner_motion_residency.csv`
+   is hashed across the two processes. It records one row per world-update tick
+   of the eight-step sweep. Held samples taken before the republishing update
+   keep the previous published owner; the new owner appears on a later tick
+   only after republication. Those rows are not a per-tick GPU present. A hard
+   budget for non-preemptible work remains open.
 6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
    publication, conversion/upload and retirement. Count limits do not bound the
    cost of one operation. Large shared-map edits and continuous-movement planning
@@ -118,11 +120,12 @@ set and fails closed when coverage is absent or includes unsupported required
 transitions. The explicit Height/Hex scope uses clipped published mesh bounds.
 Discovery of those bounds fails closed when they contain an unsupported edge.
 `policyPairCompositionWindow` selects the resident pair-adjacency rectangle for
-the composition request. The eight-step native sweep in that gate now records
-column stability, edit retention, region-change ownership, and unload. The
-two-process gate passed again (112 captures per run). Every rendered frame is
-still not covered: a per-tick present of this sweep is not cross-process
-stable, so it is not hashed evidence. MSVC ASan was not re-run. Renderer
+the composition request. The eight-step native sweep in that gate now records one residency row per
+world-update tick under fixed work-unit admission, plus held samples for edit
+retention and region-change ownership. The two-process gate passed again (112
+captures per run), and `corner_motion_residency.csv` matches. That admission
+cap is not a hard realtime deadline, and the rows are not a per-tick GPU
+present. Interactive pacing is unchanged. MSVC ASan was not re-run. Renderer
 consumers still keep a local surface package: plain sync can replace it when
 the new package is not current, while the engine slot keeps the prior
 publication, so displayed raycasts do not read the slot. That swap is still open.

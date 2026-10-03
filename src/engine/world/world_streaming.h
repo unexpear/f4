@@ -40,7 +40,10 @@ struct WorldStreamingConfig {
     std::size_t workerCount = 0;
     // Cooperative budget: a positive value admits at least one operation per
     // enabled stage. Individual topology/publication operations are not preemptible.
+    // deterministicAdmission skips the wall clock and stops at the per-frame
+    // count caps. That is a fixed work-unit cap, not a hard realtime deadline.
     std::chrono::microseconds frameBudget{2000};
+    bool deterministicAdmission = false;
     std::uint32_t maxLoadsPerFrame = 8;
     std::uint32_t maxUnloadsPerFrame = 16;
     std::uint32_t maxPublicationsPerFrame = 16;
@@ -286,6 +289,8 @@ public:
     [[nodiscard]] auto blocks() -> BlockRegistry&;
 
     auto update(math::Vec3 cameraPosition) -> StreamingFrameStats;
+    // True when update admits by count caps and does not read the wall clock.
+    [[nodiscard]] auto deterministicAdmission() const -> bool;
     void waitForIdle();
     [[nodiscard]] auto hasPendingWork() const -> bool;
 

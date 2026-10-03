@@ -677,8 +677,10 @@ public:
     }
 
     [[nodiscard]] auto withinBudget(std::chrono::steady_clock::time_point start) const -> bool {
-        return config_.frameBudget.count() > 0 &&
-            std::chrono::steady_clock::now() - start < config_.frameBudget;
+        if (config_.frameBudget.count() <= 0) return false;
+        // Count caps are the admission limit. The clock is not a deadline.
+        if (config_.deterministicAdmission) return true;
+        return std::chrono::steady_clock::now() - start < config_.frameBudget;
     }
 
     [[nodiscard]] static auto desiredChunks(const WorldStreamingConfig& config,
@@ -784,7 +786,10 @@ public:
             }
             const bool finite = std::isfinite(camera.x) && std::isfinite(camera.y) &&
                                 std::isfinite(camera.z);
-            if (count <= 256.0L || !finite) {
+            // Fixed work-unit admission plans on this thread. An async plan can
+            // finish before or after this update checks it, which changes tick
+            // counts. This is not a realtime deadline.
+            if (count <= 256.0L || !finite || config_.deterministicAdmission) {
                 desired_ = desiredChunks(config_, regions_, camera);
             } else {
                 auto work = std::make_shared<PlanningWork>(config_, regions_, camera);
@@ -1247,56 +1252,75 @@ public:
         }
         finishStage(frame.timings.load);
 
-        collectCompletions();
-        while (!pendingCompletions_.empty() &&
-               frame.completionsProcessed < config_.maxPublicationsPerFrame &&
-               (frame.completionsProcessed == 0 || withinBudget(start))) {
-            Completion completion = std::move(pendingCompletions_.front());
-            pendingCompletions_.erase(pendingCompletions_.begin());
-            if (processCompletion(std::move(completion))) ++frame.published;
-            ++frame.completionsProcessed;
-        }
-        if (!pendingCompletions_.empty() && frame.completionsProcessed > 0 &&
-            frame.completionsProcessed < config_.maxPublicationsPerFrame && !withinBudget(start)) {
-            frame.budgetDeferred = true;
-        }
-        finishStage(frame.timings.publication);
-
-        std::vector<Candidate> meshCandidates;
-        for (const auto& [key, entry] : entries_) {
-            const ChunkStore& store = storeFor(key.policy);
-            if (entry.meshInFlight || entry.generationInFlight ||
-                store.state(entry.handle) != ChunkState::CellsReady) {
-                continue;
+        const auto submitReadyMeshes = [&] {
+            std::vector<Candidate> meshCandidates;
+            for (const auto& [key, entry] : entries_) {
+                const ChunkStore& store = storeFor(key.policy);
+                if (entry.meshInFlight || entry.generationInFlight ||
+                    store.state(entry.handle) != ChunkState::CellsReady) {
+                    continue;
+                }
+                const DirtyFlags dirty = store.dirty(entry.handle);
+                if (!dirty.meshDirty && !dirty.bordersDirty) continue;
+                if (entry.failedMeshVersion.has_value() &&
+                    *entry.failedMeshVersion == store.version(entry.handle)) {
+                    continue;
+                }
+                meshCandidates.push_back({key, entry.distanceSquared});
             }
-            const DirtyFlags dirty = store.dirty(entry.handle);
-            if (!dirty.meshDirty && !dirty.bordersDirty) continue;
-            if (entry.failedMeshVersion.has_value() &&
-                *entry.failedMeshVersion == store.version(entry.handle)) {
-                continue;
+            std::sort(meshCandidates.begin(), meshCandidates.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                if (a.distanceSquared != b.distanceSquared) {
+                    return a.distanceSquared < b.distanceSquared;
+                }
+                return keyLess(a.key, b.key);
+            });
+            for (const Candidate& candidate : meshCandidates) {
+                if (frame.meshJobs >= config_.maxMeshJobsPerFrame) break;
+                if (frame.meshJobs != 0 && !withinBudget(start)) {
+                    frame.budgetDeferred = true;
+                    break;
+                }
+                const auto found = entries_.find(candidate.key);
+                if (found == entries_.end()) continue;
+                std::optional<ChunkSnapshot> copy =
+                    storeFor(candidate.key.policy).snapshot(found->second.handle);
+                if (!copy.has_value()) continue;
+                submitMesh(candidate.key, found->second, std::move(*copy));
+                if (found->second.meshInFlight) ++frame.meshJobs;
             }
-            meshCandidates.push_back({key, entry.distanceSquared});
-        }
-        std::sort(meshCandidates.begin(), meshCandidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-            if (a.distanceSquared != b.distanceSquared) {
-                return a.distanceSquared < b.distanceSquared;
+        };
+        const auto publishReady = [&] {
+            collectCompletions();
+            while (!pendingCompletions_.empty() &&
+                   frame.completionsProcessed < config_.maxPublicationsPerFrame &&
+                   (frame.completionsProcessed == 0 || withinBudget(start))) {
+                Completion completion = std::move(pendingCompletions_.front());
+                pendingCompletions_.erase(pendingCompletions_.begin());
+                if (processCompletion(std::move(completion))) ++frame.published;
+                ++frame.completionsProcessed;
             }
-            return keyLess(a.key, b.key);
-        });
-        for (const Candidate& candidate : meshCandidates) {
-            if (frame.meshJobs >= config_.maxMeshJobsPerFrame) break;
-            if (frame.meshJobs != 0 && !withinBudget(start)) {
+            if (!pendingCompletions_.empty() && frame.completionsProcessed > 0 &&
+                frame.completionsProcessed < config_.maxPublicationsPerFrame && !withinBudget(start)) {
                 frame.budgetDeferred = true;
-                break;
             }
-            const auto found = entries_.find(candidate.key);
-            if (found == entries_.end()) continue;
-            std::optional<ChunkSnapshot> copy =
-                storeFor(candidate.key.policy).snapshot(found->second.handle);
-            if (!copy.has_value()) continue;
-            submitMesh(candidate.key, found->second, std::move(*copy));
-            if (found->second.meshInFlight) ++frame.meshJobs;
+        };
+        // The gate path finishes jobs already in flight, including this tick's
+        // loads, before it chooses a publication prefix. Count caps still stop
+        // the tick. Interactive pacing does not wait here.
+        if (config_.deterministicAdmission) jobs_.waitIdle();
+        publishReady();
+        finishStage(frame.timings.publication);
+        submitReadyMeshes();
+        if (config_.deterministicAdmission) {
+            for (unsigned pass = 0; pass < 8; ++pass) {
+                const auto meshesBefore = frame.meshJobs;
+                jobs_.waitIdle();
+                publishReady();
+                if (!pendingCompletions_.empty()) break;
+                submitReadyMeshes();
+                if (frame.meshJobs == meshesBefore) break;
+            }
         }
         finishStage(frame.timings.mesh);
 
@@ -1405,6 +1429,10 @@ auto WorldStreamer::blocks() -> BlockRegistry& { return impl_->blocks_; }
 
 auto WorldStreamer::update(math::Vec3 cameraPosition) -> StreamingFrameStats {
     return impl_->update(cameraPosition);
+}
+
+auto WorldStreamer::deterministicAdmission() const -> bool {
+    return impl_->config_.deterministicAdmission;
 }
 
 void WorldStreamer::waitForIdle() { impl_->jobs_.waitIdle(); }

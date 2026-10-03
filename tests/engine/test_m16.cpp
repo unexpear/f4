@@ -1102,6 +1102,34 @@ TEST_CASE("M16: camera rings honor frame caps and unload obsolete residency") {
     CHECK(streamer.chunk({PolicyKind::Height, {3, 0, 0}}).has_value());
 }
 
+TEST_CASE("M16: deterministic admission uses work-unit caps instead of the wall clock") {
+    auto config = testConfig(PolicyKind::Height, 1);
+    config.frameBudget = std::chrono::microseconds(1);
+    config.maxLoadsPerFrame = 4;
+    config.deterministicAdmission = true;
+    WorldStreamer streamer(config);
+    const auto frame = streamer.update({});
+    CHECK_FALSE(frame.budgetClosed);
+    CHECK_FALSE(frame.budgetDeferred);
+    CHECK(frame.loaded == 4);
+    CHECK(streamer.residentCount() == 4);
+    WorldStreamer again(config);
+    const auto second = again.update({});
+    CHECK(second.loaded == frame.loaded);
+    CHECK(second.budgetDeferred == frame.budgetDeferred);
+    std::vector<ChunkCoord> firstKeys, secondKeys;
+    for (const auto& chunk : streamer.residentChunks()) firstKeys.push_back(chunk.key.coord);
+    for (const auto& chunk : again.residentChunks()) secondKeys.push_back(chunk.key.coord);
+    const auto byCoord = [](ChunkCoord a, ChunkCoord b) {
+        if (a.x != b.x) return a.x < b.x;
+        if (a.z != b.z) return a.z < b.z;
+        return a.y < b.y;
+    };
+    std::sort(firstKeys.begin(), firstKeys.end(), byCoord);
+    std::sort(secondKeys.begin(), secondKeys.end(), byCoord);
+    CHECK(firstKeys == secondKeys);
+}
+
 TEST_CASE("M16: cooperative budget deferral is visible and does not preempt admitted work") {
     auto config = testConfig(PolicyKind::Height, 2);
     config.frameBudget = std::chrono::microseconds(1);

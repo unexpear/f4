@@ -58,9 +58,11 @@ Height/Hex edge against voxel, returns `UnsupportedVoxel` and no owner.
 ## Still Open
 
 Full-world policy coverage, renderer use of the engine accepted-view slot,
-coverage of every rendered frame during travel (a per-tick present of the
-eight-step sweep is not cross-process stable), a hard budget for
-non-preemptible work, and a general voxel solid query remain open. Discovery fails closed on an unsupported edge inside
+a per-tick GPU present of the travel sweep, a hard budget for
+non-preemptible work, and a general voxel solid query remain open. The
+two-process gate hashes one residency row per world-update tick of the
+eight-step sweep. That verify path uses fixed work-unit admission (per-frame
+count caps), not a hard realtime deadline. Interactive pacing is unchanged. Discovery fails closed on an unsupported edge inside
 the window whether or not the caller scoped the query to Height/Hex. The
 Height/Hex mesh rectangle can contain a Voxel/Hex edge; scoped resident
 composition uses the pair-adjacency rectangle instead, and a window that

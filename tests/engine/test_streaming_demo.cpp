@@ -471,6 +471,7 @@ TEST_CASE("Streaming demo: shared deadline bounds uploads without starving progr
         auto config = demo::streamingDemoConfig();
         CHECK(config.frameBudget > std::chrono::microseconds::zero());
         CHECK(config.frameBudget + demo::kStreamingDemoUploadReserve == demo::kStreamingDemoFrameBudget);
+        CHECK_FALSE(config.deterministicAdmission);
         config.horizontalRadius = 1;
         world::WorldStreamer streamer(config);
         REQUIRE(settle(streamer, {}, 9));
