@@ -58,7 +58,8 @@ Height/Hex edge against voxel, returns `UnsupportedVoxel` and no owner.
 ## Still Open
 
 Full-world policy coverage, renderer use of the engine accepted-view slot,
-coverage of every rendered frame during travel, a hard budget for
+coverage of every rendered frame during travel (a per-tick present of the
+eight-step sweep is not cross-process stable), a hard budget for
 non-preemptible work, and a general voxel solid query remain open. Discovery fails closed on an unsupported edge inside
 the window whether or not the caller scoped the query to Height/Hex. The
 Height/Hex mesh rectangle can contain a Voxel/Hex edge; scoped resident

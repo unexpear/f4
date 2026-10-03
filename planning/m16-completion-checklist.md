@@ -73,7 +73,13 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    checkout and passed: 112 captures per run, and `corner_motion_residency.csv`
    matches across processes. A window that contains the Voxel/Hex edge still
    fails closed. Coverage of every rendered frame, rather than these settled
-   anchors, remains open.
+   anchors, remains open. Presenting each world-update tick of this sweep and
+   writing one residency row per tick failed the two-process hash: admission is
+   wall-clock budgeted, so the processes rendered different tick counts (159
+   versus 170 rows) even though each tick's home column was solid or
+   `NoPublishedSurface` and in-flight edits did not adopt the new owner early.
+   Those rows are not gate evidence. The hashed evidence remains the settled
+   anchors.
 6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
    publication, conversion/upload and retirement. Count limits do not bound the
    cost of one operation. Large shared-map edits and continuous-movement planning
@@ -115,7 +121,8 @@ Discovery of those bounds fails closed when they contain an unsupported edge.
 the composition request. The eight-step native sweep in that gate now records
 column stability, edit retention, region-change ownership, and unload. The
 two-process gate passed again (112 captures per run). Every rendered frame is
-still not covered. MSVC ASan was not re-run. Renderer
+still not covered: a per-tick present of this sweep is not cross-process
+stable, so it is not hashed evidence. MSVC ASan was not re-run. Renderer
 consumers still keep a local surface package: plain sync can replace it when
 the new package is not current, while the engine slot keeps the prior
 publication, so displayed raycasts do not read the slot. That swap is still open.
