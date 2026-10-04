@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -340,30 +341,54 @@ struct ChunkGenerationRequest {
 [[nodiscard]] auto generateChunkBase(const ChunkGenerationRequest& request)
     -> std::optional<ChunkBase>;
 
+// Absolute deadline for one shared-map edit. now == nullptr reads steady_clock.
+// The clock stops the next copied entry. It does not discard an entry already copied.
+struct RegionBudget {
+    std::chrono::steady_clock::time_point deadline{};
+    std::chrono::steady_clock::time_point (*now)(void*) = nullptr;
+    void* clock = nullptr;
+};
+
+struct RegionBudgetResult {
+    bool applied = false;
+    bool deferred = false;
+    bool overrun = false;
+    std::size_t retained = 0;
+};
+
 class RegionMap {
 public:
     explicit RegionMap(std::int32_t tileExtentMeters = 512,
                        PolicyKind defaultPolicy = PolicyKind::Height);
     // Value-semantic snapshots share immutable storage; mutations detach.
     // Distinct copies can be read concurrently with edits to the main-thread map.
-    RegionMap(const RegionMap&) = default;
+    // A budgeted slice still in progress is not part of the snapshot.
+    RegionMap(const RegionMap& other);
+    ~RegionMap();
     auto operator=(const RegionMap& other) -> RegionMap&;
     [[nodiscard]] auto regionFor(std::int32_t worldX, std::int32_t worldZ) const
         -> RegionCoord;
     [[nodiscard]] auto policyAt(std::int32_t worldX, std::int32_t worldZ) const
         -> PolicyKind;
     void set(RegionCoord coord, PolicyKind policy);
+    // Copies a shared map one entry at a time. The shared snapshot stays in
+    // place until the copy finishes. A later call resumes the same slice.
+    // set and erase stay eager and discard a pending slice.
+    auto setBudgeted(RegionCoord coord, PolicyKind policy, RegionBudget budget)
+        -> RegionBudgetResult;
     auto erase(RegionCoord coord) -> bool;
     [[nodiscard]] auto tileExtentMeters() const -> std::int32_t { return tileExtentMeters_; }
     [[nodiscard]] auto revision() const -> std::uint64_t { return revision_; }
 
 private:
+    struct RegionDetachState;
     using Regions = containers::HashMap<RegionCoord, PolicyKind>;
     void detach();
     std::int32_t tileExtentMeters_ = 512;
     PolicyKind defaultPolicy_ = PolicyKind::Height;
     std::shared_ptr<Regions> regions_ = std::make_shared<Regions>();
     std::uint64_t revision_ = 0;
+    std::unique_ptr<RegionDetachState> detach_;
 };
 
 class ChunkStore {

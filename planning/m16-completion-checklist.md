@@ -87,12 +87,17 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    one `sweep_tick_*.bmp` of the view already installed for that tick. The
    two-process gate hashes those presents. They do not advance world admission
    or the wall-clock upload budget, and they are not a hard realtime deadline.
-   A hard budget for non-preemptible work remains open.
-6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
-   publication, conversion/upload and retirement. Count limits do not bound the
-   cost of one operation. Large shared-map edits and continuous-movement planning
-   need explicit progress and budget evidence. Do not claim a universal hard 2 ms
-   deadline from a cooperative scheduler or one favorable local run.
+   A separate opt-in deadline can refuse the next streaming unit, and
+   `RegionMap::setBudgeted` can refuse the next copied entry of a shared map.
+   Work already started is kept and overrun is visible. The verify path ignores
+   that deadline. The interactive demo stays cooperative.
+6. Budget acceptance: an opt-in hard deadline refuses the next unload, load,
+   publication, or mesh unit. `RegionMap::setBudgeted` refuses the next copied
+   entry of a shared map and keeps entries already copied. Overrun is visible
+   when a started unit finishes late. `deterministicAdmission` ignores the
+   deadline and stays a work-unit cap. `set` and `erase` stay eager. The
+   interactive demo stays on the cooperative budget. This clock does not bound
+   the unit already started. Do not claim a universal hard 2 ms finish time.
 7. Final regression/plan audit: rerun applicable native build, sanitizer,
    determinism and visual gates; check existing fixtures and assets; reconcile
    every remaining M16 claim with actual code and evidence. Hardware/toolchain
@@ -107,8 +112,10 @@ No completion box is checked merely because this checklist or a fixture exists.
 query. `classifyPublishedSolid` classifies published Height/Hex interiors from
 the upward triangle, and boundary or corner samples through the reference
 classifiers. A cooperative frame can report `budgetClosed` when admission is
-off and `budgetDeferred` when a later candidate waits; neither is a hard
-deadline, and the admitted operation is not preempted. Discovery fails closed
+off and `budgetDeferred` when a later candidate waits. A separate hard
+deadline sets `budgetOverrun` when a unit already started finishes late,
+and it does not tear that unit down. Cooperative admission still has a
+progress exception. `deterministicAdmission` ignores the hard deadline. Discovery fails closed
 when a window contains an unsupported transition, including a Height/Hex scope.
 Focused tests cover triangle-top
 disagreement with bilinear sampling, an edit that stays on the retained mesh
@@ -131,6 +138,8 @@ world-update tick under fixed work-unit admission, plus held samples for edit
 retention and region-change ownership, and presents one frame per recorded
 tick. The two-process gate hashes `corner_motion_residency.csv` and every
 `sweep_tick_*.bmp`. That admission cap is not a hard realtime deadline.
+A separate opt-in deadline refuses the next streaming unit and the next
+copied entry of a shared region map. It keeps work already started.
 Interactive pacing is unchanged. MSVC ASan was not re-run. Renderer
 consumers still keep a local surface package: plain sync can replace it when
 the new package is not current, while the engine slot keeps the prior

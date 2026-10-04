@@ -1117,6 +1117,7 @@ TEST_CASE("M16: deterministic admission uses work-unit caps instead of the wall 
     const auto second = again.update({});
     CHECK(second.loaded == frame.loaded);
     CHECK(second.budgetDeferred == frame.budgetDeferred);
+    CHECK_FALSE(frame.budgetOverrun);
     std::vector<ChunkCoord> firstKeys, secondKeys;
     for (const auto& chunk : streamer.residentChunks()) firstKeys.push_back(chunk.key.coord);
     for (const auto& chunk : again.residentChunks()) secondKeys.push_back(chunk.key.coord);
@@ -1146,6 +1147,166 @@ TEST_CASE("M16: cooperative budget deferral is visible and does not preempt admi
     }
     CHECK(frame.loaded >= 1);
     CHECK(streamer.residentCount() == frame.loaded);
+    CHECK_FALSE(frame.budgetOverrun);
+}
+
+struct HardClock {
+    int samples = 0;
+    int earlySamples = 0;
+    std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
+};
+
+auto sampleHardClock(void* clock) -> std::chrono::steady_clock::time_point {
+    auto* hard = static_cast<HardClock*>(clock);
+    const int sample = hard->samples++;
+    if (sample < hard->earlySamples) return hard->origin;
+    return hard->origin + std::chrono::hours(1);
+}
+
+TEST_CASE("M16: hard deadline stops the next load and keeps the admitted chunk") {
+    auto config = testConfig(PolicyKind::Height, 1);
+    config.frameBudget = std::chrono::microseconds(1);
+    config.maxLoadsPerFrame = 64;
+    WorldStreamer streamer(config);
+    HardClock clock;
+    clock.earlySamples = 2;
+    StreamingDeadline deadline;
+    deadline.hard = true;
+    deadline.now = sampleHardClock;
+    deadline.clock = &clock;
+    const auto frame = streamer.update({}, deadline);
+    CHECK_FALSE(frame.budgetClosed);
+    CHECK_FALSE(frame.planningPending);
+    CHECK(frame.loaded == 1);
+    CHECK(frame.budgetOverrun);
+    CHECK(frame.budgetDeferred);
+    CHECK(streamer.residentCount() == frame.loaded);
+
+    HardClock expired;
+    expired.earlySamples = 1;
+    deadline.clock = &expired;
+    const auto stopped = streamer.update({}, deadline);
+    CHECK(stopped.loaded == 0);
+    CHECK(stopped.unloaded == 0);
+    CHECK(stopped.budgetDeferred);
+    CHECK_FALSE(stopped.budgetOverrun);
+    CHECK(streamer.residentCount() == 1);
+}
+
+TEST_CASE("M16: deterministic admission ignores a hard deadline") {
+    auto config = testConfig(PolicyKind::Height, 1);
+    config.frameBudget = std::chrono::microseconds(1);
+    config.maxLoadsPerFrame = 4;
+    config.deterministicAdmission = true;
+    WorldStreamer streamer(config);
+    HardClock clock;
+    clock.earlySamples = 0;
+    StreamingDeadline deadline;
+    deadline.hard = true;
+    deadline.now = sampleHardClock;
+    deadline.clock = &clock;
+    const auto frame = streamer.update({}, deadline);
+    CHECK(frame.loaded == 4);
+    CHECK_FALSE(frame.budgetOverrun);
+    CHECK_FALSE(frame.budgetDeferred);
+    CHECK(streamer.residentCount() == 4);
+    CHECK(clock.samples == 0);
+}
+
+struct RegionClock {
+    int samples = 0;
+    int earlySamples = 0;
+    std::chrono::steady_clock::time_point early = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point late = early + std::chrono::hours(1);
+};
+
+auto sampleRegionClock(void* clock) -> std::chrono::steady_clock::time_point {
+    auto* region = static_cast<RegionClock*>(clock);
+    const int sample = region->samples++;
+    if (sample < region->earlySamples) return region->early;
+    return region->late;
+}
+
+TEST_CASE("M16: a shared region edit keeps copied entries when the deadline passes") {
+    constexpr int tiles = 32;
+    RegionMap map(64, PolicyKind::Height);
+    for (int i = 0; i < tiles; ++i) map.set({i, 0}, PolicyKind::Hex);
+    const auto revision = map.revision();
+    RegionMap snapshot = map;
+
+    RegionClock clock;
+    clock.earlySamples = 2;
+    RegionBudget budget;
+    budget.deadline = clock.early + std::chrono::microseconds(1);
+    budget.now = sampleRegionClock;
+    budget.clock = &clock;
+    const auto partial = map.setBudgeted({100, 0}, PolicyKind::Voxel, budget);
+    CHECK_FALSE(partial.applied);
+    CHECK(partial.deferred);
+    CHECK(partial.overrun);
+    CHECK(partial.retained == 1);
+    CHECK(map.revision() == revision);
+    CHECK(map.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(map.policyAt(100 * 64, 0) == PolicyKind::Height);
+    CHECK(snapshot.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(snapshot.policyAt(100 * 64, 0) == PolicyKind::Height);
+
+    RegionClock resume;
+    resume.earlySamples = 1000;
+    budget.deadline = resume.early + std::chrono::hours(1);
+    budget.clock = &resume;
+    const auto done = map.setBudgeted({100, 0}, PolicyKind::Voxel, budget);
+    CHECK(done.applied);
+    CHECK_FALSE(done.deferred);
+    CHECK_FALSE(done.overrun);
+    CHECK(done.retained == static_cast<std::size_t>(tiles));
+    CHECK(map.policyAt(100 * 64, 0) == PolicyKind::Voxel);
+    CHECK(map.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(map.policyAt((tiles - 1) * 64, 0) == PolicyKind::Hex);
+    CHECK(snapshot.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(snapshot.policyAt(100 * 64, 0) == PolicyKind::Height);
+    const bool revisionMoved = map.revision() != revision;
+    CHECK(revisionMoved);
+
+    RegionMap pending(64, PolicyKind::Height);
+    for (int i = 0; i < tiles; ++i) pending.set({i, 0}, PolicyKind::Hex);
+    RegionMap pendingSnapshot = pending;
+    RegionClock slicedClock;
+    slicedClock.earlySamples = 2;
+    budget.deadline = slicedClock.early + std::chrono::microseconds(1);
+    budget.clock = &slicedClock;
+    const auto sliced = pending.setBudgeted({100, 0}, PolicyKind::Voxel, budget);
+    CHECK(sliced.retained == 1);
+    CHECK(sliced.overrun);
+    pending.set({7, 0}, PolicyKind::Voxel);
+    RegionClock finish;
+    finish.earlySamples = 1000;
+    budget.deadline = finish.early + std::chrono::hours(1);
+    budget.clock = &finish;
+    const auto afterEager = pending.setBudgeted({100, 0}, PolicyKind::Voxel, budget);
+    CHECK(afterEager.applied);
+    CHECK(pending.policyAt(7 * 64, 0) == PolicyKind::Voxel);
+    CHECK(pending.policyAt(100 * 64, 0) == PolicyKind::Voxel);
+    CHECK(pending.policyAt(0, 0) == PolicyKind::Hex);
+    CHECK(pendingSnapshot.policyAt(7 * 64, 0) == PolicyKind::Hex);
+    CHECK(pendingSnapshot.policyAt(100 * 64, 0) == PolicyKind::Height);
+
+    RegionMap held(64, PolicyKind::Height);
+    for (int i = 0; i < tiles; ++i) held.set({i, 0}, PolicyKind::Hex);
+    RegionMap hold = held;
+    const auto heldRevision = held.revision();
+    RegionClock expired;
+    expired.earlySamples = 0;
+    budget.deadline = expired.early;
+    budget.clock = &expired;
+    const auto refused = held.setBudgeted({3, 0}, PolicyKind::Voxel, budget);
+    CHECK_FALSE(refused.applied);
+    CHECK(refused.deferred);
+    CHECK_FALSE(refused.overrun);
+    CHECK(refused.retained == 0);
+    CHECK(held.revision() == heldRevision);
+    CHECK(held.policyAt(3 * 64, 0) == PolicyKind::Hex);
+    CHECK(hold.policyAt(3 * 64, 0) == PolicyKind::Hex);
 }
 
 TEST_CASE("M16: large rings plan off-thread and make progress under a tiny budget") {

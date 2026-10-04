@@ -679,6 +679,7 @@ public:
     [[nodiscard]] auto withinBudget(std::chrono::steady_clock::time_point start) const -> bool {
         if (config_.frameBudget.count() <= 0) return false;
         // Count caps are the admission limit. The clock is not a deadline.
+        // A hard StreamingDeadline does not use this function.
         if (config_.deterministicAdmission) return true;
         return std::chrono::steady_clock::now() - start < config_.frameBudget;
     }
@@ -1164,14 +1165,20 @@ public:
         }
     }
 
-    auto update(math::Vec3 camera) -> StreamingFrameStats {
-        const auto start = std::chrono::steady_clock::now();
+    auto update(math::Vec3 camera, StreamingDeadline deadline) -> StreamingFrameStats {
+        const bool hard = deadline.hard && !config_.deterministicAdmission;
+        const auto sample = [&]() -> std::chrono::steady_clock::time_point {
+            if (hard && deadline.now != nullptr) return deadline.now(deadline.clock);
+            return std::chrono::steady_clock::now();
+        };
+        const auto start = sample();
         StreamingFrameStats frame;
         if (config_.frameBudget.count() <= 0) {
             frame.budgetClosed = true;
             return frame;
         }
         auto stageStart = start;
+        const auto past = [&] { return sample() - start >= config_.frameBudget; };
         const auto finishStage = [&](std::chrono::nanoseconds& duration) {
             if (!config_.profileTimings) return;
             const auto now = std::chrono::steady_clock::now();
@@ -1205,7 +1212,12 @@ public:
         finishStage(frame.timings.residency);
         for (const Candidate& candidate : unloads) {
             if (!ready || frame.unloaded >= config_.maxUnloadsPerFrame) break;
-            if (frame.unloaded != 0 && !withinBudget(start)) {
+            if (hard) {
+                if (past()) {
+                    frame.budgetDeferred = true;
+                    break;
+                }
+            } else if (frame.unloaded != 0 && !withinBudget(start)) {
                 frame.budgetDeferred = true;
                 break;
             }
@@ -1219,12 +1231,22 @@ public:
             entries_.erase(found);
             ++frame.unloaded;
             ++stats_.unloadedChunks;
+            if (hard && past()) {
+                frame.budgetOverrun = true;
+                frame.budgetDeferred = true;
+                break;
+            }
         }
         finishStage(frame.timings.unload);
 
         for (const Candidate& candidate : desired) {
             if (!ready || frame.loaded >= config_.maxLoadsPerFrame) break;
-            if (frame.loaded != 0 && !withinBudget(start)) {
+            if (hard) {
+                if (past()) {
+                    frame.budgetDeferred = true;
+                    break;
+                }
+            } else if (frame.loaded != 0 && !withinBudget(start)) {
                 frame.budgetDeferred = true;
                 break;
             }
@@ -1249,6 +1271,11 @@ public:
                 continue;
             }
             ++frame.loaded;
+            if (hard && past()) {
+                frame.budgetOverrun = true;
+                frame.budgetDeferred = true;
+                break;
+            }
         }
         finishStage(frame.timings.load);
 
@@ -1277,7 +1304,12 @@ public:
             });
             for (const Candidate& candidate : meshCandidates) {
                 if (frame.meshJobs >= config_.maxMeshJobsPerFrame) break;
-                if (frame.meshJobs != 0 && !withinBudget(start)) {
+                if (hard) {
+                    if (past()) {
+                        frame.budgetDeferred = true;
+                        break;
+                    }
+                } else if (frame.meshJobs != 0 && !withinBudget(start)) {
                     frame.budgetDeferred = true;
                     break;
                 }
@@ -1288,19 +1320,36 @@ public:
                 if (!copy.has_value()) continue;
                 submitMesh(candidate.key, found->second, std::move(*copy));
                 if (found->second.meshInFlight) ++frame.meshJobs;
+                if (hard && past()) {
+                    frame.budgetOverrun = true;
+                    frame.budgetDeferred = true;
+                    break;
+                }
             }
         };
         const auto publishReady = [&] {
             collectCompletions();
             while (!pendingCompletions_.empty() &&
-                   frame.completionsProcessed < config_.maxPublicationsPerFrame &&
-                   (frame.completionsProcessed == 0 || withinBudget(start))) {
+                   frame.completionsProcessed < config_.maxPublicationsPerFrame) {
+                if (hard) {
+                    if (past()) {
+                        frame.budgetDeferred = true;
+                        break;
+                    }
+                } else if (frame.completionsProcessed != 0 && !withinBudget(start)) {
+                    break;
+                }
                 Completion completion = std::move(pendingCompletions_.front());
                 pendingCompletions_.erase(pendingCompletions_.begin());
                 if (processCompletion(std::move(completion))) ++frame.published;
                 ++frame.completionsProcessed;
+                if (hard && past()) {
+                    frame.budgetOverrun = true;
+                    frame.budgetDeferred = true;
+                    break;
+                }
             }
-            if (!pendingCompletions_.empty() && frame.completionsProcessed > 0 &&
+            if (!hard && !pendingCompletions_.empty() && frame.completionsProcessed > 0 &&
                 frame.completionsProcessed < config_.maxPublicationsPerFrame && !withinBudget(start)) {
                 frame.budgetDeferred = true;
             }
@@ -1324,8 +1373,7 @@ public:
         }
         finishStage(frame.timings.mesh);
 
-        frame.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start);
+        frame.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(sample() - start);
         return frame;
     }
 
@@ -1427,8 +1475,8 @@ auto WorldStreamer::identityToken() const -> std::shared_ptr<const std::byte> { 
 
 auto WorldStreamer::blocks() -> BlockRegistry& { return impl_->blocks_; }
 
-auto WorldStreamer::update(math::Vec3 cameraPosition) -> StreamingFrameStats {
-    return impl_->update(cameraPosition);
+auto WorldStreamer::update(math::Vec3 cameraPosition, StreamingDeadline deadline) -> StreamingFrameStats {
+    return impl_->update(cameraPosition, deadline);
 }
 
 auto WorldStreamer::deterministicAdmission() const -> bool {

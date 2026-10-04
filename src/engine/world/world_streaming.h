@@ -42,6 +42,7 @@ struct WorldStreamingConfig {
     // enabled stage. Individual topology/publication operations are not preemptible.
     // deterministicAdmission skips the wall clock and stops at the per-frame
     // count caps. That is a fixed work-unit cap, not a hard realtime deadline.
+    // A hard stop is the separate StreamingDeadline argument to update.
     std::chrono::microseconds frameBudget{2000};
     bool deterministicAdmission = false;
     std::uint32_t maxLoadsPerFrame = 8;
@@ -80,9 +81,14 @@ struct StreamingFrameStats {
     bool planningPending = false;
     // frameBudget <= 0 admits nothing. This is not a measured deadline.
     bool budgetClosed = false;
-    // A later candidate was left queued because the cooperative budget elapsed.
-    // The operation already admitted in that stage was not preempted.
+    // A later candidate was left queued because the cooperative budget elapsed
+    // or a hard deadline refused to start it. The operation already admitted
+    // in that stage was not preempted.
     bool budgetDeferred = false;
+    // A unit started under a hard deadline finished after that deadline.
+    // The unit was kept. Cooperative admission and deterministicAdmission
+    // do not set this.
+    bool budgetOverrun = false;
     std::uint32_t loaded = 0;
     std::uint32_t unloaded = 0;
     std::uint32_t completionsProcessed = 0;
@@ -90,6 +96,16 @@ struct StreamingFrameStats {
     std::uint32_t meshJobs = 0;
     std::chrono::microseconds elapsed{};
     StreamingStageTimes timings{}; // Populated only when profileTimings is enabled.
+};
+
+// Opt-in hard admission clock for one update. Ignored while
+// deterministicAdmission is set, so the verify path stays a work-unit cap.
+// The clock refuses the next unload, load, publication, or mesh unit. It does
+// not preempt a unit that has already started. now == nullptr reads steady_clock.
+struct StreamingDeadline {
+    bool hard = false;
+    std::chrono::steady_clock::time_point (*now)(void*) = nullptr;
+    void* clock = nullptr;
 };
 
 struct StreamingStats {
@@ -288,7 +304,7 @@ public:
     [[nodiscard]] auto identityToken() const -> std::shared_ptr<const std::byte>;
     [[nodiscard]] auto blocks() -> BlockRegistry&;
 
-    auto update(math::Vec3 cameraPosition) -> StreamingFrameStats;
+    auto update(math::Vec3 cameraPosition, StreamingDeadline deadline = {}) -> StreamingFrameStats;
     // True when update admits by count caps and does not read the wall clock.
     [[nodiscard]] auto deterministicAdmission() const -> bool;
     void waitForIdle();

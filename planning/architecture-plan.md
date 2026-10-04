@@ -854,7 +854,9 @@ Completed delivery and acceptance gates:
   the previous owner. The edit and region are restored before the return
   image. The corner-sweep verify path skips the wall clock and stops at the
   per-frame count caps. That is a fixed work-unit cap, not a hard realtime
-  deadline. Interactive pacing is unchanged. The two-process gate hashes
+  deadline. Interactive pacing is unchanged. A separate opt-in deadline can
+  refuse the next streaming unit and the next copied region-map entry. It
+  keeps the unit already started. The verify path does not use it. The two-process gate hashes
   `corner_motion_residency.csv`: one row per world-update tick, with held
   samples that keep the previous owner until republication, plus one presented
   `sweep_tick_*.bmp` per tick. Those presents draw the view already installed
@@ -1239,12 +1241,15 @@ capture acceptance is claimed by this local increment.
    records one residency row per world-update tick under fixed work-unit
    admission, including held samples that keep the previous owner until
    republication, and presents one frame per those ticks. That cap is not a
-   hard realtime deadline. The presents draw the view already installed and
+   hard realtime deadline. A separate opt-in deadline refuses the next
+   streaming unit and the next copied region-map entry, keeps the unit already
+   started, and reports overrun. The verify path ignores that deadline. The
+   interactive demo stays cooperative. The presents draw the view already installed and
    do not spend the wall-clock upload budget. The two-process policy gate
    hashes `corner_motion_residency.csv` and every `sweep_tick_*.bmp`. Still
    open: full-world policy
-   coverage, renderer consumption of the engine accepted-view slot, and budget
-   acceptance for non-preemptible work and large shared-map edits.
+   coverage and renderer consumption of the engine accepted-view slot. One
+   streaming unit or one copied map entry can still finish after the deadline.
    The opt-in
    [regional surface mode](regional-surfaces.md) now clips published CPU
    triangles after edit replay and admits intersecting chunk bounds. It fills
@@ -1311,8 +1316,9 @@ capture acceptance is claimed by this local increment.
    Composed transition meshes feed the accepted-view ray query. The solid-column
    classifier is installed as `classifyPublishedSolid` and does not change cell-DDA or
    bilinear sampling.
-   Continue profiling non-preemptible operations and large shared-map edits;
-   cooperative progress exceptions still prevent a hard budget claim. M16
+   An opt-in hard deadline refuses the next streaming unit and the next copied
+   region entry. Cooperative progress exceptions remain on the interactive path,
+   and the unit already started is not preempted. M16
    remains partial; existing height save/upload/reload gates are preserved.
 2. Continue independent M12 work on the available Windows PC: profile the
    renderer to select the next occlusion, multithreaded recording, or SIMD

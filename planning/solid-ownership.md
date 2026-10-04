@@ -58,8 +58,10 @@ Height/Hex edge against voxel, returns `UnsupportedVoxel` and no owner.
 ## Still Open
 
 Full-world policy coverage, renderer use of the engine accepted-view slot,
-a hard budget for non-preemptible work, and a general voxel solid query remain
-open. The two-process gate hashes one residency row per world-update tick of
+and a general voxel solid query remain open. An opt-in hard deadline refuses
+the next streaming unit and the next copied entry of a shared region map. It
+does not preempt the unit already started, and overrun stays visible.
+`deterministicAdmission` ignores that deadline. The two-process gate hashes one residency row per world-update tick of
 the eight-step sweep, and one presented `sweep_tick_*.bmp` for each of those
 ticks. The present uses the view already installed for that tick. It does not
 advance world admission or the wall-clock upload budget. That verify path uses

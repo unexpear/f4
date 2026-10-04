@@ -1,6 +1,7 @@
 #include "engine/world/world_data.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <initializer_list>
 #include <limits>
@@ -715,11 +716,27 @@ auto CellValue::hexValue(const HexCell& value) -> CellValue {
     return result;
 }
 
+struct RegionMap::RegionDetachState {
+    std::shared_ptr<Regions> source;
+    std::shared_ptr<Regions> copy;
+    decltype(std::declval<const Regions&>().begin()) next{};
+    RegionCoord coord{};
+    PolicyKind policy = PolicyKind::Height;
+};
+
 RegionMap::RegionMap(std::int32_t tileExtentMeters, PolicyKind defaultPolicy)
     : tileExtentMeters_(tileExtentMeters > 0 ? tileExtentMeters : 512),
       defaultPolicy_(defaultPolicy) {
     F4_ASSERT(tileExtentMeters > 0, "region tile extent must be positive");
 }
+
+RegionMap::RegionMap(const RegionMap& other)
+    : tileExtentMeters_(other.tileExtentMeters_),
+      defaultPolicy_(other.defaultPolicy_),
+      regions_(other.regions_),
+      revision_(other.revision_) {}
+
+RegionMap::~RegionMap() = default;
 
 auto RegionMap::regionFor(std::int32_t worldX, std::int32_t worldZ) const -> RegionCoord {
     return {floorDiv(worldX, tileExtentMeters_), floorDiv(worldZ, tileExtentMeters_)};
@@ -732,6 +749,7 @@ auto RegionMap::policyAt(std::int32_t worldX, std::int32_t worldZ) const -> Poli
 
 auto RegionMap::operator=(const RegionMap& other) -> RegionMap& {
     if (this != &other) {
+        detach_.reset();
         regions_ = other.regions_;
         tileExtentMeters_ = other.tileExtentMeters_;
         defaultPolicy_ = other.defaultPolicy_;
@@ -741,6 +759,7 @@ auto RegionMap::operator=(const RegionMap& other) -> RegionMap& {
 }
 
 void RegionMap::set(RegionCoord coord, PolicyKind policy) {
+    detach_.reset();
     const auto* existing = std::as_const(*regions_).find(coord);
     if (existing != nullptr && *existing == policy) return;
     detach();
@@ -748,7 +767,72 @@ void RegionMap::set(RegionCoord coord, PolicyKind policy) {
     ++revision_;
 }
 
+auto RegionMap::setBudgeted(RegionCoord coord, PolicyKind policy, RegionBudget budget)
+    -> RegionBudgetResult {
+    const auto now = [&] {
+        return budget.now != nullptr ? budget.now(budget.clock)
+                                     : std::chrono::steady_clock::now();
+    };
+    RegionBudgetResult result;
+    if (!detach_ && regions_.use_count() == 1) {
+        if (now() >= budget.deadline) {
+            result.deferred = true;
+            return result;
+        }
+        const auto* existing = std::as_const(*regions_).find(coord);
+        if (existing == nullptr || *existing != policy) {
+            regions_->set(coord, policy);
+            ++revision_;
+        }
+        result.applied = true;
+        if (now() >= budget.deadline) result.overrun = true;
+        return result;
+    }
+    if (!detach_) {
+        if (now() >= budget.deadline) {
+            result.deferred = true;
+            return result;
+        }
+        detach_ = std::make_unique<RegionDetachState>();
+        detach_->source = regions_;
+        detach_->copy = std::make_shared<Regions>();
+        detach_->next = std::as_const(*detach_->source).begin();
+        detach_->coord = coord;
+        detach_->policy = policy;
+    }
+    const auto end = std::as_const(*detach_->source).end();
+    while (detach_->next != end) {
+        if (now() >= budget.deadline) {
+            result.deferred = true;
+            result.retained = detach_->copy->size();
+            return result;
+        }
+        detach_->copy->set(detach_->next->first, detach_->next->second);
+        ++detach_->next;
+        if (now() >= budget.deadline) {
+            result.deferred = true;
+            result.overrun = true;
+            result.retained = detach_->copy->size();
+            return result;
+        }
+    }
+    result.retained = detach_->source->size();
+    regions_ = detach_->copy;
+    const RegionCoord editCoord = detach_->coord;
+    const PolicyKind editPolicy = detach_->policy;
+    detach_.reset();
+    const auto* existing = std::as_const(*regions_).find(editCoord);
+    if (existing == nullptr || *existing != editPolicy) {
+        regions_->set(editCoord, editPolicy);
+        ++revision_;
+    }
+    result.applied = true;
+    if (now() >= budget.deadline) result.overrun = true;
+    return result;
+}
+
 auto RegionMap::erase(RegionCoord coord) -> bool {
+    detach_.reset();
     if (!std::as_const(*regions_).contains(coord)) return false;
     detach();
     regions_->erase(coord);
