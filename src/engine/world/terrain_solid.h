@@ -53,8 +53,16 @@ struct TerrainSolidSample {
 struct TerrainSolidColumn {
     PolicyKind policy = PolicyKind::Height;
     double top = 0;
-    // Required for Hex, forbidden for Height. Voxel is never a column.
+    // Required for Hex, forbidden for Height. A voxel stack is not one top;
+    // classifyVoxelColumn owns its published solid spans.
     std::optional<double> floor;
+};
+
+// One closed solid run of a voxel column, bottom then top. Air between runs
+// is empty. The runs are the published stack, including a cave or overhang.
+struct VoxelSolidSpan {
+    double floor = 0;
+    double top = 0;
 };
 
 struct TerrainBoundarySolidQuery {
@@ -108,8 +116,14 @@ struct TerrainTopSample {
 // Names a vertical voxel stack and always fails closed. Bottom to top.
 // Two or more solid runs: VoxelOverhang. One run that starts above an air
 // cell: VoxelCavity. A bottom-anchored run, or no solid cells: UnsupportedVoxel.
-// Never returns an owner. That is the contract, not a completed voxel solid.
+// Never returns an owner. This is not a streaming column walker.
 [[nodiscard]] auto classifyVoxelStack(std::span<const bool> solidFromBottom)
+    -> Result<TerrainSolidSample, TerrainSolidError>;
+
+// Published voxel column. Spans are closed, ordered, and non-overlapping.
+// A sample inside a span is solid and owned by Voxel. A sample outside every
+// span is empty and still names Voxel. An empty span list is an all-air column.
+[[nodiscard]] auto classifyVoxelColumn(std::span<const VoxelSolidSpan> spans, double height)
     -> Result<TerrainSolidSample, TerrainSolidError>;
 
 } // namespace f4::world

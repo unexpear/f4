@@ -277,6 +277,26 @@ auto sampleUpwardTriangleHeight(const TerrainTopSample& a, const TerrainTopSampl
     return height;
 }
 
+auto classifyVoxelColumn(std::span<const VoxelSolidSpan> spans, double height)
+    -> Result<TerrainSolidSample, TerrainSolidError> {
+    using Error = TerrainSolidError;
+    if (!std::isfinite(height)) return Error::InvalidData;
+    double previousTop = -std::numeric_limits<double>::infinity();
+    bool inside = false;
+    for (const VoxelSolidSpan& span : spans) {
+        if (!representable(span.floor) || !representable(span.top) || !(span.top > span.floor) ||
+            !(span.floor >= previousTop)) {
+            return Error::InvalidData;
+        }
+        previousTop = span.top;
+        if (height >= span.floor && height <= span.top) inside = true;
+    }
+    TerrainSolidSample sample;
+    sample.solid = inside;
+    sample.policy = PolicyKind::Voxel;
+    return sample;
+}
+
 // UnsupportedVoxel, VoxelCavity, and VoxelOverhang never return an owner.
 auto classifyVoxelStack(std::span<const bool> solidFromBottom) -> Result<TerrainSolidSample, TerrainSolidError> {
     using Error = TerrainSolidError;

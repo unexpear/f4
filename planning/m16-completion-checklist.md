@@ -49,13 +49,15 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
 4. Solid ownership: a reference column contract now specifies and tests policy
    boundary/corner behavior, including nonplanar triangle tops, finite hex floors,
    precision limits, discontinuous breakpoints and unsupported intersections.
-   Voxel cavities and overhangs are named and fail closed; a bottom-anchored voxel
-   stack is still unsupported.    Surface rays remain a different API and do not
-   establish this volume contract. `WorldStreamer::classifyPublishedSolid` now
-   installs that classifier on the streaming collision path for published
-   Height/Hex columns, including boundary planes and corners. Voxel samples
-   fail closed with `UnsupportedVoxel` and never return an owner. A general
-   voxel solid query remains open.
+   Voxel cavities and overhangs are named by `classifyVoxelStack` and that
+   function still returns no owner. A bottom-anchored bool stack is still
+   unsupported. Surface rays remain a different API and do not establish this
+   volume contract. `WorldStreamer::classifyPublishedSolid` installs the
+   Height/Hex classifier on published columns, including boundary planes and
+   corners. An interior voxel column is owned from retained horizontal faces:
+   a solid span, an empty span, and a cave or overhang the published stack
+   contains. A region plane or corner that touches Voxel stays
+   `UnsupportedVoxel` with no owner.
 5. Moving coverage: test continuous camera/residency changes, edits, region changes,
    stale jobs and source arrivals/unloads. The resident-scope controller now has a
    focused queued-retarget regression across three outbound and two return
@@ -120,9 +122,11 @@ when a window contains an unsupported transition, including a Height/Hex scope.
 Focused tests cover triangle-top
 disagreement with bilinear sampling, an edit that stays on the retained mesh
 until republication, camera travel that keeps then drops a resident column, a
-region change that does not keep the previous owner, hex floor closure, voxel
-fail-closed samples, and Height/Hex boundary agreement with the reference
-classifier. M16 remains partial.
+region change that does not keep the previous owner, hex floor closure, a
+published voxel column that owns a solid span, the air above it, and an
+overhang punched through the retained mesh, and Height/Hex boundary agreement
+with the reference classifier. The Voxel/Hex plane sample stays
+`UnsupportedVoxel`. M16 remains partial.
 
 [Bounded boundary discovery](boundary-discovery.md) adds ownership-driven request
 selection within caller-supplied windows. [Resident reuse](boundary-resident-reuse.md)

@@ -190,7 +190,7 @@ TEST_CASE("Streaming solid: a region change during travel does not keep the old 
     CHECK_FALSE(under.value().solid);
 }
 
-TEST_CASE("Streaming solid: hex prisms are closed at the floor and voxel columns fail closed") {
+TEST_CASE("Streaming solid: hex prisms are closed at the floor") {
     WorldStreamer hexes(testConfig(PolicyKind::Hex));
     const math::Vec3 camera{8.f, 0.f, 8.f};
     REQUIRE(settle(hexes, camera, 1));
@@ -214,13 +214,58 @@ TEST_CASE("Streaming solid: hex prisms are closed at the floor and voxel columns
     const auto below = hexes.classifyPublishedSolid(centroid->x, floor - 1.0, centroid->z);
     REQUIRE(below.hasValue());
     CHECK_FALSE(below.value().solid);
+}
 
+TEST_CASE("Streaming solid: published voxel columns own solid empty and overhang spans") {
     WorldStreamer voxels(testConfig(PolicyKind::Voxel));
-    CHECK(voxels.classifyPublishedSolid(1.0, 1.0, 1.0).error() == StreamingSolidError::UnsupportedVoxel);
+    const math::Vec3 probe{1.5, 2.5, 1.5};
+    CHECK(voxels.classifyPublishedSolid(probe.x, probe.y, probe.z).error() == StreamingSolidError::NoPublishedSurface);
     REQUIRE(settle(voxels, {8.f, 8.f, 8.f}, 1));
-    const auto named = voxels.classifyPublishedSolid(1.0, 1.0, 1.0);
-    CHECK(named.error() == StreamingSolidError::UnsupportedVoxel);
-    CHECK_FALSE(named.hasValue());
+    const auto residents = voxels.residentChunks();
+    REQUIRE(residents.size() == 1);
+    REQUIRE(residents[0].key.policy == PolicyKind::Voxel);
+
+    const auto solid = voxels.classifyPublishedSolid(probe.x, 1.5, probe.z);
+    const auto cave = voxels.classifyPublishedSolid(probe.x, probe.y, probe.z);
+    const auto roof = voxels.classifyPublishedSolid(probe.x, 3.5, probe.z);
+    const auto sky = voxels.classifyPublishedSolid(probe.x, 40.0, probe.z);
+    REQUIRE(solid.hasValue());
+    REQUIRE(cave.hasValue());
+    REQUIRE(roof.hasValue());
+    REQUIRE(sky.hasValue());
+    CHECK(solid.value().solid);
+    CHECK(solid.value().policy == PolicyKind::Voxel);
+    CHECK(solid.value().sector == 0);
+    CHECK(cave.value().solid);
+    CHECK(cave.value().policy == PolicyKind::Voxel);
+    CHECK(roof.value().solid);
+    CHECK(roof.value().policy == PolicyKind::Voxel);
+    CHECK_FALSE(sky.value().solid);
+    CHECK(sky.value().policy == PolicyKind::Voxel);
+
+    REQUIRE(voxels.edit(residents[0].key, voxelIndex(1, 2, 1), CellValue::voxelValue(0)));
+    const auto retained = voxels.classifyPublishedSolid(probe.x, probe.y, probe.z);
+    REQUIRE(retained.hasValue());
+    CHECK(retained.value().solid);
+    CHECK(retained.value().policy == PolicyKind::Voxel);
+    REQUIRE(settle(voxels, {8.f, 8.f, 8.f}, 1));
+
+    const auto belowHole = voxels.classifyPublishedSolid(probe.x, 1.5, probe.z);
+    const auto hole = voxels.classifyPublishedSolid(probe.x, probe.y, probe.z);
+    const auto aboveHole = voxels.classifyPublishedSolid(probe.x, 3.5, probe.z);
+    const auto stillSky = voxels.classifyPublishedSolid(probe.x, 40.0, probe.z);
+    REQUIRE(belowHole.hasValue());
+    REQUIRE(hole.hasValue());
+    REQUIRE(aboveHole.hasValue());
+    REQUIRE(stillSky.hasValue());
+    CHECK(belowHole.value().solid);
+    CHECK(belowHole.value().policy == PolicyKind::Voxel);
+    CHECK_FALSE(hole.value().solid);
+    CHECK(hole.value().policy == PolicyKind::Voxel);
+    CHECK(aboveHole.value().solid);
+    CHECK(aboveHole.value().policy == PolicyKind::Voxel);
+    CHECK_FALSE(stillSky.value().solid);
+    CHECK(stillSky.value().policy == PolicyKind::Voxel);
 }
 
 TEST_CASE("Streaming solid: height/hex boundary and corner agree with the reference classifiers") {
@@ -335,7 +380,15 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
     const auto above = world.classifyPublishedSolid(64.0, upper + 10.0, tangent);
     REQUIRE(above.hasValue());
     CHECK_FALSE(above.value().solid);
-    CHECK(world.classifyPublishedSolid(-32.0, 0.0, 32.0).error() == StreamingSolidError::UnsupportedVoxel);
+    const auto voxelChunk = world.chunk(StreamingChunkKey{PolicyKind::Voxel, {-1, 0, 0}});
+    const auto voxelInterior = world.classifyPublishedSolid(-31.5, 1.0, 31.5);
+    if (voxelChunk && voxelChunk->hasMesh) {
+        REQUIRE(voxelInterior.hasValue());
+        CHECK(voxelInterior.value().policy == PolicyKind::Voxel);
+        CHECK(voxelInterior.value().solid);
+    } else {
+        CHECK(voxelInterior.error() == StreamingSolidError::NoPublishedSurface);
+    }
 
     const PolicyKind sectorPolicy[]{world.regions().policyAt(64, 64), world.regions().policyAt(63, 64),
                                     world.regions().policyAt(63, 63), world.regions().policyAt(64, 63)};

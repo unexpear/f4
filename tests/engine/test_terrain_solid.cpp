@@ -211,6 +211,32 @@ TEST_CASE("Solid columns: nonplanar tops, voxel stacks and unsupported profiles 
     CHECK(classifyVoxelStack(std::array<bool, 3>{true, true, false}).error() == TerrainSolidError::UnsupportedVoxel);
     CHECK(classifyVoxelStack(std::array<bool, 2>{false, false}).error() == TerrainSolidError::UnsupportedVoxel);
     CHECK(classifyVoxelStack(std::span<const bool>{}).error() == TerrainSolidError::InvalidData);
+    const std::array<VoxelSolidSpan, 2> cave{{{0, 2}, {3, 6}}};
+    const auto lower = classifyVoxelColumn(cave, 1);
+    const auto pocket = classifyVoxelColumn(cave, 2.5);
+    const auto upper = classifyVoxelColumn(cave, 4);
+    REQUIRE(lower.hasValue());
+    REQUIRE(pocket.hasValue());
+    REQUIRE(upper.hasValue());
+    CHECK(lower.value().solid);
+    CHECK(lower.value().policy == PolicyKind::Voxel);
+    CHECK_FALSE(pocket.value().solid);
+    CHECK(pocket.value().policy == PolicyKind::Voxel);
+    CHECK(upper.value().solid);
+    CHECK(upper.value().policy == PolicyKind::Voxel);
+    CHECK(classifyVoxelColumn(cave, 2).value().solid);
+    CHECK(classifyVoxelColumn(cave, 3).value().solid);
+    const auto sky = classifyVoxelColumn(cave, 7);
+    REQUIRE(sky.hasValue());
+    CHECK_FALSE(sky.value().solid);
+    CHECK(sky.value().policy == PolicyKind::Voxel);
+    const auto air = classifyVoxelColumn({}, 1);
+    REQUIRE(air.hasValue());
+    CHECK_FALSE(air.value().solid);
+    CHECK(air.value().policy == PolicyKind::Voxel);
+    CHECK(classifyVoxelColumn(std::array<VoxelSolidSpan, 2>{{{0, 2}, {1, 3}}}, 1).error() ==
+          TerrainSolidError::InvalidData);
+    CHECK(classifyVoxelColumn(std::array<VoxelSolidSpan, 1>{{{2, 2}}}, 2).error() == TerrainSolidError::InvalidData);
 
     const std::array profile{span(0, 2, 0, 0, 2, 2)};
     const TerrainBoundaryLine line{TerrainBoundaryAxis::X, 0, 0, 2};

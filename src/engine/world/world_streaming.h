@@ -377,11 +377,13 @@ public:
     // Height and Hex interiors use the upward published triangle
     // (sampleUpwardTriangleHeight), not bilinear sampling. A sample on one
     // region plane uses classifyTerrainBoundarySolid; a sample on both planes
-    // uses classifyTerrainCornerSolid. Voxel policy returns UnsupportedVoxel
-    // and never an owner. Does not change raycastVoxelTerrain, sampleHeightTerrain,
-    // or voxel DDA. Uses the retained published mesh, including while a remesh
-    // is in flight. A non-solid success leaves policy at Height and sector at 0;
-    // those fields name the owner only when solid is true.
+    // uses classifyTerrainCornerSolid. An interior voxel sample walks the
+    // horizontal faces of the retained published meshes: each closed solid
+    // run is owned by Voxel, and air in that column is an empty Voxel sample.
+    // A region plane or corner that touches Voxel stays UnsupportedVoxel.
+    // Does not change raycastVoxelTerrain, sampleHeightTerrain, or voxel DDA.
+    // Uses the retained published mesh, including while a remesh is in flight.
+    // A Height or Hex non-solid success leaves policy at Height and sector at 0.
     [[nodiscard]] auto classifyPublishedSolid(double x, double y, double z) const
         -> Result<TerrainSolidSample, StreamingSolidError>;
 
