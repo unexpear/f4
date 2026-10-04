@@ -49,12 +49,12 @@ were observed in this settled route.
 
 ## Remaining Work
 
-The unscoped union is intentionally conservative and can include unrelated
-policy transitions. Scoped Height/Hex discovery fails that same window instead
-of omitting the unsupported edge. The mixed diagnostic world's Height/Hex mesh
-rectangle can still contain a Voxel/Hex edge. The composition request uses the
-pair-adjacency rectangle, which leaves that edge outside the window, and the
-native policy gate passed again with 112 captures per run. A rectangle that
-contains the foreign edge still fails closed. Continuous camera movement,
+The unscoped union is intentionally conservative and can include a Height/Voxel
+edge. That edge still fails the whole window and is not omitted. A resident
+Voxel/Hex pair window contains the shared edge. Discovery returns it, and the
+published column on the edge is `UnsupportedVoxel` with no owner. A Height/Hex
+scope fails that same window instead of dropping the edge. The native policy
+gate hashes `voxel_hex_column.csv` with the existing residency CSV and 44
+sweep presents. Continuous camera movement,
 accepted world/query publication outside the demo adapter, and integrated
 operation-time budgets remain open. No assets were modified.

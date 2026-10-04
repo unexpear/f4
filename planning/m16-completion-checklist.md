@@ -23,10 +23,13 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
 2. Automatic bounded discovery: region-map enumeration and caller-window
    selection are implemented. A Height/Hex scope still derives its active
    window from current camera-selected residency and clipped published meshes.
-   An unsupported edge inside that window fails the request for both scoped
-   and unscoped callers. Scoped resident composition submits the pair-adjacency
-   rectangle, so the mixed-policy corner can stage Height/Hex without putting
-   the Voxel/Hex edge in the window. Full-world policy coverage remains open.
+   A Height/Voxel edge inside a window fails the request for both scoped and
+   unscoped callers and is not omitted. A resident Voxel/Hex window contains
+   that edge. Discovery returns it, and the published column is
+   `UnsupportedVoxel` with no owner. A Height/Hex scope fails that window
+   instead of dropping the edge. Scoped resident composition still submits the
+   Height/Hex pair-adjacency rectangle for the corner sweep. The full resident
+   union still fails closed on Height/Voxel.
    Derive required boundaries from actual region
    ownership and residency, split endpoints/crossings consistently, and
    distinguish no boundaries from unsupported, incomplete or failed discovery.

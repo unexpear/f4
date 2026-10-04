@@ -242,6 +242,28 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
     CHECK(discoverTerrainBoundaries(world.regions(), *full).error() == BoundaryDiscoveryError::UnsupportedTransition);
     CHECK(discoverTerrainBoundaries(world.regions(), *full, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
+    const auto voxelHexMesh = world.residentTerrainFootprint(PolicyKind::Voxel, PolicyKind::Hex);
+    REQUIRE(voxelHexMesh.has_value());
+    const auto voxelHexWindow = policyPairCompositionWindow(
+        world.regions(), *voxelHexMesh, PolicyKind::Voxel, PolicyKind::Hex);
+    const auto voxelHex = discoverTerrainBoundaries(
+        world.regions(), voxelHexWindow, {}, std::pair{PolicyKind::Voxel, PolicyKind::Hex});
+    REQUIRE(voxelHex.hasValue());
+    const StreamingBoundaryRequest* voxelEdge = nullptr;
+    for (const auto& edge : voxelHex.value()) {
+        const bool pair = (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Hex) ||
+                          (edge.negative == PolicyKind::Hex && edge.positive == PolicyKind::Voxel);
+        CHECK(pair);
+        if (edge.line.axis == TerrainBoundaryAxis::X && edge.line.plane == 0.0) voxelEdge = &edge;
+    }
+    REQUIRE(voxelEdge != nullptr);
+    CHECK(voxelHexWindow.minX < voxelEdge->line.plane);
+    CHECK(voxelHexWindow.maxX > voxelEdge->line.plane);
+    const double voxelTangent = (voxelEdge->line.begin + voxelEdge->line.end) * 0.5;
+    CHECK(world.classifyPublishedSolid(voxelEdge->line.plane, 0.0, voxelTangent).error() ==
+          StreamingSolidError::UnsupportedVoxel);
+    CHECK(discoverTerrainBoundaries(world.regions(), voxelHexWindow, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
     const auto scoped = world.residentTerrainFootprint(PolicyKind::Height, PolicyKind::Hex);
     REQUIRE(scoped.has_value());
     const TerrainFootprint containingVoxel{std::min(scoped->minX, -32.0), std::max(scoped->maxX, 96.0),

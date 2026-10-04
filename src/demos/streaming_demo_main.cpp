@@ -594,6 +594,7 @@ public:
         probes.flush();
         require(probes.good(), "Cannot write regional surface evidence");
         if (cutWalls) {
+            recordVoxelHexColumn();
             auditHeightHexProfiles();
             std::ofstream walls(output_ / "capped_wall_probes.csv");
             walls.precision(17);
@@ -616,6 +617,54 @@ public:
             require(walls.good(), "Cannot write cut wall evidence");
             verifyCornerPublication();
         }
+    }
+
+    void recordVoxelHexColumn() {
+        const auto meshes = world_->residentTerrainFootprint(world::PolicyKind::Voxel, world::PolicyKind::Hex);
+        require(meshes.has_value(), "Resident world has no voxel/hex mesh bounds");
+        const auto window = world::policyPairCompositionWindow(
+            world_->regions(), *meshes, world::PolicyKind::Voxel, world::PolicyKind::Hex);
+        const auto edges = world::discoverTerrainBoundaries(
+            world_->regions(), window, {}, std::pair{world::PolicyKind::Voxel, world::PolicyKind::Hex});
+        require(edges.hasValue() && !edges.value().empty(), "Voxel/Hex window did not return the resident edge");
+        require(world::discoverTerrainBoundaries(world_->regions(), window, {},
+                    std::pair{world::PolicyKind::Height, world::PolicyKind::Hex}).error() ==
+                world::BoundaryDiscoveryError::UnsupportedTransition,
+            "Height/Hex scope omitted the voxel/hex edge");
+        const auto full = world_->residentTerrainFootprint();
+        require(full.has_value(), "Resident world has no footprint");
+        require(world::discoverTerrainBoundaries(world_->regions(), *full).error() ==
+                world::BoundaryDiscoveryError::UnsupportedTransition,
+            "Full resident union omitted an unsupported edge");
+        std::ofstream csv(output_ / "voxel_hex_column.csv");
+        csv.precision(17);
+        csv << "record,axis,plane,begin,end,negative,positive,sample_x,sample_z,sample_y,status\n";
+        bool sawPlane = false;
+        for (const auto& edge : edges.value()) {
+            const bool voxelHex = (edge.negative == world::PolicyKind::Voxel && edge.positive == world::PolicyKind::Hex) ||
+                                  (edge.negative == world::PolicyKind::Hex && edge.positive == world::PolicyKind::Voxel);
+            require(voxelHex, "Voxel/Hex window returned a different pair");
+            const bool contains = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? window.minX < edge.line.plane && window.maxX > edge.line.plane
+                : window.minZ < edge.line.plane && window.maxZ > edge.line.plane;
+            require(contains, "Voxel/Hex edge fell outside its window");
+            if (edge.line.axis == world::TerrainBoundaryAxis::X && edge.line.plane == 0.0) sawPlane = true;
+            const double sampleX = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
+            const double sampleZ = edge.line.axis == world::TerrainBoundaryAxis::Z
+                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
+            const auto sample = world_->classifyPublishedSolid(sampleX, -8.0, sampleZ);
+            require(!sample.hasValue() && sample.error() == world::StreamingSolidError::UnsupportedVoxel,
+                "Voxel/Hex column returned an owner");
+            csv << "edge," << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
+                << edge.line.begin << ',' << edge.line.end << ','
+                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
+                << sampleX << ',' << sampleZ << ",-8,UnsupportedVoxel\n";
+        }
+        require(sawPlane, "Resident voxel/hex edge at x=0 was not inside the window");
+        csv << "union,,,,,,," << full->minX << ',' << full->minZ << ",,UnsupportedTransition\n";
+        csv.flush();
+        require(csv.good(), "Cannot write voxel/hex column evidence");
     }
 
     void verifyCornerPublication() {

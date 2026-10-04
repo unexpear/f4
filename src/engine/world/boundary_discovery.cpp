@@ -16,9 +16,16 @@ auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint f, Bou
         return BoundaryDiscoveryError::InvalidWindow;
     if (!limits.maxTiles || limits.maxTiles > 4096 || !limits.maxBoundaries || limits.maxBoundaries > 256)
         return BoundaryDiscoveryError::InvalidLimits;
+    const auto heightHex = [](PolicyKind a, PolicyKind b) {
+        return (a == PolicyKind::Height && b == PolicyKind::Hex) ||
+               (a == PolicyKind::Hex && b == PolicyKind::Height);
+    };
+    const auto voxelHex = [](PolicyKind a, PolicyKind b) {
+        return (a == PolicyKind::Voxel && b == PolicyKind::Hex) ||
+               (a == PolicyKind::Hex && b == PolicyKind::Voxel);
+    };
     if (scope && (scope->first == scope->second ||
-                  !((scope->first == PolicyKind::Height && scope->second == PolicyKind::Hex) ||
-                    (scope->first == PolicyKind::Hex && scope->second == PolicyKind::Height))))
+                  !(heightHex(scope->first, scope->second) || voxelHex(scope->first, scope->second))))
         return BoundaryDiscoveryError::UnsupportedTransition;
     const auto extent = regions.tileExtentMeters();
     const auto regionAt = [extent](double coordinate) {
@@ -44,11 +51,12 @@ auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint f, Bou
     const auto append = [&](TerrainBoundaryLine line, PolicyKind negative, PolicyKind positive)
         -> std::optional<BoundaryDiscoveryError> {
         if (negative == positive) return {};
-        const bool supported = (negative == PolicyKind::Height && positive == PolicyKind::Hex) ||
-                               (negative == PolicyKind::Hex && positive == PolicyKind::Height);
-        if (!supported) return BoundaryDiscoveryError::UnsupportedTransition;
+        if (!heightHex(negative, positive) && !voxelHex(negative, positive))
+            return BoundaryDiscoveryError::UnsupportedTransition;
+        // A scope does not drop the other enumerated pair. The window fails.
         if (scope && !((negative == scope->first && positive == scope->second) ||
-                       (negative == scope->second && positive == scope->first))) return {};
+                       (negative == scope->second && positive == scope->first)))
+            return BoundaryDiscoveryError::UnsupportedTransition;
         if (result.size() == limits.maxBoundaries) return BoundaryDiscoveryError::LimitExceeded;
         result.push_back({line, negative, positive});
         return {};
