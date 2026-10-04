@@ -792,8 +792,18 @@ public:
             }
         }
         require(hexColumn.has_value(), "Home travel has no stable published hex column");
-        int stableHex = 0, droppedHex = 0, tickRows = 0, unadoptedEdit = 0, unadoptedRegion = 0;
+        int stableHex = 0, droppedHex = 0, tickRows = 0, sweepPresents = 0, unadoptedEdit = 0, unadoptedRegion = 0;
         bool hexDropped = false;
+        const auto presentTick = [&](double ax, double az) {
+            auto eye = homeCamera();
+            eye.position = {static_cast<float>(ax) + 24.f, 80.f, static_cast<float>(az) + 24.f};
+            eye.pitch = std::atan2(70.f, std::sqrt(24.f * 24.f * 2.f));
+            eye.yaw = std::atan2(24.f, 24.f);
+            char name[32];
+            std::snprintf(name, sizeof(name), "sweep_tick_%04d", sweepPresents);
+            presentSweepFrame(eye, name);
+            ++sweepPresents;
+        };
         const auto noteHexColumn = [&](const char* direction, bool anchorRow) {
             const auto sample = world_->classifyPublishedSolid(hexColumn->first, -8.0, hexColumn->second);
             const bool outboundTravel = std::string(direction) == "outbound" || std::string(direction) == "away";
@@ -813,6 +823,7 @@ public:
             return probeText(hexColumn->first, -8.0, hexColumn->second);
         };
         const auto recordHexTick = [&](const char* direction, unsigned step, unsigned tick, double ax, double az) {
+            presentTick(ax, az);
             const auto probe = noteHexColumn(direction, false);
             movement << direction << ',' << step << ',' << ax << ',' << az << ','
                 << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
@@ -949,6 +960,7 @@ public:
                     if (std::string(direction) == "edit") ++unadoptedEdit;
                     else ++unadoptedRegion;
                 }
+                presentTick(512.0, 512.0);
                 movement << direction << ',' << (published ? "published" : "inflight") << ",512,512,"
                     << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
                     << static_cast<unsigned>(job.status().state) << ','
@@ -1012,6 +1024,7 @@ public:
         require(different(original, checkpoint(camera, "corner_returned")) == 0,
             "Retargeted home corner failed exact image restoration");
         require(tickRows > 16, "Corner sweep did not record a world-update tick between the settled anchors");
+        require(sweepPresents == tickRows, "Sweep presents diverged from world-update ticks");
         require(unadoptedEdit >= 1, "In-flight height edit was not recorded before republication");
         require(unadoptedRegion >= 1, "In-flight region change was not recorded before republication");
         movement.flush(); require(movement.good(), "Cannot finish continuous corner residency evidence");
@@ -1687,6 +1700,22 @@ private:
         commands.endRenderPass(); commands.end();
         require(window_.device()->submit(commands) == gfx::GfxError::None, "HUD submit failed");
         hudUs_ = micros(Clock::now() - beforeHud);
+    }
+
+    // One presented frame of the view already installed for this sweep tick.
+    // Does not advance world admission or the wall-clock upload budget.
+    void presentSweepFrame(const demo::FreeCamera& camera, const char* name) {
+        draw(camera, true);
+        (void)captureImage(name);
+        window_.window()->swap();
+        require(world_->stats().failedCompletions == 0, "Streaming worker failure");
+        const auto gpu = window_.device()->stats();
+        require(gpu.pipelineCount == preparedPipelineCount_,
+                "Terrain created an unprepared pipeline during verification");
+        require(gpu.shaderFailed == 0 && gpu.shaderWarnings == 0, "Shader diagnostics are not clean");
+        require(glGetError() == GL_NO_ERROR, "OpenGL error during streaming frame");
+        ++frames_;
+        window_.device()->resetFrameStats();
     }
 
     auto captureImage(const char* name) -> Bytes {

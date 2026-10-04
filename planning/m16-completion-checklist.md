@@ -80,8 +80,11 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    is hashed across the two processes. It records one row per world-update tick
    of the eight-step sweep. Held samples taken before the republishing update
    keep the previous published owner; the new owner appears on a later tick
-   only after republication. Those rows are not a per-tick GPU present. A hard
-   budget for non-preemptible work remains open.
+   only after republication. Each of those world-update ticks also presents
+   one `sweep_tick_*.bmp` of the view already installed for that tick. The
+   two-process gate hashes those presents. They do not advance world admission
+   or the wall-clock upload budget, and they are not a hard realtime deadline.
+   A hard budget for non-preemptible work remains open.
 6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
    publication, conversion/upload and retirement. Count limits do not bound the
    cost of one operation. Large shared-map edits and continuous-movement planning
@@ -122,10 +125,10 @@ Discovery of those bounds fails closed when they contain an unsupported edge.
 `policyPairCompositionWindow` selects the resident pair-adjacency rectangle for
 the composition request. The eight-step native sweep in that gate now records one residency row per
 world-update tick under fixed work-unit admission, plus held samples for edit
-retention and region-change ownership. The two-process gate passed again (112
-captures per run), and `corner_motion_residency.csv` matches. That admission
-cap is not a hard realtime deadline, and the rows are not a per-tick GPU
-present. Interactive pacing is unchanged. MSVC ASan was not re-run. Renderer
+retention and region-change ownership, and presents one frame per recorded
+tick. The two-process gate hashes `corner_motion_residency.csv` and every
+`sweep_tick_*.bmp`. That admission cap is not a hard realtime deadline.
+Interactive pacing is unchanged. MSVC ASan was not re-run. Renderer
 consumers still keep a local surface package: plain sync can replace it when
 the new package is not current, while the engine slot keeps the prior
 publication, so displayed raycasts do not read the slot. That swap is still open.
