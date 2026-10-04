@@ -704,7 +704,7 @@ public:
             for (int t = 4; t < 64; t += 4) {
                 const math::Vec3 eye = axis == 0 ? math::Vec3{62, 10, float(t)} : math::Vec3{float(t), 10, 62};
                 const math::Vec3 direction = axis == 0 ? math::Vec3{1, 0, 0} : math::Vec3{0, 0, 1};
-                const auto hit = view_->raycastDisplayedTerrain(eye, direction, 4, true);
+                const auto hit = view_->raycastDisplayedTerrain(*world_, eye, direction, 4, true);
                 require(hit && hit->boundary == axis && std::abs(hit->source.surface.distance - 2) < 0.00001,
                         "Displayed transition disagrees with the installed query geometry");
                 probes << axis << ',' << t << ',' << hit->composedTriangle << ',' << hit->source.surface.triangleIndex << ','
@@ -800,7 +800,7 @@ public:
         verifyReuse("edited");
         const auto after = checkpoint(camera, "corner_live_edited");
         require(different(before, after) > 100, "Live corner edit did not change the displayed geometry");
-        const auto hit = view_->raycastDisplayedTerrain({56, 100, 64}, {0, -1, 0}, 200);
+        const auto hit = view_->raycastDisplayedTerrain(*world_, {56, 100, 64}, {0, -1, 0}, 200);
         require(hit && std::abs(hit->source.surface.position.y - 45) < 0.00001,
             "Live corner query did not follow the displayed edit");
         require(world_->edit(key, index, original), "Cannot restore live corner edit");
@@ -953,7 +953,7 @@ public:
         converge(false);
         auto away = homeCamera(); away.position.x += 512; away.position.z += 512;
         const auto plain = checkpoint(away, "corner_away_plain");
-        const auto hit = view_->raycastDisplayedTerrain({544, 100, 544}, {0, -1, 0}, 200);
+        const auto hit = view_->raycastDisplayedTerrain(*world_, {544, 100, 544}, {0, -1, 0}, 200);
         require(hit && !hit->boundary && hit->source.key.policy == world::PolicyKind::Height,
             "Departed view did not publish plain height query geometry");
         const math::Vec3 awayAnchor{512, 0, 512};

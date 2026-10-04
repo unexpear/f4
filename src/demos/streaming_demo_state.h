@@ -91,10 +91,13 @@ public:
     void removeBoundaryComposition(world::WorldStreamer& world);
     auto hasBoundaryComposition() const -> bool { return boundary_.has_value(); }
     auto acceptedSurfaceCurrent(const world::WorldStreamer& world) const -> bool;
-    // Queries exactly the CPU geometry corresponding to this view's GPU versions,
-    // not newer WorldStreamer publication. A retained result need not be current.
-    auto raycastDisplayedTerrain(math::Vec3 origin, math::Vec3 direction, float maxDistance,
-                                  bool cullBackFaces = false) const -> std::optional<world::StreamingBoundaryHit>;
+    // Queries the engine accepted-view slot, which is the package this view has
+    // published. A retained result need not be current. Plain sync does not
+    // replace the drawn meshes until that same package can be published.
+    auto raycastDisplayedTerrain(const world::WorldStreamer& world, math::Vec3 origin,
+                                  math::Vec3 direction, float maxDistance,
+                                  bool cullBackFaces = false) const
+        -> std::optional<world::StreamingBoundaryHit>;
     auto render(gfx::FramebufferHandle target, const engine::Camera& camera, float aspect)
         -> gfx::GfxError;
     void clear();

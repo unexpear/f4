@@ -140,10 +140,10 @@ tick. The two-process gate hashes `corner_motion_residency.csv` and every
 `sweep_tick_*.bmp`. That admission cap is not a hard realtime deadline.
 A separate opt-in deadline refuses the next streaming unit and the next
 copied entry of a shared region map. It keeps work already started.
-Interactive pacing is unchanged. MSVC ASan was not re-run. Renderer
-consumers still keep a local surface package: plain sync can replace it when
-the new package is not current, while the engine slot keeps the prior
-publication, so displayed raycasts do not read the slot. That swap is still open.
+Interactive pacing is unchanged. MSVC ASan was not re-run. Displayed raycasts
+read the engine accepted-view slot. Plain sync does not replace the drawn
+meshes until that package can be published, so a stale resident keeps the
+picture on the publication the query hits.
 Subsequent increments must update this checklist and the architecture plan
 without weakening the acceptance requirements.
 

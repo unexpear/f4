@@ -243,82 +243,152 @@ auto StreamingDemoView::sync(world::WorldStreamer& world, std::uint32_t uploadLi
         reloadMeshes_.pop();
         ++uploads_.reloadRetired;
     }
-    for (auto it = chunks_.begin(); it != chunks_.end();) {
-        if (!world.chunk(it->first)) {
-            if (it->second.entity.isValid()) registry_.destroy(it->second.entity);
-            if (it->second.mesh.isValid()) renderer_.destroyMesh(it->second.mesh);
-            it = chunks_.erase(it);
-            ++uploads_.retired;
-        } else {
-            ++it;
-        }
+    std::vector<world::StreamingChunkKey> retireKeys;
+    for (const auto& [key, resident] : chunks_) {
+        (void)resident;
+        if (!world.chunk(key)) retireKeys.push_back(key);
     }
+    struct PreparedUpload {
+        world::StreamingChunkInfo chunk;
+        std::shared_ptr<const world::MeshData> geometry;
+        resources::MeshHandle mesh;
+        bool expired = false;
+        std::size_t bytes = 0;
+    };
+    std::vector<PreparedUpload> prepared;
+    std::uint32_t admitted = 0;
+    const auto rollbackPrepared = [&] {
+        for (const auto& upload : prepared) if (upload.mesh.isValid()) renderer_.destroyMesh(upload.mesh);
+    };
     for (const auto& chunk : world.residentChunks()) {
         if (!chunk.hasMesh || chunk.state != world::ChunkState::Meshed) continue;
-        auto found = chunks_.find(chunk.key);
+        const auto found = chunks_.find(chunk.key);
         if (found != chunks_.end() && residentCurrent(found->second, world, chunk)) continue;
-        if (uploads_.uploaded >= uploadLimit) {
+        if (admitted >= uploadLimit) {
             ++uploads_.deferred;
             continue;
         }
         const bool expired = deadline && std::chrono::steady_clock::now() >= *deadline;
-        if (expired && uploads_.uploaded != 0) {
+        if (expired && admitted != 0) {
             ++uploads_.deferred;
             ++uploads_.budgetDeferred;
             continue;
         }
         const auto* source = world.mesh(chunk.key);
-        if (source == nullptr || source->vertices.isEmpty() != source->indices.isEmpty()) return false;
+        if (source == nullptr || source->vertices.isEmpty() != source->indices.isEmpty()) {
+            rollbackPrepared();
+            return false;
+        }
+        PreparedUpload upload;
+        upload.chunk = chunk;
+        upload.geometry = std::make_shared<const world::MeshData>(*source);
+        upload.expired = expired;
         auto resource = world::toResourceMesh(*source);
-        auto geometry = std::make_shared<const world::MeshData>(*source);
-        resources::MeshHandle mesh;
+        upload.bytes = resource.indices.size();
+        for (const auto& stream : resource.streams) upload.bytes += stream.data.size();
         if (!source->indices.isEmpty()) {
             // One vertex-colored material per policy covers every terrain surface.
             // Keep the entire index range, not just material slot zero.
             resource.submeshes.clear();
             resource.submeshes.push({0, source->indices.size()});
-            mesh = renderer_.createMesh(resource);
-            if (!mesh.isValid()) return false;
-        }
-        // Publish the replacement before retiring the prior mesh. A failed upload
-        // leaves its old entity/mesh intact, and dirty CPU versions never upload.
-        ecs::Entity entity;
-        if (mesh.isValid()) {
-            entity = found != chunks_.end() ? found->second.entity : ecs::Entity{};
-            if (!entity.isValid()) {
-                entity = registry_.create();
-                registry_.emplace<ecs::LocalTransform>(entity).position = world.meshOrigin(chunk.key);
-                registry_.emplace<engine::MeshRenderer>(entity,
-                    engine::MeshRenderer{mesh, materials_[static_cast<std::size_t>(chunk.key.policy)], 0, false, false});
-            } else {
-                registry_.get<engine::MeshRenderer>(entity)->mesh = mesh;
-                ecs::setLocalPosition(registry_, entity, world.meshOrigin(chunk.key));
+            upload.mesh = renderer_.createMesh(resource);
+            if (!upload.mesh.isValid()) {
+                rollbackPrepared();
+                return false;
             }
         }
-        if (found == chunks_.end()) {
-            chunks_.emplace(chunk.key, Resident{chunk.handle, chunk.version, entity, mesh, std::move(geometry),
-                world.meshOrigin(chunk.key), chunk.meshRegionRevision, world.identityToken()});
-        } else {
-            auto& resident = found->second;
-            if (resident.entity.isValid() && !entity.isValid()) registry_.destroy(resident.entity);
-            if (resident.mesh.isValid()) renderer_.destroyMesh(resident.mesh);
-            resident = {chunk.handle, chunk.version, entity, mesh, std::move(geometry), world.meshOrigin(chunk.key),
-                chunk.meshRegionRevision, world.identityToken()};
-        }
-        ++uploads_.uploaded;
-        uploads_.progressAfterDeadline = uploads_.progressAfterDeadline || expired;
-        uploads_.bytes += resource.indices.size();
-        for (const auto& stream : resource.streams) uploads_.bytes += stream.data.size();
+        prepared.push_back(std::move(upload));
+        ++admitted;
     }
-    ecs::updateWorldTransforms(registry_);
-    if (const auto accepted = makeSurfaceView(chunks_)) surfaceView_ = *accepted;
-    else if (chunks_.empty()) surfaceView_.reset();
-    else return false;
-    if (surfaceView_ && surfaceView_->current(world)) {
-        if (!world.publishSurfaceView(*surfaceView_)) return false;
-    } else if (!surfaceView_) {
+    bool unready = false;
+    for (const auto& [key, resident] : chunks_) {
+        const auto chunk = world.chunk(key);
+        if (!chunk || residentCurrent(resident, world, *chunk)) continue;
+        const bool uploaded = std::any_of(prepared.begin(), prepared.end(),
+            [&](const PreparedUpload& upload) { return upload.chunk.key == key; });
+        if (uploaded) continue;
+        if (!chunk->hasMesh || chunk->state != world::ChunkState::Meshed) unready = true;
+        else if (admitted > 0) retireKeys.push_back(key);
+    }
+    // A resident with no replacement yet keeps the previous picture. Ready
+    // replacements that do not fit this frame leave the picture until a later
+    // upload, so the slot never queries geometry that is no longer drawn.
+    if (unready) {
+        rollbackPrepared();
+        uploads_.deferred += admitted;
+        plainOwner_.reset();
+        return true;
+    }
+    std::unordered_map<world::StreamingChunkKey, Resident> planned = chunks_;
+    for (const auto& key : retireKeys) planned.erase(key);
+    for (const auto& upload : prepared) {
+        Resident& resident = planned[upload.chunk.key];
+        const auto previous = chunks_.find(upload.chunk.key);
+        resident = {upload.chunk.handle, upload.chunk.version,
+            previous == chunks_.end() ? ecs::Entity{} : previous->second.entity, upload.mesh,
+            upload.geometry, world.meshOrigin(upload.chunk.key), upload.chunk.meshRegionRevision,
+            world.identityToken()};
+    }
+    std::optional<world::StreamingSurfaceView> plannedView;
+    if (const auto accepted = makeSurfaceView(planned)) plannedView = *accepted;
+    else if (!planned.empty()) {
+        rollbackPrepared();
+        return false;
+    }
+    // A package that fails the slot gate is not drawn. The previous publication
+    // stays on screen and remains the query.
+    if (plannedView ? !plannedView->current(world) : false) {
+        rollbackPrepared();
+        uploads_.deferred += admitted;
+        plainOwner_.reset();
+        return true;
+    }
+    if (plannedView) {
+        if (!world.publishSurfaceView(*plannedView)) {
+            rollbackPrepared();
+            return false;
+        }
+    } else {
         world.clearSurfaceView();
     }
+    for (const auto& key : retireKeys) {
+        const auto found = chunks_.find(key);
+        if (found->second.entity.isValid()) registry_.destroy(found->second.entity);
+        if (found->second.mesh.isValid()) renderer_.destroyMesh(found->second.mesh);
+        chunks_.erase(found);
+        ++uploads_.retired;
+    }
+    for (auto& upload : prepared) {
+        const auto previous = chunks_.find(upload.chunk.key);
+        ecs::Entity entity = previous == chunks_.end() ? ecs::Entity{} : previous->second.entity;
+        const resources::MeshHandle oldMesh = previous == chunks_.end() ? resources::MeshHandle{} : previous->second.mesh;
+        if (upload.mesh.isValid()) {
+            if (!entity.isValid()) {
+                entity = registry_.create();
+                registry_.emplace<ecs::LocalTransform>(entity).position = world.meshOrigin(upload.chunk.key);
+                registry_.emplace<engine::MeshRenderer>(entity,
+                    engine::MeshRenderer{upload.mesh, materials_[static_cast<std::size_t>(upload.chunk.key.policy)], 0, false, false});
+            } else {
+                registry_.get<engine::MeshRenderer>(entity)->mesh = upload.mesh;
+                ecs::setLocalPosition(registry_, entity, world.meshOrigin(upload.chunk.key));
+            }
+        } else if (entity.isValid()) {
+            registry_.destroy(entity);
+            entity = {};
+        }
+        if (oldMesh.isValid()) renderer_.destroyMesh(oldMesh);
+        Resident resident{upload.chunk.handle, upload.chunk.version, entity, upload.mesh,
+            upload.geometry, world.meshOrigin(upload.chunk.key), upload.chunk.meshRegionRevision,
+            world.identityToken()};
+        if (previous == chunks_.end()) chunks_.emplace(upload.chunk.key, std::move(resident));
+        else previous->second = std::move(resident);
+        ++uploads_.uploaded;
+        uploads_.progressAfterDeadline = uploads_.progressAfterDeadline || upload.expired;
+        uploads_.bytes += upload.bytes;
+    }
+    ecs::updateWorldTransforms(registry_);
+    if (plannedView) surfaceView_ = *plannedView;
+    else surfaceView_.reset();
     plainOwner_.reset(); // Ordinary per-resident synchronization is not a composed transaction.
     return true;
 }
@@ -655,10 +725,10 @@ auto StreamingDemoView::publishBoundaryComposition(world::WorldStreamer& world,
     return false;
 }
 
-auto StreamingDemoView::raycastDisplayedTerrain(math::Vec3 origin, math::Vec3 direction, float maxDistance,
+auto StreamingDemoView::raycastDisplayedTerrain(const world::WorldStreamer& world, math::Vec3 origin,
+                                                math::Vec3 direction, float maxDistance,
                                                 bool cullBackFaces) const -> std::optional<world::StreamingBoundaryHit> {
-    return surfaceView_ ? surfaceView_->raycast(origin, direction, maxDistance, cullBackFaces) :
-        std::optional<world::StreamingBoundaryHit>{};
+    return world.raycastAcceptedTerrain(origin, direction, maxDistance, cullBackFaces);
 }
 
 auto StreamingDemoView::render(gfx::FramebufferHandle target, const engine::Camera& camera,

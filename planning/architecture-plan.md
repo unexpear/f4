@@ -844,9 +844,8 @@ Completed delivery and acceptance gates:
   packages the demo's accepted resident/composition geometry, routes its
   displayed query through the same immutable inputs, and adds an explicit
   WorldStreamer publication/query slot. Successful current demo commits publish
-  into it, but the demo still keeps a local surface package for displayed
-  raycasts. Plain sync can replace that package when it is not current while
-  the engine slot retains the prior publication. The two-process native policy
+  into it. Displayed raycasts read that slot. Plain sync keeps the drawn meshes
+  until the same package can be published. The two-process native policy
   gate was re-run after the pair-window selection and passed with 112 captures
   per run. That sweep now also records a resident hex column across camera
   steps, an unload that drops it, an away height edit that stays on the old
@@ -1246,9 +1245,11 @@ capture acceptance is claimed by this local increment.
    started, and reports overrun. The verify path ignores that deadline. The
    interactive demo stays cooperative. The presents draw the view already installed and
    do not spend the wall-clock upload budget. The two-process policy gate
-   hashes `corner_motion_residency.csv` and every `sweep_tick_*.bmp`. Still
+   hashes `corner_motion_residency.csv` and every `sweep_tick_*.bmp`. Displayed
+   raycasts read the engine accepted-view slot, and plain sync does not draw a
+   package that slot rejects. Still
    open: full-world policy
-   coverage and renderer consumption of the engine accepted-view slot. One
+   coverage. One
    streaming unit or one copied map entry can still finish after the deadline.
    The opt-in
    [regional surface mode](regional-surfaces.md) now clips published CPU
