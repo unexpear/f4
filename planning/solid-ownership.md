@@ -82,9 +82,11 @@ advance world admission or the wall-clock upload budget. That verify path uses
 fixed work-unit admission (per-frame count caps), not a hard realtime deadline.
 Interactive pacing is unchanged. Discovery returns a Voxel/Hex edge that is inside the window. The published
 column on that edge is `UnsupportedVoxel` and has no owner, because the sample
-is on the region plane rather than inside one voxel cell. Height/Voxel still
-fails the whole window and is not omitted. The resident bounding union of the
-mixed world still fails for that reason. Scoped Height/Hex composition keeps
-the pair-adjacency rectangle, and a Height/Hex scope fails a window that
+is on the region plane rather than inside one voxel cell. An unscoped
+resident window that contains a Height/Voxel edge returns that edge. The
+published column on it is `UnsupportedVoxel` with no owner. A Height/Hex
+scope of that window fails instead of dropping the edge. The full resident
+union returns the edge. Scoped Height/Hex composition keeps the
+pair-adjacency rectangle, and a Height/Hex scope fails a window that
 actually contains the Voxel/Hex edge. `classifyVoxelStack` still returns no
 owner. Surface rays are not this contract.

@@ -49,12 +49,12 @@ were observed in this settled route.
 
 ## Remaining Work
 
-The unscoped union is intentionally conservative and can include a Height/Voxel
-edge. That edge still fails the whole window and is not omitted. A resident
-Voxel/Hex pair window contains the shared edge. Discovery returns it, and the
-published column on the edge is `UnsupportedVoxel` with no owner. A Height/Hex
-scope fails that same window instead of dropping the edge. The native policy
-gate hashes `voxel_hex_column.csv` with the existing residency CSV and 44
-sweep presents. Continuous camera movement,
+The unscoped resident union returns a Height/Voxel edge that lies inside it.
+The published column on that edge is `UnsupportedVoxel` with no owner. A
+resident Voxel/Hex pair window contains the shared edge. Discovery returns
+it, and the published column on the edge is `UnsupportedVoxel` with no owner.
+A Height/Hex scope fails a window that contains either voxel pair instead of
+dropping the edge. The native policy gate hashes `voxel_hex_column.csv` with
+the existing residency CSV and 44 sweep presents. Continuous camera movement,
 accepted world/query publication outside the demo adapter, and integrated
 operation-time budgets remain open. No assets were modified.

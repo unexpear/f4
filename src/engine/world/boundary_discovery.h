@@ -20,16 +20,15 @@ enum class BoundaryDiscoveryError {
     NoResidentCoverage,
 };
 
-// Enumerate Height/Hex and Voxel/Hex ownership edges strictly inside the
-// supplied XZ window, clipped to its tangent range. Split at every region-grid
-// vertex so junctions only meet at endpoints. Deterministic Z/X tile order,
-// X edge first. An empty success means no such edge INSIDE this window, not
-// source coverage. This pure snapshot operation neither examines residency nor
-// selects a view. Any other policy pair inside the window, including
-// Height/Voxel, fails the entire result and is never omitted. A scope
-// enumerates only that pair and fails the window if the other enumerated pair
-// is inside it. It does not omit that edge, and it is not coverage outside
-// the window. A returned Voxel/Hex edge is not a voxel column owner.
+// Enumerate Height/Hex, Voxel/Hex, and Height/Voxel ownership edges strictly
+// inside the supplied XZ window, clipped to its tangent range. Split at every
+// region-grid vertex so junctions only meet at endpoints. Deterministic Z/X
+// tile order, X edge first. An empty success means no such edge INSIDE this
+// window, not source coverage. This pure snapshot operation neither examines
+// residency nor selects a view. A scope enumerates only that pair and fails
+// the window if another enumerated pair is inside it. It does not omit that
+// edge, and it is not coverage outside the window. A returned edge that
+// touches Voxel is not by itself a voxel column owner.
 [[nodiscard]] auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint window,
                                             BoundaryDiscoveryLimits limits = {},
                                             std::optional<std::pair<PolicyKind, PolicyKind>> scope = {})

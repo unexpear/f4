@@ -633,9 +633,9 @@ public:
             "Height/Hex scope omitted the voxel/hex edge");
         const auto full = world_->residentTerrainFootprint();
         require(full.has_value(), "Resident world has no footprint");
-        require(world::discoverTerrainBoundaries(world_->regions(), *full).error() ==
-                world::BoundaryDiscoveryError::UnsupportedTransition,
-            "Full resident union omitted an unsupported edge");
+        const auto unionEdges = world::discoverTerrainBoundaries(world_->regions(), *full);
+        require(unionEdges.hasValue() && !unionEdges.value().empty(),
+            "Full resident union dropped an edge");
         std::ofstream csv(output_ / "voxel_hex_column.csv");
         csv.precision(17);
         csv << "record,axis,plane,begin,end,negative,positive,sample_x,sample_z,sample_y,status\n";
@@ -662,7 +662,29 @@ public:
                 << sampleX << ',' << sampleZ << ",-8,UnsupportedVoxel\n";
         }
         require(sawPlane, "Resident voxel/hex edge at x=0 was not inside the window");
-        csv << "union,,,,,,," << full->minX << ',' << full->minZ << ",,UnsupportedTransition\n";
+        bool sawHeightVoxel = false;
+        for (const auto& edge : unionEdges.value()) {
+            const bool heightVoxel = (edge.negative == world::PolicyKind::Height && edge.positive == world::PolicyKind::Voxel) ||
+                                     (edge.negative == world::PolicyKind::Voxel && edge.positive == world::PolicyKind::Height);
+            if (!heightVoxel) continue;
+            const bool contains = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? full->minX < edge.line.plane && full->maxX > edge.line.plane
+                : full->minZ < edge.line.plane && full->maxZ > edge.line.plane;
+            require(contains, "Height/Voxel edge fell outside the resident union");
+            sawHeightVoxel = true;
+            const double sampleX = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
+            const double sampleZ = edge.line.axis == world::TerrainBoundaryAxis::Z
+                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
+            const auto sample = world_->classifyPublishedSolid(sampleX, -8.0, sampleZ);
+            require(!sample.hasValue() && sample.error() == world::StreamingSolidError::UnsupportedVoxel,
+                "Height/Voxel column invented an owner");
+            csv << "height_voxel," << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
+                << edge.line.begin << ',' << edge.line.end << ','
+                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
+                << sampleX << ',' << sampleZ << ",-8,UnsupportedVoxel\n";
+        }
+        require(sawHeightVoxel, "Resident union did not return a Height/Voxel edge");
         csv.flush();
         require(csv.good(), "Cannot write voxel/hex column evidence");
     }

@@ -284,7 +284,27 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
     const auto full = world.residentTerrainFootprint();
     REQUIRE(full.has_value());
     const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
-    CHECK(discoverTerrainBoundaries(world.regions(), *full).error() == BoundaryDiscoveryError::UnsupportedTransition);
+    const auto fullEdges = discoverTerrainBoundaries(world.regions(), *full);
+    REQUIRE(fullEdges.hasValue());
+    const StreamingBoundaryRequest* heightVoxel = nullptr;
+    for (const auto& edge : fullEdges.value()) {
+        const bool pair = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                          (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        if (!pair) continue;
+        const bool inside = edge.line.axis == TerrainBoundaryAxis::X
+            ? full->minX < edge.line.plane && full->maxX > edge.line.plane
+            : full->minZ < edge.line.plane && full->maxZ > edge.line.plane;
+        CHECK(inside);
+        if (heightVoxel == nullptr) heightVoxel = &edge;
+    }
+    REQUIRE(heightVoxel != nullptr);
+    const double heightVoxelTangent = (heightVoxel->line.begin + heightVoxel->line.end) * 0.5;
+    const double heightVoxelX = heightVoxel->line.axis == TerrainBoundaryAxis::X
+        ? heightVoxel->line.plane : heightVoxelTangent;
+    const double heightVoxelZ = heightVoxel->line.axis == TerrainBoundaryAxis::Z
+        ? heightVoxel->line.plane : heightVoxelTangent;
+    CHECK(world.classifyPublishedSolid(heightVoxelX, -8.0, heightVoxelZ).error() ==
+          StreamingSolidError::UnsupportedVoxel);
     CHECK(discoverTerrainBoundaries(world.regions(), *full, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
     const auto voxelHexMesh = world.residentTerrainFootprint(PolicyKind::Voxel, PolicyKind::Hex);
@@ -313,14 +333,26 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
     REQUIRE(scoped.has_value());
     const TerrainFootprint containingVoxel{std::min(scoped->minX, -32.0), std::max(scoped->maxX, 96.0),
                                            std::min(scoped->minZ, 0.0), std::max(scoped->maxZ, 64.0)};
-    CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel).error() ==
-          BoundaryDiscoveryError::UnsupportedTransition);
+    const auto containingEdges = discoverTerrainBoundaries(world.regions(), containingVoxel);
+    REQUIRE(containingEdges.hasValue());
+    const bool containingHeightVoxel = std::any_of(containingEdges.value().begin(), containingEdges.value().end(),
+        [](const StreamingBoundaryRequest& edge) {
+            return (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                   (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        });
+    CHECK(containingHeightVoxel);
     CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
     const auto unscopedResident = discoverTerrainBoundaries(world.regions(), *scoped);
     const auto residentScoped = discoverTerrainBoundaries(world.regions(), *scoped, {}, scope);
-    if (!unscopedResident.hasValue()) {
-        CHECK(unscopedResident.error() == BoundaryDiscoveryError::UnsupportedTransition);
+    REQUIRE(unscopedResident.hasValue());
+    bool foreign = false;
+    for (const auto& edge : unscopedResident.value()) {
+        const bool heightHex = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Hex) ||
+                               (edge.negative == PolicyKind::Hex && edge.positive == PolicyKind::Height);
+        if (!heightHex) foreign = true;
+    }
+    if (foreign) {
         REQUIRE_FALSE(residentScoped.hasValue());
         CHECK(residentScoped.error() == BoundaryDiscoveryError::UnsupportedTransition);
     } else {

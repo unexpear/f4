@@ -71,9 +71,17 @@ TEST_CASE("Composed jobs: discovered windows retain queued work and fail closed"
     // Reject even an unrelated unsupported edge in the selected window. It
     // must not silently return the earlier valid subset or retire the view.
     world.regions().set({1, 0}, PolicyKind::Voxel);
-    CHECK(job.requestWindow(world.regions(), {0, 96, 0, 96}) == BoundaryDiscoveryError::UnsupportedTransition);
+    const auto returned = discoverTerrainBoundaries(world.regions(), {0, 96, 0, 96});
+    REQUIRE(returned);
+    const bool returnedHeightVoxel = std::any_of(returned.value().begin(), returned.value().end(),
+        [](const StreamingBoundaryRequest& edge) {
+            return (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                   (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        });
+    CHECK(returnedHeightVoxel);
+    CHECK_FALSE(job.requestWindow(world.regions(), {0, 96, 0, 96}));
     CHECK(job.update(world).state == BoundaryCompositionState::Failed);
-    CHECK(job.status().discoveryError == BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(job.status().captureError == StreamingBoundaryError::InvalidBoundary);
     CHECK_FALSE(job.result(world));
     REQUIRE_FALSE(job.requestWindow(world.regions(), {512, 608, 512, 608}));
     CHECK(job.update(world).state == BoundaryCompositionState::NoBoundaries);

@@ -24,8 +24,14 @@ auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint f, Bou
         return (a == PolicyKind::Voxel && b == PolicyKind::Hex) ||
                (a == PolicyKind::Hex && b == PolicyKind::Voxel);
     };
-    if (scope && (scope->first == scope->second ||
-                  !(heightHex(scope->first, scope->second) || voxelHex(scope->first, scope->second))))
+    const auto heightVoxel = [](PolicyKind a, PolicyKind b) {
+        return (a == PolicyKind::Height && b == PolicyKind::Voxel) ||
+               (a == PolicyKind::Voxel && b == PolicyKind::Height);
+    };
+    const auto enumerated = [&](PolicyKind a, PolicyKind b) {
+        return heightHex(a, b) || voxelHex(a, b) || heightVoxel(a, b);
+    };
+    if (scope && (scope->first == scope->second || !enumerated(scope->first, scope->second)))
         return BoundaryDiscoveryError::UnsupportedTransition;
     const auto extent = regions.tileExtentMeters();
     const auto regionAt = [extent](double coordinate) {
@@ -51,7 +57,7 @@ auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint f, Bou
     const auto append = [&](TerrainBoundaryLine line, PolicyKind negative, PolicyKind positive)
         -> std::optional<BoundaryDiscoveryError> {
         if (negative == positive) return {};
-        if (!heightHex(negative, positive) && !voxelHex(negative, positive))
+        if (!enumerated(negative, positive))
             return BoundaryDiscoveryError::UnsupportedTransition;
         // A scope does not drop the other enumerated pair. The window fails.
         if (scope && !((negative == scope->first && positive == scope->second) ||
