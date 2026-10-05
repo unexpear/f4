@@ -24,10 +24,12 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    selection are implemented. A Height/Hex scope still derives its active
    window from current camera-selected residency and clipped published meshes.
    An unscoped window that contains a Height/Voxel edge returns that edge.
-   The published column on the edge is `UnsupportedVoxel` with no owner. A
-   Height/Hex scope of a window that also contains that edge fails instead of
+   A sample inside one face of that edge is owned by Height below the voxel
+   floor. A cell corner where the published tops disagree is `AmbiguousSurface`.
+   A Height/Hex scope of a window that also contains that edge fails instead of
    dropping it. A resident Voxel/Hex window contains that edge. Discovery
-   returns it, and its published column is `UnsupportedVoxel` with no owner.
+   returns it. On the hex floor the column is Hex, and inside the taller voxel
+   span it is Voxel.
    A Height/Hex scope fails that window instead of dropping the edge. Scoped
    resident composition still submits the Height/Hex pair-adjacency rectangle
    for the corner sweep. The full resident union returns its Height/Voxel
@@ -59,8 +61,10 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    Height/Hex classifier on published columns, including boundary planes and
    corners. An interior voxel column is owned from retained horizontal faces:
    a solid span, an empty span, and a cave or overhang the published stack
-   contains. A region plane or corner that touches Voxel stays
-   `UnsupportedVoxel` with no owner.
+   contains. A single region plane with Voxel on one side is owned from those
+   spans and the other side's upward top when the faces agree. A cell corner
+   where adjacent tops disagree is `AmbiguousSurface`. A corner that touches
+   Voxel stays `UnsupportedVoxel` with no owner.
 5. Moving coverage: test continuous camera/residency changes, edits, region changes,
    stale jobs and source arrivals/unloads. The resident-scope controller now has a
    focused queued-retarget regression across three outbound and two return
@@ -128,8 +132,10 @@ until republication, camera travel that keeps then drops a resident column, a
 region change that does not keep the previous owner, hex floor closure, a
 published voxel column that owns a solid span, the air above it, and an
 overhang punched through the retained mesh, and Height/Hex boundary agreement
-with the reference classifier. The Voxel/Hex plane sample stays
-`UnsupportedVoxel`. M16 remains partial.
+with the reference classifier. Voxel/Hex and Height/Voxel plane samples are
+owned from the published faces when those faces agree, and
+`AmbiguousSurface` when adjacent tops disagree. A corner that touches Voxel
+stays `UnsupportedVoxel`. M16 remains partial.
 
 [Bounded boundary discovery](boundary-discovery.md) adds ownership-driven request
 selection within caller-supplied windows. [Resident reuse](boundary-resident-reuse.md)

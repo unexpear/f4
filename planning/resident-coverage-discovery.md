@@ -50,9 +50,11 @@ were observed in this settled route.
 ## Remaining Work
 
 The unscoped resident union returns a Height/Voxel edge that lies inside it.
-The published column on that edge is `UnsupportedVoxel` with no owner. A
-resident Voxel/Hex pair window contains the shared edge. Discovery returns
-it, and the published column on the edge is `UnsupportedVoxel` with no owner.
+A sample inside one published face of that edge is owned by Height below the
+voxel floor. A cell corner where adjacent tops disagree is `AmbiguousSurface`.
+A resident Voxel/Hex pair window contains the shared edge. Discovery returns
+it. On the hex floor the published column is Hex. Inside the taller voxel
+span it is Voxel.
 A Height/Hex scope fails a window that contains either voxel pair instead of
 dropping the edge. The native policy gate hashes `voxel_hex_column.csv` with
 the existing residency CSV and 44 sweep presents. Continuous camera movement,

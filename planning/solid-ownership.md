@@ -4,8 +4,10 @@ Reference volume contract for the boundary and corner columns this tree can
 already describe. M16 stays partial. `WorldStreamer::classifyPublishedSolid`
 uses this contract for published Height/Hex columns and for interior voxel
 columns read from retained horizontal mesh faces. It does not change voxel
-DDA or bilinear height sampling. A region plane that touches Voxel still has
-no owner.
+DDA or bilinear height sampling. A single region plane with Voxel on one side
+is owned from those spans and the other side's upward top when the faces
+agree. A cell corner where they disagree is `AmbiguousSurface`. A corner that
+touches Voxel still has no owner.
 
 ## Contract
 
@@ -64,8 +66,14 @@ closes a solid run and a downward face opens the next one. Solid runs are
 owned by Voxel. Air in the same column is an empty Voxel sample, including
 the gap punched through a published stack. A face stack that does not close,
 or two columns that disagree on a shared edge, stays unpublished or
-ambiguous. A region plane or corner that touches Voxel, including the
-resident Voxel/Hex edge, stays `UnsupportedVoxel` with no owner.
+ambiguous. A single region plane with Voxel on one side uses that side's
+published horizontal spans against the other side's upward top. The greatest
+containing top owns the sample. A point below the voxel floor and inside the
+Height column or Hex prism is that other side. A point inside a voxel span
+whose top is greater is Voxel, including the wall band above the shorter top.
+Air above both is an empty success. A cell corner whose adjacent tops disagree
+is `AmbiguousSurface`. Missing faces are `NoPublishedSurface`. A corner that
+touches Voxel stays `UnsupportedVoxel`.
 `classifyVoxelStack` is unchanged.
 
 ## Still Open
@@ -81,10 +89,12 @@ ticks. The present uses the view already installed for that tick. It does not
 advance world admission or the wall-clock upload budget. That verify path uses
 fixed work-unit admission (per-frame count caps), not a hard realtime deadline.
 Interactive pacing is unchanged. Discovery returns a Voxel/Hex edge that is inside the window. The published
-column on that edge is `UnsupportedVoxel` and has no owner, because the sample
-is on the region plane rather than inside one voxel cell. An unscoped
-resident window that contains a Height/Voxel edge returns that edge. The
-published column on it is `UnsupportedVoxel` with no owner. A Height/Hex
+column on that edge is owned when the published faces agree. On the hex
+floor the owner is Hex. Inside the taller voxel span the owner is Voxel.
+An unscoped resident window that contains a Height/Voxel edge returns that
+edge. A sample inside one face of that edge is owned by Height below the
+voxel floor. A cell corner where adjacent tops disagree is
+`AmbiguousSurface` and is not given an owner. A Height/Hex
 scope of that window fails instead of dropping the edge. The full resident
 union returns the edge. Scoped Height/Hex composition keeps the
 pair-adjacency rectangle, and a Height/Hex scope fails a window that

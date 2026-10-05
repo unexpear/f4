@@ -380,7 +380,10 @@ public:
     // uses classifyTerrainCornerSolid. An interior voxel sample walks the
     // horizontal faces of the retained published meshes: each closed solid
     // run is owned by Voxel, and air in that column is an empty Voxel sample.
-    // A region plane or corner that touches Voxel stays UnsupportedVoxel.
+    // A single region plane with Voxel on one side uses those spans against
+    // the other side's upward top (classifyVoxelPlaneSolid). Disagreeing or
+    // missing faces at that point are AmbiguousSurface or NoPublishedSurface.
+    // A corner that touches Voxel stays UnsupportedVoxel.
     // Does not change raycastVoxelTerrain, sampleHeightTerrain, or voxel DDA.
     // Uses the retained published mesh, including while a remesh is in flight.
     // A Height or Hex non-solid success leaves policy at Height and sector at 0.

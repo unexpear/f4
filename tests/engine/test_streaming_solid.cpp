@@ -298,13 +298,35 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
         if (heightVoxel == nullptr) heightVoxel = &edge;
     }
     REQUIRE(heightVoxel != nullptr);
-    const double heightVoxelTangent = (heightVoxel->line.begin + heightVoxel->line.end) * 0.5;
-    const double heightVoxelX = heightVoxel->line.axis == TerrainBoundaryAxis::X
-        ? heightVoxel->line.plane : heightVoxelTangent;
-    const double heightVoxelZ = heightVoxel->line.axis == TerrainBoundaryAxis::Z
-        ? heightVoxel->line.plane : heightVoxelTangent;
-    CHECK(world.classifyPublishedSolid(heightVoxelX, -8.0, heightVoxelZ).error() ==
-          StreamingSolidError::UnsupportedVoxel);
+    const auto expectSolid = [&](double sx, double sy, double sz, PolicyKind policy, std::uint8_t sector) {
+        const auto sample = world.classifyPublishedSolid(sx, sy, sz);
+        REQUIRE(sample.hasValue());
+        CHECK(sample.value().solid);
+        CHECK(sample.value().policy == policy);
+        CHECK(sample.value().sector == sector);
+        CHECK_FALSE(sample.value().wallBand);
+    };
+    for (const auto& edge : fullEdges.value()) {
+        const bool pair = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                          (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        if (!pair) continue;
+        const double mid = (edge.line.begin + edge.line.end) * 0.5;
+        const double face = mid + 0.5;
+        const auto point = [&](double tangent) {
+            return edge.line.axis == TerrainBoundaryAxis::X
+                ? std::pair{edge.line.plane, tangent} : std::pair{tangent, edge.line.plane};
+        };
+        const auto midpoint = point(mid);
+        const auto interior = point(face);
+        const std::uint8_t sector = edge.negative == PolicyKind::Height ? 0 : 1;
+        expectSolid(midpoint.first, -8.0, midpoint.second, PolicyKind::Height, sector);
+        expectSolid(interior.first, -8.0, interior.second, PolicyKind::Height, sector);
+        expectSolid(interior.first, 1.0, interior.second, PolicyKind::Height, sector);
+        const auto sky = world.classifyPublishedSolid(interior.first, 80.0, interior.second);
+        REQUIRE(sky.hasValue());
+        CHECK_FALSE(sky.value().solid);
+    }
+    CHECK(world.classifyPublishedSolid(0.0, -8.0, 0.0).error() == StreamingSolidError::UnsupportedVoxel);
     CHECK(discoverTerrainBoundaries(world.regions(), *full, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
     const auto voxelHexMesh = world.residentTerrainFootprint(PolicyKind::Voxel, PolicyKind::Hex);
@@ -325,8 +347,12 @@ TEST_CASE("Streaming solid: height/hex boundary and corner agree with the refere
     CHECK(voxelHexWindow.minX < voxelEdge->line.plane);
     CHECK(voxelHexWindow.maxX > voxelEdge->line.plane);
     const double voxelTangent = (voxelEdge->line.begin + voxelEdge->line.end) * 0.5;
-    CHECK(world.classifyPublishedSolid(voxelEdge->line.plane, 0.0, voxelTangent).error() ==
-          StreamingSolidError::UnsupportedVoxel);
+    expectSolid(voxelEdge->line.plane, -8.0, voxelTangent, PolicyKind::Hex, 1);
+    expectSolid(voxelEdge->line.plane, -8.0, voxelTangent + 0.5, PolicyKind::Hex, 1);
+    expectSolid(voxelEdge->line.plane, 1.0, voxelTangent + 0.5, PolicyKind::Voxel, 0);
+    const auto voxelSky = world.classifyPublishedSolid(voxelEdge->line.plane, 80.0, voxelTangent + 0.5);
+    REQUIRE(voxelSky.hasValue());
+    CHECK_FALSE(voxelSky.value().solid);
     CHECK(discoverTerrainBoundaries(world.regions(), voxelHexWindow, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
     const auto scoped = world.residentTerrainFootprint(PolicyKind::Height, PolicyKind::Hex);

@@ -1405,7 +1405,14 @@ public:
 
     [[nodiscard]] auto classifyPublishedSolid(double x, double y, double z) const
         -> Result<TerrainSolidSample, StreamingSolidError>;
+    [[nodiscard]] auto collectPublishedVoxelSpans(double x, double z, bool missingIsError) const
+        -> Result<std::vector<VoxelSolidSpan>, StreamingSolidError>;
+    [[nodiscard]] auto uniquePublishedTop(PolicyKind policy, double x, double z) const
+        -> Result<double, StreamingSolidError>;
     [[nodiscard]] auto classifyPublishedVoxelColumn(double x, double y, double z) const
+        -> Result<TerrainSolidSample, StreamingSolidError>;
+    [[nodiscard]] auto classifyPublishedVoxelPlane(double x, double y, double z, PolicyKind negative,
+                                                  PolicyKind positive) const
         -> Result<TerrainSolidSample, StreamingSolidError>;
 
     auto boundarySourceReady(StreamingChunkKey key, const Entry& entry) const -> bool {
@@ -1771,8 +1778,8 @@ auto WorldStreamer::raycastVoxelTerrain(math::Vec3 origin, math::Vec3 direction,
         });
 }
 
-auto WorldStreamer::Impl::classifyPublishedVoxelColumn(double x, double y, double z) const
-    -> Result<TerrainSolidSample, StreamingSolidError> {
+auto WorldStreamer::Impl::collectPublishedVoxelSpans(double x, double z, bool missingIsError) const
+    -> Result<std::vector<VoxelSolidSpan>, StreamingSolidError> {
     struct Event { double y; bool solidBelow; };
     std::vector<Event> events;
     bool covered = false;
@@ -1809,8 +1816,8 @@ auto WorldStreamer::Impl::classifyPublishedVoxelColumn(double x, double y, doubl
         }
     }
     if (events.empty()) {
-        if (!covered) return StreamingSolidError::NoPublishedSurface;
-        return solidResult(classifyVoxelColumn({}, y));
+        if (missingIsError || !covered) return StreamingSolidError::NoPublishedSurface;
+        return std::vector<VoxelSolidSpan>{};
     }
     std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
         if (a.y != b.y) return a.y < b.y;
@@ -1833,13 +1840,76 @@ auto WorldStreamer::Impl::classifyPublishedVoxelColumn(double x, double y, doubl
             floor = event.y;
             continue;
         }
-        if (!floor) return StreamingSolidError::NoPublishedSurface;
+        if (!floor) return missingIsError ? StreamingSolidError::AmbiguousSurface : StreamingSolidError::NoPublishedSurface;
         if (!(event.y > *floor)) return StreamingSolidError::InvalidData;
         spans.push_back({*floor, event.y});
         floor.reset();
     }
     if (floor) return StreamingSolidError::NoPublishedSurface;
-    return solidResult(classifyVoxelColumn(spans, y));
+    return spans;
+}
+
+auto WorldStreamer::Impl::uniquePublishedTop(PolicyKind policy, double x, double z) const
+    -> Result<double, StreamingSolidError> {
+    std::optional<double> top;
+    for (const auto& [key, entry] : entries_) {
+        if (key.policy != policy || !entry.mesh) continue;
+        const math::Vec3 origin = config_.regionalSurfaceOwnership && key.policy == PolicyKind::Hex
+            ? math::Vec3{} : terrainOrigin(key, config_);
+        const MeshData& mesh = *entry.mesh;
+        if (mesh.indices.size() % 3 != 0) return StreamingSolidError::InvalidData;
+        for (std::size_t index = 0; index < mesh.indices.size(); index += 3) {
+            std::array<TerrainTopSample, 3> samples;
+            for (int corner = 0; corner < 3; ++corner) {
+                const auto vertex = mesh.indices[index + static_cast<std::size_t>(corner)];
+                if (vertex >= mesh.vertices.size()) return StreamingSolidError::InvalidData;
+                const auto& position = mesh.vertices[vertex].position;
+                samples[static_cast<std::size_t>(corner)] = {
+                    double(position.x) + origin.x, double(position.y) + origin.y, double(position.z) + origin.z};
+            }
+            const double area = (samples[1].z - samples[0].z) * (samples[2].x - samples[0].x) -
+                                (samples[1].x - samples[0].x) * (samples[2].z - samples[0].z);
+            if (!(area > 0.0)) continue;
+            const auto signedArea = [](double px, double pz, const TerrainTopSample& q, const TerrainTopSample& r) {
+                return (q.z - pz) * (r.x - px) - (q.x - px) * (r.z - pz);
+            };
+            if (signedArea(x, z, samples[1], samples[2]) < 0.0 || signedArea(x, z, samples[2], samples[0]) < 0.0 ||
+                signedArea(x, z, samples[0], samples[1]) < 0.0) {
+                continue;
+            }
+            const auto sampled = sampleUpwardTriangleHeight(samples[0], samples[1], samples[2], x, z);
+            if (!sampled) return mapSolidError(sampled.error());
+            if (top && *top != sampled.value()) return StreamingSolidError::AmbiguousSurface;
+            top = sampled.value();
+        }
+    }
+    if (!top) return StreamingSolidError::NoPublishedSurface;
+    return *top;
+}
+
+auto WorldStreamer::Impl::classifyPublishedVoxelColumn(double x, double y, double z) const
+    -> Result<TerrainSolidSample, StreamingSolidError> {
+    const auto spans = collectPublishedVoxelSpans(x, z, false);
+    if (!spans) return spans.error();
+    return solidResult(classifyVoxelColumn(spans.value(), y));
+}
+
+auto WorldStreamer::Impl::classifyPublishedVoxelPlane(double x, double y, double z, PolicyKind negative,
+                                                     PolicyKind positive) const
+    -> Result<TerrainSolidSample, StreamingSolidError> {
+    const bool voxelNegative = negative == PolicyKind::Voxel;
+    const PolicyKind other = voxelNegative ? positive : negative;
+    const auto spans = collectPublishedVoxelSpans(x, z, true);
+    if (!spans) return spans.error();
+    const auto top = uniquePublishedTop(other, x, z);
+    if (!top) return top.error();
+    std::optional<double> floor;
+    if (other == PolicyKind::Hex) {
+        if (!std::isfinite(config_.hexFloorHeight)) return StreamingSolidError::InvalidData;
+        floor = double(config_.hexFloorHeight);
+    }
+    return solidResult(classifyVoxelPlaneSolid(
+        VoxelPlaneSolidQuery{voxelNegative, spans.value(), other, top.value(), floor}, y));
 }
 
 auto WorldStreamer::Impl::classifyPublishedSolid(double x, double y, double z) const
@@ -1885,7 +1955,9 @@ auto WorldStreamer::Impl::classifyPublishedSolid(double x, double y, double z) c
             positive = policyOf(*tangent, *plane);
         }
         if (negative == PolicyKind::Voxel || positive == PolicyKind::Voxel) {
-            return StreamingSolidError::UnsupportedVoxel;
+            if (negative == PolicyKind::Voxel && positive == PolicyKind::Voxel)
+                return classifyPublishedVoxelColumn(x, y, z);
+            return classifyPublishedVoxelPlane(x, y, z, negative, positive);
         }
     } else {
         const auto ix = narrowFloor(x);

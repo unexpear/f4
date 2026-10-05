@@ -639,6 +639,33 @@ public:
         std::ofstream csv(output_ / "voxel_hex_column.csv");
         csv.precision(17);
         csv << "record,axis,plane,begin,end,negative,positive,sample_x,sample_z,sample_y,status\n";
+        const auto solidStatus = [](const f4::Result<world::TerrainSolidSample, world::StreamingSolidError>& sample) {
+            if (!sample.hasValue()) {
+                switch (sample.error()) {
+                case world::StreamingSolidError::AmbiguousSurface: return std::string("AmbiguousSurface");
+                case world::StreamingSolidError::NoPublishedSurface: return std::string("NoPublishedSurface");
+                case world::StreamingSolidError::InvalidData: return std::string("InvalidData");
+                case world::StreamingSolidError::DiscontinuousHeight: return std::string("DiscontinuousHeight");
+                case world::StreamingSolidError::NonmanifoldCorner: return std::string("NonmanifoldCorner");
+                case world::StreamingSolidError::UnsupportedVoxel: return std::string("UnsupportedVoxel");
+                default: return std::string("error");
+                }
+            }
+            if (!sample.value().solid) return std::string("empty");
+            return std::string("solid,") + std::to_string(static_cast<unsigned>(sample.value().policy)) + ',' +
+                   std::to_string(sample.value().sector) + ',' + (sample.value().wallBand ? "1" : "0");
+        };
+        const auto writeColumn = [&](const char* record, const world::StreamingBoundaryRequest& edge,
+                                      double sampleX, double sampleZ, double sampleY) {
+            const auto sample = world_->classifyPublishedSolid(sampleX, sampleY, sampleZ);
+            require(sample.hasValue() || sample.error() != world::StreamingSolidError::UnsupportedVoxel,
+                "Plane column stayed a blanket UnsupportedVoxel");
+            csv << record << ',' << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
+                << edge.line.begin << ',' << edge.line.end << ','
+                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
+                << sampleX << ',' << sampleZ << ',' << sampleY << ',' << solidStatus(sample) << '\n';
+            return sample;
+        };
         bool sawPlane = false;
         for (const auto& edge : edges.value()) {
             const bool voxelHex = (edge.negative == world::PolicyKind::Voxel && edge.positive == world::PolicyKind::Hex) ||
@@ -649,17 +676,26 @@ public:
                 : window.minZ < edge.line.plane && window.maxZ > edge.line.plane;
             require(contains, "Voxel/Hex edge fell outside its window");
             if (edge.line.axis == world::TerrainBoundaryAxis::X && edge.line.plane == 0.0) sawPlane = true;
-            const double sampleX = edge.line.axis == world::TerrainBoundaryAxis::X
-                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
-            const double sampleZ = edge.line.axis == world::TerrainBoundaryAxis::Z
-                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
-            const auto sample = world_->classifyPublishedSolid(sampleX, -8.0, sampleZ);
-            require(!sample.hasValue() && sample.error() == world::StreamingSolidError::UnsupportedVoxel,
-                "Voxel/Hex column returned an owner");
-            csv << "edge," << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
-                << edge.line.begin << ',' << edge.line.end << ','
-                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
-                << sampleX << ',' << sampleZ << ",-8,UnsupportedVoxel\n";
+            const double mid = (edge.line.begin + edge.line.end) * 0.5;
+            const auto at = [&](double tangent) {
+                return edge.line.axis == world::TerrainBoundaryAxis::X
+                    ? std::pair{edge.line.plane, tangent} : std::pair{tangent, edge.line.plane};
+            };
+            const auto midpoint = at(mid);
+            const auto interior = at(mid + 0.5);
+            const auto below = writeColumn("edge", edge, midpoint.first, midpoint.second, -8.0);
+            const std::uint8_t sector = edge.positive == world::PolicyKind::Hex ? 1 : 0;
+            require(below.hasValue() && below.value().solid && below.value().policy == world::PolicyKind::Hex &&
+                    below.value().sector == sector && !below.value().wallBand,
+                "Voxel/Hex column on the hex floor is not the hex side");
+            if (edge.line.axis == world::TerrainBoundaryAxis::X && edge.line.plane == 0.0) {
+                const auto low = writeColumn("edge_face", edge, interior.first, interior.second, 1.0);
+                const bool incident = low.hasValue() && low.value().solid &&
+                    (low.value().policy == world::PolicyKind::Voxel || low.value().policy == world::PolicyKind::Hex);
+                require(incident, "Voxel/Hex face column has no incident owner");
+                const auto sky = writeColumn("edge_sky", edge, interior.first, interior.second, 80.0);
+                require(sky.hasValue() && !sky.value().solid, "Voxel/Hex sky invented a solid owner");
+            }
         }
         require(sawPlane, "Resident voxel/hex edge at x=0 was not inside the window");
         bool sawHeightVoxel = false;
@@ -672,17 +708,34 @@ public:
                 : full->minZ < edge.line.plane && full->maxZ > edge.line.plane;
             require(contains, "Height/Voxel edge fell outside the resident union");
             sawHeightVoxel = true;
-            const double sampleX = edge.line.axis == world::TerrainBoundaryAxis::X
-                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
-            const double sampleZ = edge.line.axis == world::TerrainBoundaryAxis::Z
-                ? edge.line.plane : (edge.line.begin + edge.line.end) * 0.5;
-            const auto sample = world_->classifyPublishedSolid(sampleX, -8.0, sampleZ);
-            require(!sample.hasValue() && sample.error() == world::StreamingSolidError::UnsupportedVoxel,
-                "Height/Voxel column invented an owner");
-            csv << "height_voxel," << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
-                << edge.line.begin << ',' << edge.line.end << ','
-                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
-                << sampleX << ',' << sampleZ << ",-8,UnsupportedVoxel\n";
+            const double mid = (edge.line.begin + edge.line.end) * 0.5;
+            const double face = mid + 0.5;
+            const auto at = [&](double tangent) {
+                return edge.line.axis == world::TerrainBoundaryAxis::X
+                    ? std::pair{edge.line.plane, tangent} : std::pair{tangent, edge.line.plane};
+            };
+            const auto midpoint = at(mid);
+            const auto interior = at(face);
+            const auto below = writeColumn("height_voxel", edge, midpoint.first, midpoint.second, -8.0);
+            const std::uint8_t sector = edge.negative == world::PolicyKind::Height ? 0 : 1;
+            if (below.hasValue()) {
+                require(below.value().solid && below.value().policy == world::PolicyKind::Height &&
+                        below.value().sector == sector && !below.value().wallBand,
+                    "Height/Voxel column below the voxel floor is not the height side");
+            } else {
+                require(below.error() == world::StreamingSolidError::AmbiguousSurface,
+                    "Height/Voxel corner refused without naming the disagreeing faces");
+            }
+            const auto belowFace = writeColumn("height_voxel_below", edge, interior.first, interior.second, -8.0);
+            require(belowFace.hasValue() && belowFace.value().solid && belowFace.value().policy == world::PolicyKind::Height &&
+                    belowFace.value().sector == sector && !belowFace.value().wallBand,
+                "Height/Voxel face below the voxel floor is not the height side");
+            const auto low = writeColumn("height_voxel_face", edge, interior.first, interior.second, 1.0);
+            const bool incident = low.hasValue() && low.value().solid &&
+                (low.value().policy == world::PolicyKind::Height || low.value().policy == world::PolicyKind::Voxel);
+            require(incident, "Height/Voxel face column has no incident owner");
+            const auto sky = writeColumn("height_voxel_sky", edge, interior.first, interior.second, 80.0);
+            require(sky.hasValue() && !sky.value().solid, "Height/Voxel sky invented a solid owner");
         }
         require(sawHeightVoxel, "Resident union did not return a Height/Voxel edge");
         csv.flush();
