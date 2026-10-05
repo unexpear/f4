@@ -341,7 +341,9 @@ public:
         -> std::optional<ChunkSnapshot>;
     [[nodiscard]] auto stats() const -> StreamingStats;
 
-    // Main-thread reference capture of a uniform Height/Hex region boundary.
+    // Main-thread reference capture of a Height/Hex, Height/Voxel, or Voxel/Hex
+    // region boundary. The snapshot copies published meshes. It does not
+    // generate transition triangles.
     // Requires regionalSurfaceOwnership, an integer region plane, <=4096 tiles,
     // and current published meshes for all resident footprint contributors.
     // Missing residents are recorded by the membership set/profile gaps, not

@@ -96,7 +96,11 @@ edge. A sample inside one face of that edge is owned by Height below the
 voxel floor. A cell corner where adjacent tops disagree is
 `AmbiguousSurface` and is not given an owner. A Height/Hex
 scope of that window fails instead of dropping the edge. The full resident
-union returns the edge. Scoped Height/Hex composition keeps the
+union returns the edge. Capture of a Height/Voxel or Voxel/Hex edge copies
+the published meshes and emits no wall. An isolated edge composes as those
+meshes. A retained edge that shares an endpoint is JunctionRejected, and a
+still-current prior composition is kept. A Height/Hex scope that still
+contains an unsupported corner fails closed. Scoped Height/Hex composition keeps the
 pair-adjacency rectangle, and a Height/Hex scope fails a window that
 actually contains the Voxel/Hex edge. `classifyVoxelStack` still returns no
 owner. Surface rays are not this contract.

@@ -30,6 +30,10 @@ public:
     auto operator=(const BoundaryCompositionJob&) -> BoundaryCompositionJob& = delete;
     // Invalid request counts leave the previous request untouched. Re-requesting
     // an accepted set explicitly retries an unchanged failed build.
+    // Staging a different set keeps a still-current composition. Capture or
+    // build failure of the new set leaves that composition in result() when
+    // boundaryCurrent still holds. Discovery failure, retirement, and clear()
+    // drop it.
     auto request(std::span<const StreamingBoundaryRequest> requests) -> bool;
     // Re-evaluate ownership in a caller-selected window. Repeating an unchanged
     // set preserves queued work and cached failures. Empty success retires;
@@ -66,6 +70,7 @@ private:
     bool retireRequested_ = false;
     std::optional<BoundaryDiscoveryError> discoveryError_;
     std::vector<StreamingBoundaryRequest> requests_;
+    std::vector<StreamingBoundaryRequest> acceptedRequests_;
     std::shared_ptr<Ticket> ticket_;
     std::vector<StreamingBoundarySnapshot> failedInput_;
     std::optional<StreamingBoundaryComposition> result_;

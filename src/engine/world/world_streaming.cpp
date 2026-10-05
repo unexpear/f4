@@ -478,7 +478,9 @@ auto StreamingBoundaryComposition::build(std::span<const StreamingBoundarySnapsh
                 memberships[b][side].push_back(index);
             }
         }
-        requests.push_back({capture.request.line, memberships[b][0], memberships[b][1]});
+        const bool retain = capture.request.negative == PolicyKind::Voxel ||
+                            capture.request.positive == PolicyKind::Voxel;
+        requests.push_back({capture.request.line, memberships[b][0], memberships[b][1], 0, 0, retain});
         data->snapshots.push_back(snapshots[b]);
     }
     auto built = composeTerrainBoundaryReplacements(sources, requests, limits);
@@ -1615,8 +1617,15 @@ auto WorldStreamer::captureBoundary(StreamingBoundaryRequest request, StreamingB
     constexpr double low = std::numeric_limits<std::int32_t>::min();
     constexpr double high = double(std::numeric_limits<std::int32_t>::max()) + 1;
     const auto extent = impl_->regions_.tileExtentMeters();
-    if ((request.negative != PolicyKind::Height || request.positive != PolicyKind::Hex) &&
-        (request.negative != PolicyKind::Hex || request.positive != PolicyKind::Height)) return StreamingBoundaryError::InvalidBoundary;
+    const auto enumerated = [](PolicyKind negative, PolicyKind positive) {
+        const auto pair = [](PolicyKind a, PolicyKind b, PolicyKind first, PolicyKind second) {
+            return (a == first && b == second) || (a == second && b == first);
+        };
+        return pair(negative, positive, PolicyKind::Height, PolicyKind::Hex) ||
+               pair(negative, positive, PolicyKind::Height, PolicyKind::Voxel) ||
+               pair(negative, positive, PolicyKind::Voxel, PolicyKind::Hex);
+    };
+    if (!enumerated(request.negative, request.positive)) return StreamingBoundaryError::InvalidBoundary;
     if ((line.axis != TerrainBoundaryAxis::X && line.axis != TerrainBoundaryAxis::Z) ||
         !std::isfinite(line.plane) || !std::isfinite(line.begin) || !std::isfinite(line.end) ||
         line.plane <= low || line.plane >= high || line.begin < low || line.end > high ||

@@ -33,7 +33,10 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    A Height/Hex scope fails that window instead of dropping the edge. Scoped
    resident composition still submits the Height/Hex pair-adjacency rectangle
    for the corner sweep. The full resident union returns its Height/Voxel
-   edges. Uniform voxel interiors with no inter-policy edge stay an empty
+   edges. Capture of a Height/Voxel or Voxel/Hex edge copies published meshes
+   and emits no wall. An isolated edge composes as those meshes. A retained
+   edge that shares an endpoint is JunctionRejected, and a still-current prior
+   composition is kept. Uniform voxel interiors with no inter-policy edge stay an empty
    success.
    Derive required boundaries from actual region
    ownership and residency, split endpoints/crossings consistently, and
@@ -135,7 +138,9 @@ overhang punched through the retained mesh, and Height/Hex boundary agreement
 with the reference classifier. Voxel/Hex and Height/Voxel plane samples are
 owned from the published faces when those faces agree, and
 `AmbiguousSurface` when adjacent tops disagree. A corner that touches Voxel
-stays `UnsupportedVoxel`. M16 remains partial.
+stays `UnsupportedVoxel`. Capture of an isolated Height/Voxel edge copies the
+published meshes and emits no wall. A retained edge that shares an endpoint is
+`JunctionRejected` and keeps a still-current prior composition. M16 remains partial.
 
 [Bounded boundary discovery](boundary-discovery.md) adds ownership-driven request
 selection within caller-supplied windows. [Resident reuse](boundary-resident-reuse.md)

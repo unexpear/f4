@@ -162,6 +162,14 @@ auto composeTerrainBoundaryReplacements(std::span<const TerrainBoundaryMesh> sou
         }
     }
     if (std::find(used.begin(), used.end(), false) != used.end()) return Error::InvalidData;
+    // A copied voxel boundary has no generated wall, so a shared endpoint cannot
+    // be filled from paired tops. Refuse that corner before any height fill.
+    for (const auto& [point, arms] : endpoints) {
+        (void)point;
+        if (arms.size() < 2) continue;
+        for (const auto& arm : arms)
+            if (boundaries[arm.boundary].retainSources) return Error::JunctionRejected;
+    }
     std::vector<bool> needsEndpoints(boundaries.size());
     for (const auto& [point, arms] : endpoints) {
         if (arms.size() < 2) continue;
@@ -210,6 +218,7 @@ auto composeTerrainBoundaryReplacements(std::span<const TerrainBoundaryMesh> sou
     };
     for (const auto b : order) {
         const auto& request = boundaries[b];
+        if (request.retainSources) continue;
         std::array<std::vector<TerrainBoundaryMesh>, 2> views;
         for (const bool side : {false, true})
             for (const auto s : side ? request.positive : request.negative)
@@ -352,11 +361,23 @@ auto composeTerrainBoundaryReplacements(std::span<const TerrainBoundaryMesh> sou
     };
     for (std::size_t s = 0; s < working.size(); ++s) {
         const auto& source = working[s];
+        const auto origin = source.origin;
+        const bool translate = origin.x != 0.f || origin.y != 0.f || origin.z != 0.f;
         std::size_t surface = 0;
         for (std::size_t i = 0; i < source.originals.size(); ++i) {
             while (i * 3 >= std::size_t(source.mesh.surfaces[surface].firstIndex) + source.mesh.surfaces[surface].indexCount) ++surface;
-            const std::array vertices{source.mesh.vertices[source.mesh.indices[i * 3]],
+            std::array vertices{source.mesh.vertices[source.mesh.indices[i * 3]],
                 source.mesh.vertices[source.mesh.indices[i * 3 + 1]], source.mesh.vertices[source.mesh.indices[i * 3 + 2]]};
+            if (translate) {
+                for (auto& vertex : vertices) {
+                    const std::array<double, 3> world{double(vertex.position.x) + origin.x,
+                        double(vertex.position.y) + origin.y, double(vertex.position.z) + origin.z};
+                    for (const auto coordinate : world)
+                        if (!std::isfinite(coordinate) || std::abs(coordinate) > std::numeric_limits<float>::max() ||
+                            double(static_cast<float>(coordinate)) != coordinate) return Error::PrecisionLoss;
+                    vertex.position = {static_cast<float>(world[0]), static_cast<float>(world[1]), static_cast<float>(world[2])};
+                }
+            }
             if (!append(vertices, source.mesh.surfaces[surface].material, {false, false, s, source.originals[i]}))
                 return Error::LimitExceeded;
         }
