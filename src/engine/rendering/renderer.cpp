@@ -1140,8 +1140,14 @@ auto Renderer::preparePointLightsGpu(const Camera& camera, float aspect) -> bool
                                              pointLightInputs_.size()),
         cameraView(camera), cameraProj(camera, safeAspect), camera.nearPlane, camera.farPlane,
         grid, shadowWords, pointLightWords_, frameBinning_);
-    // Nothing to bin: the CPU path writes the header-only buffer.
+    // Nothing to bin: the CPU path writes the header-only buffer. Grids or
+    // buffers past the 65535-workgroup dispatch limit also bin on the CPU.
     if (frameBinning_.visible == 0) return false;
+    if (std::max(frameBinning_.clusterCount,
+                 (frameBinning_.copyWords + kLightBinningGroupSize - 1u) /
+                     kLightBinningGroupSize) > 65535u) {
+        return false;
+    }
     pointLightsGathered_ = false;
     if (shadowWords != 0) writePointShadowWords(frameBinning_.reservedOffset);
 
@@ -1183,7 +1189,8 @@ void Renderer::recordLightBinning(gfx::CommandBuffer& commandBuffer) {
                                framePointLightInput_.generation);
     commandBuffer.bindResource(1, gfx::BindingType::StorageBuffer, framePointLights_.index,
                                framePointLights_.generation);
-    commandBuffer.dispatch(groups(std::max(p.clusterCount, p.copyWords)));
+    // Workgroup c bins cluster c; every workgroup also copies 64 prefix words.
+    commandBuffer.dispatch(std::max(p.clusterCount, groups(p.copyWords)));
     commandBuffer.bufferBarrier(
         framePointLights_, written,
         {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});

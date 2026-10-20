@@ -12,11 +12,14 @@
 // light lies in cluster (x, y, z) exactly when its bit is set in column x,
 // row y and slice z, so ANDing three mask words tests 32 lights at once.
 //
-// One dispatch: thread i copies prefix word i, and thread c < clusterCount
-// writes cluster c's light list by walking the ANDed mask words lowest bit
-// first, i.e. in ascending light order. The output is word-for-word the CPU
-// layout. One source serves OpenGL (SSBO bindings 0/1) and Vulkan
-// (-DF4_VULKAN=1, storage slots 0/1 flatten to bindings 3/7).
+// One dispatch of max(clusterCount, ceil(copyWords / 64)) workgroups:
+// workgroup g copies prefix words [64g, 64g + 64), and workgroup c <
+// clusterCount writes cluster c's light list. Each lane takes one ANDed mask
+// word, a workgroup prefix sum of the popcounts gives every lane its write
+// position, and lanes write their bits lowest first, so the list is in
+// ascending light order. The output is word-for-word the CPU layout. One
+// source serves OpenGL (SSBO bindings 0/1) and Vulkan (-DF4_VULKAN=1, storage
+// slots 0/1 flatten to bindings 3/7).
 
 #ifdef F4_VULKAN
 layout(set = 0, binding = 0, std140) uniform BinParams {
@@ -38,32 +41,49 @@ layout(std430, binding = 1) writeonly buffer BinOutput { uint words[]; } dst;
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+shared uint sScan[64];
+
 void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (id < params.counts.z) dst.words[id] = src.words[id];
-    uint clusterCount = params.counts.x;
-    if (id >= clusterCount) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint copyWord = group * 64u + lane;
+    if (copyWord < params.counts.z) dst.words[copyWord] = src.words[copyWord];
+    if (group >= params.counts.x) return; // whole workgroup
     uint gridOffset = params.offsets.y;
-    uint first = src.words[gridOffset + id * 2u];
-    uint allowed = src.words[gridOffset + id * 2u + 1u];
-    if (allowed == 0u) return;
+    uint first = src.words[gridOffset + group * 2u];
+    uint allowed = src.words[gridOffset + group * 2u + 1u];
+    if (allowed == 0u) return; // whole workgroup
     uint maskWords = params.counts.w;
     uint tilesX = params.grid.x;
     uint tilesY = params.grid.y;
-    uint x = id % tilesX;
-    uint y = (id / tilesX) % tilesY;
-    uint z = id / (tilesX * tilesY);
+    uint x = group % tilesX;
+    uint y = (group / tilesX) % tilesY;
+    uint z = group / (tilesX * tilesY);
     uint rowX = params.offsets.x + x * maskWords;
     uint rowY = params.offsets.x + (tilesX + y) * maskWords;
     uint rowZ = params.offsets.x + (tilesX + tilesY + z) * maskWords;
-    uint written = 0u;
-    for (uint word = 0u; word < maskWords && written < allowed; ++word) {
-        uint bits = src.words[rowX + word] & src.words[rowY + word] & src.words[rowZ + word];
-        while (bits != 0u && written < allowed) {
-            uint bit = uint(findLSB(bits));
-            dst.words[first + written] = word * 32u + bit;
-            ++written;
+    uint base = 0u;
+    for (uint chunk = 0u; chunk < maskWords && base < allowed; chunk += 64u) {
+        uint word = chunk + lane;
+        uint bits = word < maskWords
+                        ? src.words[rowX + word] & src.words[rowY + word] & src.words[rowZ + word]
+                        : 0u;
+        uint count = uint(bitCount(bits));
+        sScan[lane] = count;
+        barrier();
+        for (uint offset = 1u; offset < 64u; offset <<= 1u) {
+            uint add = lane >= offset ? sScan[lane - offset] : 0u;
+            barrier();
+            sScan[lane] += add;
+            barrier();
+        }
+        uint position = base + sScan[lane] - count;
+        while (bits != 0u && position < allowed) {
+            dst.words[first + position] = word * 32u + uint(findLSB(bits));
+            ++position;
             bits &= bits - 1u;
         }
+        base += sScan[63];
+        barrier();
     }
 }
