@@ -1132,7 +1132,9 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         }
         case CommandKind::SetViewport: {
-            glViewport(0, 0, static_cast<GLsizei>(command.viewport.width),
+            glViewport(static_cast<GLint>(command.viewportX),
+                       static_cast<GLint>(command.viewportY),
+                       static_cast<GLsizei>(command.viewport.width),
                        static_cast<GLsizei>(command.viewport.height));
             break;
         }
@@ -1141,7 +1143,8 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 glEnable(GL_SCISSOR_TEST);
                 impl_->glScissorTest_ = true;
             }
-            glScissor(0, 0, static_cast<GLsizei>(command.scissor.width),
+            glScissor(static_cast<GLint>(command.scissorX), static_cast<GLint>(command.scissorY),
+                      static_cast<GLsizei>(command.scissor.width),
                       static_cast<GLsizei>(command.scissor.height));
             break;
         }

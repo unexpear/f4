@@ -1527,7 +1527,9 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
         case CommandKind::SetViewport:
             if (renderPass == nullptr || command.viewport.width == 0 ||
                 command.viewport.height == 0) error = GfxError::BadDescriptor;
-            else wgpuRenderPassEncoderSetViewport(renderPass, 0.0f, 0.0f,
+            else wgpuRenderPassEncoderSetViewport(renderPass,
+                                                  static_cast<float>(command.viewportX),
+                                                  static_cast<float>(command.viewportY),
                                                   static_cast<float>(command.viewport.width),
                                                   static_cast<float>(command.viewport.height),
                                                   0.0f, 1.0f);
@@ -1535,7 +1537,8 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
         case CommandKind::SetScissor:
             if (renderPass == nullptr || command.scissor.width == 0 ||
                 command.scissor.height == 0) error = GfxError::BadDescriptor;
-            else wgpuRenderPassEncoderSetScissorRect(renderPass, 0, 0, command.scissor.width,
+            else wgpuRenderPassEncoderSetScissorRect(renderPass, command.scissorX,
+                                                     command.scissorY, command.scissor.width,
                                                      command.scissor.height);
             break;
         case CommandKind::Draw:

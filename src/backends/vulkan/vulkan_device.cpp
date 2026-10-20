@@ -2494,7 +2494,10 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
                 break;
             }
             VkViewport viewport{};
-            viewport.y = static_cast<float>(command.viewport.height);
+            // Negative height keeps NDC +Y at the rectangle's first row.
+            viewport.x = static_cast<float>(command.viewportX);
+            viewport.y = static_cast<float>(command.viewportY) +
+                         static_cast<float>(command.viewport.height);
             viewport.width = static_cast<float>(command.viewport.width);
             viewport.height = -static_cast<float>(command.viewport.height);
             viewport.minDepth = 0.0f;
@@ -2507,7 +2510,9 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
                 error = GfxError::BadDescriptor;
                 break;
             }
-            VkRect2D scissor{{0, 0}, {command.scissor.width, command.scissor.height}};
+            VkRect2D scissor{{static_cast<std::int32_t>(command.scissorX),
+                              static_cast<std::int32_t>(command.scissorY)},
+                             {command.scissor.width, command.scissor.height}};
             vkCmdSetScissor(vkCommands, 0, 1, &scissor);
             break;
         }

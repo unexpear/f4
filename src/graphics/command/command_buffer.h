@@ -63,6 +63,12 @@ struct Command {
     ResourceState after{};
     Extent viewport;
     Extent scissor;
+    // Rectangle origins in attachment pixels, counted from the attachment's
+    // first stored row (GL window coordinates; top-left everywhere else).
+    std::uint32_t viewportX = 0;
+    std::uint32_t viewportY = 0;
+    std::uint32_t scissorX = 0;
+    std::uint32_t scissorY = 0;
     std::uint32_t vertexCount = 0;
     std::uint32_t instanceCount = 1;
     std::uint32_t indexCount = 0;
@@ -100,8 +106,12 @@ public:
     void bindResource(std::uint32_t slot, std::uint32_t handleIndex, std::uint32_t handleGeneration);
     void bufferBarrier(BufferHandle buffer, ResourceState before, ResourceState after);
     void textureBarrier(TextureHandle texture, ResourceState before, ResourceState after);
-    void setViewport(Extent viewport);
-    void setScissor(Extent scissor);
+    // (x, y) offsets the rectangle inside the attachment, in pixels from the
+    // attachment's first stored row/column. Every backend passes it straight
+    // through, so a sub-rectangle covers the same stored texels everywhere
+    // (NDC +Y still points to the higher row on OpenGL, the lower elsewhere).
+    void setViewport(Extent viewport, std::uint32_t x = 0, std::uint32_t y = 0);
+    void setScissor(Extent scissor, std::uint32_t x = 0, std::uint32_t y = 0);
     void draw(std::uint32_t vertexCount, std::uint32_t instanceCount = 1);
     void drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount = 1,
                      std::uint32_t firstIndex = 0);

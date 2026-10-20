@@ -1139,11 +1139,12 @@ auto MetalDevice::submit(CommandBuffer& commandBuffer) -> GfxError {
                 break;
             case CommandKind::SetViewport:
                 if (render == nil || command.viewport.width == 0 || command.viewport.height == 0 ||
-                    command.viewport.width > passExtent.width ||
-                    command.viewport.height > passExtent.height) {
+                    command.viewportX + command.viewport.width > passExtent.width ||
+                    command.viewportY + command.viewport.height > passExtent.height) {
                     error = GfxError::BadDescriptor;
                 } else {
-                    [render setViewport:MTLViewport{0.0, 0.0,
+                    [render setViewport:MTLViewport{static_cast<double>(command.viewportX),
+                                                   static_cast<double>(command.viewportY),
                                                    static_cast<double>(command.viewport.width),
                                                    static_cast<double>(command.viewport.height),
                                                    0.0, 1.0}];
@@ -1151,11 +1152,12 @@ auto MetalDevice::submit(CommandBuffer& commandBuffer) -> GfxError {
                 break;
             case CommandKind::SetScissor:
                 if (render == nil || command.scissor.width == 0 || command.scissor.height == 0 ||
-                    command.scissor.width > passExtent.width ||
-                    command.scissor.height > passExtent.height) {
+                    command.scissorX + command.scissor.width > passExtent.width ||
+                    command.scissorY + command.scissor.height > passExtent.height) {
                     error = GfxError::BadDescriptor;
                 } else {
-                    [render setScissorRect:MTLScissorRect{0, 0, command.scissor.width,
+                    [render setScissorRect:MTLScissorRect{command.scissorX, command.scissorY,
+                                                         command.scissor.width,
                                                          command.scissor.height}];
                 }
                 break;

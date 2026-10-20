@@ -1893,7 +1893,8 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 break;
             }
             const D3D12_VIEWPORT viewport{
-                0.0f, 0.0f, static_cast<float>(command.viewport.width),
+                static_cast<float>(command.viewportX), static_cast<float>(command.viewportY),
+                static_cast<float>(command.viewport.width),
                 static_cast<float>(command.viewport.height), 0.0f, 1.0f};
             list->RSSetViewports(1, &viewport);
             break;
@@ -1903,8 +1904,10 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 error = GfxError::BadDescriptor;
                 break;
             }
-            const D3D12_RECT scissor{0, 0, static_cast<LONG>(command.scissor.width),
-                                     static_cast<LONG>(command.scissor.height)};
+            const D3D12_RECT scissor{
+                static_cast<LONG>(command.scissorX), static_cast<LONG>(command.scissorY),
+                static_cast<LONG>(command.scissorX + command.scissor.width),
+                static_cast<LONG>(command.scissorY + command.scissor.height)};
             list->RSSetScissorRects(1, &scissor);
             break;
         }

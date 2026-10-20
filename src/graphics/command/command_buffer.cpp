@@ -107,17 +107,21 @@ void CommandBuffer::textureBarrier(TextureHandle texture, ResourceState before,
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::setViewport(Extent viewport) {
+void CommandBuffer::setViewport(Extent viewport, std::uint32_t x, std::uint32_t y) {
     Command cmd;
     cmd.kind = CommandKind::SetViewport;
     cmd.viewport = viewport;
+    cmd.viewportX = x;
+    cmd.viewportY = y;
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::setScissor(Extent scissor) {
+void CommandBuffer::setScissor(Extent scissor, std::uint32_t x, std::uint32_t y) {
     Command cmd;
     cmd.kind = CommandKind::SetScissor;
     cmd.scissor = scissor;
+    cmd.scissorX = x;
+    cmd.scissorY = y;
     pushCommand(std::move(cmd));
 }
 
