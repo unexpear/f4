@@ -139,9 +139,13 @@ public:
         -> gfx::PipelineHandle;
     // Point-light shadow faces (see engine/lighting/point_shadows.h): same
     // position/UV inputs as the sun shadow, distance-to-light output.
-    auto ensurePointShadowPipeline(gfx::IDevice& dev,
-                                   const gfx::VertexInputLayout& vertexInput) -> gfx::GfxError;
-    [[nodiscard]] auto pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput) const
+    // `tileReset` selects the variant with depth testing and depth writes off
+    // that the shadow cache uses to reset one tile's colour to 1.0 (far)
+    // without touching the cached tiles around it.
+    auto ensurePointShadowPipeline(gfx::IDevice& dev, const gfx::VertexInputLayout& vertexInput,
+                                   bool tileReset = false) -> gfx::GfxError;
+    [[nodiscard]] auto pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput,
+                                              bool tileReset = false) const
         -> gfx::PipelineHandle;
 
     auto destroy(resources::MaterialHandle h, gfx::IDevice& dev) -> gfx::GfxError;
@@ -168,6 +172,7 @@ private:
     gfx::ShaderHandle pointShadowVs_{};
     gfx::ShaderHandle pointShadowFs_{};
     Array<MaterialPipelineVariant> pointShadowVariants_;
+    Array<MaterialPipelineVariant> pointShadowResetVariants_;
 };
 
 } // namespace f4::engine

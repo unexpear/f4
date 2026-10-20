@@ -534,9 +534,9 @@ auto MaterialCache::shadowPipelineFor(const gfx::VertexInputLayout& vertexInput)
 }
 
 auto MaterialCache::ensurePointShadowPipeline(gfx::IDevice& dev,
-                                              const gfx::VertexInputLayout& vertexInput)
-    -> gfx::GfxError {
-    if (pointShadowPipelineFor(vertexInput).isValid()) return gfx::GfxError::None;
+                                              const gfx::VertexInputLayout& vertexInput,
+                                              bool tileReset) -> gfx::GfxError {
+    if (pointShadowPipelineFor(vertexInput, tileReset).isValid()) return gfx::GfxError::None;
     if (owner_ != nullptr && owner_ != &dev) return gfx::GfxError::InvalidHandle;
     if (!pointShadowVs_.isValid()) {
         auto shader = loadEffectShader(dev, EffectShader::PointShadowVertex);
@@ -556,9 +556,10 @@ auto MaterialCache::ensurePointShadowPipeline(gfx::IDevice& dev,
     pipeline.vertexInput = pointShadowCompatibleInput(vertexInput);
     pipeline.topology = gfx::PrimitiveTopology::TriangleList;
     pipeline.raster.cullMode = gfx::CullMode::None;
-    pipeline.depthStencil.depthTestEnable = true;
-    pipeline.depthStencil.depthWriteEnable = true;
-    pipeline.depthStencil.depthCompare = gfx::CompareOp::Less;
+    pipeline.depthStencil.depthTestEnable = !tileReset;
+    pipeline.depthStencil.depthWriteEnable = !tileReset;
+    pipeline.depthStencil.depthCompare =
+        tileReset ? gfx::CompareOp::Always : gfx::CompareOp::Less;
     pipeline.depthStencil.format = gfx::TextureFormat::Depth32F;
     gfx::ColorAttachmentState color;
     color.format = gfx::TextureFormat::R16_FLOAT;
@@ -580,14 +581,16 @@ auto MaterialCache::ensurePointShadowPipeline(gfx::IDevice& dev,
     variant.vertexInput = vertexInput;
     variant.colorFormat = gfx::TextureFormat::R16_FLOAT;
     variant.pipeline = result.value();
-    pointShadowVariants_.push(static_cast<MaterialPipelineVariant&&>(variant));
+    (tileReset ? pointShadowResetVariants_ : pointShadowVariants_)
+        .push(static_cast<MaterialPipelineVariant&&>(variant));
     return gfx::GfxError::None;
 }
 
-auto MaterialCache::pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput) const
-    -> gfx::PipelineHandle {
+auto MaterialCache::pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput,
+                                           bool tileReset) const -> gfx::PipelineHandle {
     const std::uint64_t hash = hashLayout(vertexInput);
-    for (const MaterialPipelineVariant& variant : pointShadowVariants_) {
+    for (const MaterialPipelineVariant& variant :
+         tileReset ? pointShadowResetVariants_ : pointShadowVariants_) {
         if (variant.vertexLayoutHash == hash && layoutsEqual(variant.vertexInput, vertexInput)) {
             return variant.pipeline;
         }
@@ -621,6 +624,10 @@ void MaterialCache::clear(gfx::IDevice& dev) {
         if (variant.pipeline.isValid()) (void)dev.destroyPipeline(variant.pipeline);
     }
     pointShadowVariants_.clear();
+    for (const MaterialPipelineVariant& variant : pointShadowResetVariants_) {
+        if (variant.pipeline.isValid()) (void)dev.destroyPipeline(variant.pipeline);
+    }
+    pointShadowResetVariants_.clear();
     if (pointShadowVs_.isValid()) (void)dev.destroyShader(pointShadowVs_);
     if (pointShadowFs_.isValid()) (void)dev.destroyShader(pointShadowFs_);
     pointShadowVs_ = {};

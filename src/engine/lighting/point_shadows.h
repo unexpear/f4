@@ -90,4 +90,16 @@ void selectShadowedPointLights(std::span<const PointShadowCandidate> candidates,
                                const math::Vec3& eye, std::uint32_t budget,
                                containers::Array<std::uint32_t>& selected);
 
+// Stable atlas slots. `owners[s]` is the key of the light that held slot `s`
+// last frame (kPointShadowFreeSlot when free); `keys` are this frame's
+// selected lights. A light that already owns a slot keeps it, so its six
+// tiles stay where they are and can be reused by the shadow cache; the rest
+// take the lowest free slots in selection order. `slots[i]` receives the slot
+// of keys[i] and `owners` is rewritten for this frame (unselected slots are
+// freed). `owners.size()` is the slot count and must be >= keys.size().
+inline constexpr std::uint64_t kPointShadowFreeSlot = ~0ull;
+void assignStablePointShadowSlots(std::span<const std::uint64_t> keys,
+                                  containers::Array<std::uint64_t>& owners,
+                                  containers::Array<std::uint32_t>& slots);
+
 } // namespace f4::engine

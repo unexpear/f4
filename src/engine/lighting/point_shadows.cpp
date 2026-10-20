@@ -71,4 +71,38 @@ void selectShadowedPointLights(std::span<const PointShadowCandidate> candidates,
     for (std::size_t i = 0; i < count; ++i) selected.push(scored[i].index);
 }
 
+void assignStablePointShadowSlots(std::span<const std::uint64_t> keys,
+                                  containers::Array<std::uint64_t>& owners,
+                                  containers::Array<std::uint32_t>& slots) {
+    slots.clear();
+    slots.resize(keys.size());
+    constexpr std::uint32_t kUnassigned = ~0u;
+    std::fill(slots.begin(), slots.end(), kUnassigned);
+    containers::Array<std::uint8_t> taken;
+    taken.resize(owners.size());
+    std::fill(taken.begin(), taken.end(), std::uint8_t{0});
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        for (std::size_t slot = 0; slot < owners.size(); ++slot) {
+            if (owners[slot] != kPointShadowFreeSlot && owners[slot] == keys[i] &&
+                taken[slot] == 0) {
+                slots[i] = static_cast<std::uint32_t>(slot);
+                taken[slot] = 1;
+                break;
+            }
+        }
+    }
+    std::size_t nextFree = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (slots[i] != kUnassigned) continue;
+        while (nextFree < owners.size() && taken[nextFree] != 0) ++nextFree;
+        if (nextFree == owners.size()) break; // more keys than slots
+        slots[i] = static_cast<std::uint32_t>(nextFree);
+        taken[nextFree] = 1;
+    }
+    for (std::size_t slot = 0; slot < owners.size(); ++slot) owners[slot] = kPointShadowFreeSlot;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (slots[i] != kUnassigned) owners[slots[i]] = keys[i];
+    }
+}
+
 } // namespace f4::engine
