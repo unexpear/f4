@@ -1357,6 +1357,14 @@ auto createOpenGLDevice() -> IDevice* {
         return nullptr;
     }
 
+    static bool loggedRenderer = false;
+    if (!loggedRenderer) {
+        loggedRenderer = true;
+        const auto* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const auto* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+        F4_LOG_INFO() << "OpenGL renderer: " << (renderer != nullptr ? renderer : "?") << " ("
+                      << (vendor != nullptr ? vendor : "?") << ')';
+    }
     return new OpenGLDevice();
 }
 

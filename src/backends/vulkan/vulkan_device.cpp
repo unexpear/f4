@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/logging/logger.h"
+#include "graphics/gpu_selection.h"
 #include "graphics/device/object_store.h"
 #if defined(F4_VULKAN_HAS_PLATFORM)
 #include "platform/window.h"
@@ -139,11 +140,26 @@ struct QueueSelection {
     return result;
 }
 
-[[nodiscard]] auto deviceScore(const VkPhysicalDeviceProperties& properties) -> std::uint64_t {
-    std::uint64_t score = properties.limits.maxImageDimension2D;
-    if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 1'000'000;
-    if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 100'000;
-    return score;
+[[nodiscard]] auto gpuClassOf(VkPhysicalDeviceType type) -> GpuClass {
+    switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return GpuClass::Discrete;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return GpuClass::Integrated;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return GpuClass::Virtual;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return GpuClass::Software;
+    default: return GpuClass::Other;
+    }
+}
+
+[[nodiscard]] auto deviceLocalBytes(VkPhysicalDevice device) -> std::uint64_t {
+    VkPhysicalDeviceMemoryProperties memory{};
+    vkGetPhysicalDeviceMemoryProperties(device, &memory);
+    std::uint64_t bytes = 0;
+    for (std::uint32_t heap = 0; heap < memory.memoryHeapCount; ++heap) {
+        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+            bytes += memory.memoryHeaps[heap].size;
+        }
+    }
+    return bytes;
 }
 
 [[nodiscard]] auto toGfxError(VkResult result) -> GfxError {
@@ -1006,9 +1022,18 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
         return false;
     }
 
-    std::uint64_t bestScore = 0;
+    // Rank every eligible device (see graphics/gpu_selection.h).
+    struct EligibleDevice {
+        VkPhysicalDevice device = VK_NULL_HANDLE;
+        QueueSelection queues{};
+        VkPhysicalDeviceProperties properties{};
+        VkPhysicalDeviceFeatures features{};
+    };
+    std::vector<EligibleDevice> eligible;
+    std::vector<GpuCandidate> candidates;
     VkPhysicalDeviceFeatures selectedFeatures{};
-    for (VkPhysicalDevice device : devices) {
+    for (std::uint32_t deviceIndex = 0; deviceIndex < physicalCount; ++deviceIndex) {
+        VkPhysicalDevice device = devices[deviceIndex];
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(device, &properties);
         if (properties.apiVersion < VK_API_VERSION_1_3) continue;
@@ -1028,16 +1053,26 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
 
         const QueueSelection queues = selectQueues(device, impl_->surface);
         if (!queues.complete(impl_->surface != VK_NULL_HANDLE)) continue;
-        const std::uint64_t score = deviceScore(properties);
-        if (impl_->physicalDevice == VK_NULL_HANDLE || score > bestScore) {
-            bestScore = score;
-            impl_->physicalDevice = device;
-            impl_->graphicsQueueFamily = queues.graphics;
-            impl_->presentQueueFamily = queues.present;
-            impl_->apiVersion = properties.apiVersion;
-            std::snprintf(impl_->deviceName, sizeof(impl_->deviceName), "%s", properties.deviceName);
-            selectedFeatures = features2.features;
-        }
+        GpuCandidate candidate;
+        candidate.name = properties.deviceName;
+        candidate.gpuClass = gpuClassOf(properties.deviceType);
+        candidate.dedicatedMemoryBytes = deviceLocalBytes(device);
+        candidate.apiIndex = deviceIndex;
+        candidates.push_back(std::move(candidate));
+        eligible.push_back({device, queues, properties, features2.features});
+    }
+    if (!eligible.empty()) {
+        const GpuPreference preference = gpuPreferenceFromEnvironment();
+        const GpuSelection selection = selectGpu(candidates, preference);
+        logGpuSelection("Vulkan", candidates, selection, preference);
+        const EligibleDevice& chosen = eligible[selection.chosen];
+        impl_->physicalDevice = chosen.device;
+        impl_->graphicsQueueFamily = chosen.queues.graphics;
+        impl_->presentQueueFamily = chosen.queues.present;
+        impl_->apiVersion = chosen.properties.apiVersion;
+        std::snprintf(impl_->deviceName, sizeof(impl_->deviceName), "%s",
+                      chosen.properties.deviceName);
+        selectedFeatures = chosen.features;
     }
     if (impl_->physicalDevice == VK_NULL_HANDLE) return false;
     VkPhysicalDeviceProperties selectedProperties{};

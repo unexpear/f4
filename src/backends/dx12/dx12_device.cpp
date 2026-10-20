@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "core/logging/logger.h"
+#include "graphics/gpu_selection.h"
 #include "graphics/device/object_store.h"
 #if defined(F4_DX12_HAS_PLATFORM)
 #include "platform/window.h"
@@ -552,21 +553,48 @@ auto Dx12Device::initialize(platform::Window* window) -> bool {
         factoryFlags, IID_IDXGIFactory4, impl_->factory.putVoid());
     if (FAILED(result)) return false;
 
+    // Rank every D3D12-capable adapter (see graphics/gpu_selection.h): DXGI
+    // lists the integrated GPU first on hybrid laptops, so "first adapter"
+    // silently picked the weaker GPU. UMA architecture marks integrated parts.
+    std::vector<ComPtr<IDXGIAdapter1>> adapters;
+    std::vector<GpuCandidate> candidates;
     for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
         result = impl_->factory->EnumAdapters1(index, candidate.put());
         if (result == DXGI_ERROR_NOT_FOUND) break;
         if (FAILED(result)) continue;
         DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(candidate->GetDesc1(&desc)) ||
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+        if (FAILED(candidate->GetDesc1(&desc))) continue;
+        ComPtr<ID3D12Device> probe;
+        if (FAILED(D3D12CreateDevice(candidate.get(), D3D_FEATURE_LEVEL_11_0,
+                                     IID_ID3D12Device, probe.putVoid()))) {
             continue;
         }
-        if (SUCCEEDED(D3D12CreateDevice(candidate.get(), D3D_FEATURE_LEVEL_11_0,
-                                        IID_ID3D12Device, nullptr))) {
-            impl_->adapter = std::move(candidate);
-            break;
+        GpuCandidate info;
+        char name[256]{};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name,
+                            static_cast<int>(sizeof(name)), nullptr, nullptr);
+        info.name = name;
+        info.dedicatedMemoryBytes = desc.DedicatedVideoMemory;
+        info.apiIndex = index;
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+            info.gpuClass = GpuClass::Software;
+        } else {
+            D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+            const bool uma = SUCCEEDED(probe->CheckFeatureSupport(
+                                 D3D12_FEATURE_ARCHITECTURE, &architecture,
+                                 sizeof(architecture))) &&
+                             architecture.UMA != FALSE;
+            info.gpuClass = uma ? GpuClass::Integrated : GpuClass::Discrete;
         }
+        adapters.push_back(std::move(candidate));
+        candidates.push_back(std::move(info));
+    }
+    if (!candidates.empty()) {
+        const GpuPreference preference = gpuPreferenceFromEnvironment();
+        const GpuSelection selection = selectGpu(candidates, preference);
+        logGpuSelection("DX12", candidates, selection, preference);
+        impl_->adapter = std::move(adapters[selection.chosen]);
     }
     if (!impl_->adapter) {
         result = impl_->factory->EnumWarpAdapter(
@@ -593,6 +621,7 @@ auto Dx12Device::initialize(platform::Window* window) -> bool {
                             impl_->deviceName, static_cast<int>(sizeof(impl_->deviceName)),
                             nullptr, nullptr);
     }
+    F4_LOG_INFO() << "DX12 device: " << impl_->deviceName;
 
     if (impl_->debugLayer) {
         (void)impl_->device->QueryInterface(

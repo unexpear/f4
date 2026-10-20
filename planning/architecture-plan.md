@@ -585,16 +585,41 @@ Completed delivery and acceptance gates:
   The Chromium WebGPU smoke binds the same buffer in its standalone PBR pipeline
   and requires a red point light to add red light through the engine renderer.
   `demo_bench` scene 20 ("Night Lights") shows 64-4096 animated colored lights.
-- Point lights are open on two fronts. Metal has the shader and binding but was
-  not compiled or run (no Apple hardware). There is no bloom, no point-light
-  shadows, and no GPU-side binning. Frame time (`F4_POINT_LIGHT_BENCH=1`,
-  1280x720, 2026-10-20 laptop) was measured on mixed GPUs, because OpenGL and
-  DX12 picked the Intel Iris Xe iGPU while Vulkan picked the RTX 3070 Ti, so the
-  numbers are not a backend comparison:
-  - Vulkan: 1,024 / 4,096 lights at 0.77 / 1.7 ms with range scaled to spacing,
-    and 1.0 / 3.6 ms in the fixed-2.5 m stress case.
-  - Intel OpenGL: 4.2 / 8.2 ms (scaled) and 6.7 / 27.5 ms (stress).
-  - Intel DX12: 8.0 / 17.4 ms (scaled) and 13.4 / 67 ms (stress).
+- ✅ Frame time (`F4_POINT_LIGHT_BENCH=1`, 1280x720, RTX 3070 Ti Laptop on
+  every backend after the adapter-selection fix below), 1,024 / 4,096 lights:
+  - Range scaled to spacing: Vulkan 0.76 / 1.8 ms, OpenGL 1.0 / 2.2 ms,
+    DX12 1.4 / 2.3 ms.
+  - Fixed 2.5 m stress range: Vulkan 1.1 / 4.5 ms, OpenGL 1.3 / 5.2 ms,
+    DX12 1.6 / 5.3 ms.
+  - Before the fix, OpenGL and DX12 ran on the Intel Iris Xe iGPU (scaled
+    4.2 / 8.2 ms and 8.0 / 17.4 ms; stress 4,096 lights at 27.5 and 67 ms).
+- Point lights are still open on two fronts. Metal has the shader and binding
+  but was not compiled or run (no Apple hardware). There is no bloom, no
+  point-light shadows, and no GPU-side binning.
+- ✅ Adapter selection (2026-10-20). Every backend now picks the strongest
+  GPU by default, using one ranking in `graphics/gpu_selection.*`: discrete,
+  then integrated, then virtual/other, with software rasterizers (WARP /
+  Microsoft Basic Render Driver, llvmpipe) used only when nothing else exists.
+  Ties go to more dedicated memory, then to enumeration order.
+  - DX12 ranks every FL11 DXGI adapter and uses `D3D12_FEATURE_ARCHITECTURE`
+    UMA to mark integrated parts. It previously took the first hardware
+    adapter, which DXGI lists as the iGPU on hybrid laptops.
+  - Vulkan ranks eligible devices by `deviceType`, then by device-local heap
+    size.
+  - OpenGL cannot enumerate adapters. Every Windows executable (`f4_tests`,
+    `demo_bench`, `f4_app`, `f4_vulkan_app`, `f4_dx12_app`) exports
+    `NvOptimusEnablement` / `AmdPowerXpressRequestHighPerformance` via
+    `f4_prefer_high_performance_gpu()`.
+  - WebGPU already requests `HighPerformance` (the browser decides).
+  - `F4_GPU=auto|discrete|integrated|<n>` overrides the pick. `<n>` is the
+    API enumeration index printed in the startup ranking log. OpenGL honours
+    `integrated` by clearing the exports before the first GL context and
+    ignores indices with a warning. An unmatched override falls back to auto
+    with a warning.
+  - Verified on the laptop: GL `GL_RENDERER` and the DX12 DXGI description
+    changed from Intel Iris Xe to the RTX 3070 Ti. `F4_GPU=integrated` moves
+    all three back to Iris Xe, and GL/VK/DX point-light parity holds on both
+    GPUs.
 
 ### Milestone 12 — Optimization
 - ✅ World-space AABB frustum culling with per-frame candidate/visible/culled

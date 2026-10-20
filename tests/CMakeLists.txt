@@ -44,6 +44,7 @@ add_executable(f4_tests
     core/test_transform.cpp
     core/test_shapes.cpp
     core/test_frustum.cpp
+    graphics/test_gpu_selection.cpp
     graphics/test_rhi.cpp
     engine/test_m8.cpp
     engine/test_m11.cpp
@@ -63,6 +64,7 @@ target_compile_definitions(f4_tests PRIVATE
 f4_set_warnings(f4_tests)
 f4_set_float_precision(f4_tests)
 f4_enable_sanitizers(f4_tests)
+f4_prefer_high_performance_gpu(f4_tests)
 
 # Headless OpenGL conformance: only on toolchains where the GL backend exists
 # (MSYS2 ucrt64 / GCC). F4_GRAPHICS_HAS_OPENGL is set by src/CMakeLists.txt and

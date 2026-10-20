@@ -91,6 +91,16 @@ FetchContent_Declare(tinyusdz
 )
 FetchContent_MakeAvailable(tinyusdz)
 
+# Hybrid-GPU laptops (NVIDIA Optimus, AMD PowerXpress) run OpenGL on the
+# integrated GPU unless the executable itself exports a high-performance hint.
+# Every f4 executable that can open a GL context gets the exports.
+function(f4_prefer_high_performance_gpu target)
+    if(WIN32)
+        target_sources(${target} PRIVATE
+            "${PROJECT_SOURCE_DIR}/src/platform/high_performance_gpu.cpp")
+    endif()
+endfunction()
+
 add_library(f4_core STATIC
     core/jobs/job_system.cpp
     core/logging/logger.cpp
@@ -142,6 +152,7 @@ f4_enable_sanitizers(f4_core)
 add_library(f4_graphics STATIC
     graphics/device/device.cpp
     graphics/command/command_buffer.cpp
+    graphics/gpu_selection.cpp
     graphics/handle.cpp
     graphics/hud/hud_font.cpp
     graphics/hud/hud_overlay.cpp
@@ -228,6 +239,7 @@ if(TARGET f4_platform AND F4_EPOXY_INCLUDE_DIR AND F4_EPOXY_LIBRARY)
     f4_set_warnings(f4_app)
     f4_set_float_precision(f4_app)
     f4_enable_sanitizers(f4_app)
+    f4_prefer_high_performance_gpu(f4_app)
 
     # Focused one-capability demos.
     add_subdirectory(demos)
@@ -334,6 +346,7 @@ if(Vulkan_FOUND)
             f4_set_warnings(f4_vulkan_app)
             f4_set_float_precision(f4_vulkan_app)
             f4_enable_sanitizers(f4_vulkan_app)
+            f4_prefer_high_performance_gpu(f4_vulkan_app)
         endif()
     endif()
 elseif(F4_GRAPHICS_BACKEND STREQUAL "vulkan")
@@ -437,6 +450,7 @@ if(WIN32)
             f4_set_warnings(f4_dx12_app)
             f4_set_float_precision(f4_dx12_app)
             f4_enable_sanitizers(f4_dx12_app)
+            f4_prefer_high_performance_gpu(f4_dx12_app)
         endif()
     endif()
 elseif(F4_GRAPHICS_BACKEND STREQUAL "dx12")
