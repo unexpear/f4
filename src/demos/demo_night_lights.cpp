@@ -109,7 +109,30 @@ struct NightLightsScene::Impl {
     std::uint32_t side = 32;
     bool animate = true;
     float time = 0.0f;
-    std::array<bool, 4> previousKeys{};
+    std::array<bool, 12> previousKeys{};
+    std::vector<ecs::Entity> pillars;
+
+    void syncCamera(const FreeCamera& freeCamera) {
+        if (auto* c = registry.get<engine::Camera>(camera)) {
+            const float cy = std::cos(freeCamera.yaw);
+            const float sy = std::sin(freeCamera.yaw);
+            const float cp = std::cos(freeCamera.pitch);
+            const float sp = std::sin(freeCamera.pitch);
+            const math::Vec3 forward{-cy * cp, -sp, -sy * cp};
+            c->eye = freeCamera.position;
+            c->center = freeCamera.position + forward;
+            c->up = math::Vec3(0.f, 1.f, 0.f);
+        }
+    }
+
+    void printSettings() const {
+        const auto& s = renderer.pbrSettings();
+        std::printf("[night-lights] bloom %s (intensity %.2f, threshold %.2f); point shadows %s "
+                    "(budget %u)\n",
+                    s.bloomEnabled ? "on" : "off", static_cast<double>(s.bloomIntensity),
+                    static_cast<double>(s.bloomThreshold), s.pointShadowsEnabled ? "on" : "off",
+                    s.pointShadowBudget);
+    }
 
     void rebuildLamps() {
         for (const Lamp& lamp : lamps) {
@@ -133,6 +156,8 @@ struct NightLightsScene::Impl {
                 light.intensity = 4.0f;
                 light.range =
                     std::clamp(2.0f * extent / static_cast<float>(side) * 1.1f, 0.8f, 6.0f);
+                // Every lamp may cast shadows; the renderer picks the budget.
+                light.castShadows = true;
                 registry.emplace<engine::PointLight>(lamp.light, light);
                 lamp.cube = registry.create();
                 auto& transform = registry.emplace<ecs::LocalTransform>(lamp.cube, ecs::LocalTransform{});
@@ -174,13 +199,40 @@ bool NightLightsScene::init(gfx::IDevice* device, platform::Window*) {
         lampDesc.emissive = lampEmission;
         lampDesc.tint = math::Vec4(0.02f, 0.02f, 0.02f, 1.0f);
         lampDesc.emissiveFactor =
-            math::Vec3(kPalette[i][0], kPalette[i][1], kPalette[i][2]) * 1.5f;
+            math::Vec3(kPalette[i][0], kPalette[i][1], kPalette[i][2]) * 3.0f;
         impl_->lampMaterials[i] = renderer.createMaterial(lampDesc);
     }
     const ecs::Entity ground = impl_->registry.create();
     impl_->registry.emplace<ecs::LocalTransform>(ground, ecs::LocalTransform{});
     impl_->registry.emplace<engine::MeshRenderer>(
         ground, engine::MeshRenderer{groundMesh, groundMaterial, 0, false, false});
+
+    // Pillars between the lamps: the shadow casters for point-light shadows.
+    engine::StandardMaterialDesc pillarDesc;
+    pillarDesc.tint = math::Vec4(0.55f, 0.52f, 0.48f, 1.0f);
+    pillarDesc.roughnessFactor = 0.7f;
+    const auto pillarMaterial = renderer.createMaterial(pillarDesc);
+    if (!pillarMaterial.isValid()) return false;
+    constexpr int kPillarsPerSide = 12;
+    for (int row = 0; row < kPillarsPerSide; ++row) {
+        for (int column = 0; column < kPillarsPerSide; ++column) {
+            const float fx = (static_cast<float>(column) + 0.5f) / kPillarsPerSide;
+            const float fz = (static_cast<float>(row) + 0.5f) / kPillarsPerSide;
+            const ecs::Entity pillar = impl_->registry.create();
+            auto& transform =
+                impl_->registry.emplace<ecs::LocalTransform>(pillar, ecs::LocalTransform{});
+            transform.position = {(fx * 2.0f - 1.0f) * 18.0f + 0.4f, 0.9f,
+                                  (fz * 2.0f - 1.0f) * 18.0f - 0.3f};
+            transform.scale = math::Vec3(0.35f, 1.8f, 0.35f);
+            impl_->registry.emplace<engine::MeshRenderer>(
+                pillar, engine::MeshRenderer{impl_->cube, pillarMaterial, 0, true, false});
+            impl_->pillars.push_back(pillar);
+        }
+    }
+    renderer.pbrSettings().bloomEnabled = true;
+    renderer.pbrSettings().bloomIntensity = 0.8f;
+    renderer.pbrSettings().pointShadowsEnabled = true;
+    renderer.pbrSettings().pointShadowBudget = 8;
 
     impl_->camera = impl_->registry.create();
     engine::Camera camera;
@@ -189,6 +241,7 @@ bool NightLightsScene::init(gfx::IDevice* device, platform::Window*) {
     impl_->registry.emplace<engine::Camera>(impl_->camera, camera);
     impl_->rebuildLamps();
     ecs::updateWorldTransforms(impl_->registry);
+    impl_->printSettings();
     return true;
 }
 
@@ -203,9 +256,13 @@ void NightLightsScene::onResize(std::uint32_t, std::uint32_t) {}
 
 void NightLightsScene::update(float dt, const Uint8* keys, const SDL_MouseMotionEvent*) {
     if (impl_ == nullptr) return;
-    const std::array<bool, 4> pressed = {
+    const std::array<bool, 12> pressed = {
         keys[SDL_SCANCODE_LEFTBRACKET] != 0, keys[SDL_SCANCODE_RIGHTBRACKET] != 0,
-        keys[SDL_SCANCODE_P] != 0, keys[SDL_SCANCODE_M] != 0};
+        keys[SDL_SCANCODE_P] != 0,           keys[SDL_SCANCODE_M] != 0,
+        keys[SDL_SCANCODE_B] != 0,           keys[SDL_SCANCODE_MINUS] != 0,
+        keys[SDL_SCANCODE_EQUALS] != 0,      keys[SDL_SCANCODE_SEMICOLON] != 0,
+        keys[SDL_SCANCODE_APOSTROPHE] != 0,  keys[SDL_SCANCODE_K] != 0,
+        keys[SDL_SCANCODE_COMMA] != 0,       keys[SDL_SCANCODE_PERIOD] != 0};
     const auto edge = [&](std::size_t i) { return pressed[i] && !impl_->previousKeys[i]; };
     if (edge(0) && impl_->side > 8) {
         impl_->side /= 2;
@@ -220,6 +277,17 @@ void NightLightsScene::update(float dt, const Uint8* keys, const SDL_MouseMotion
         enabled = !enabled;
     }
     if (edge(3)) impl_->animate = !impl_->animate;
+    auto& settings = impl_->renderer.pbrSettings();
+    bool changed = false;
+    if (edge(4)) { settings.bloomEnabled = !settings.bloomEnabled; changed = true; }
+    if (edge(5)) { settings.bloomIntensity = std::max(0.0f, settings.bloomIntensity - 0.2f); changed = true; }
+    if (edge(6)) { settings.bloomIntensity = std::min(3.0f, settings.bloomIntensity + 0.2f); changed = true; }
+    if (edge(7)) { settings.bloomThreshold = std::max(0.0f, settings.bloomThreshold - 0.25f); changed = true; }
+    if (edge(8)) { settings.bloomThreshold = std::min(8.0f, settings.bloomThreshold + 0.25f); changed = true; }
+    if (edge(9)) { settings.pointShadowsEnabled = !settings.pointShadowsEnabled; changed = true; }
+    if (edge(10) && settings.pointShadowBudget > 1) { settings.pointShadowBudget /= 2; changed = true; }
+    if (edge(11) && settings.pointShadowBudget < 16) { settings.pointShadowBudget *= 2; changed = true; }
+    if (changed) impl_->printSettings();
     impl_->previousKeys = pressed;
 
     if (impl_->animate) impl_->time += dt;
@@ -241,20 +309,29 @@ void NightLightsScene::update(float dt, const Uint8* keys, const SDL_MouseMotion
 
 void NightLightsScene::render(gfx::CommandBuffer& cb, const FreeCamera& camera,
                               std::uint32_t width, std::uint32_t height) {
+    // Fallback single-pass path (no bloom, no point shadows): the bench uses
+    // renderPasses() because recordsOwnPasses() is true.
     if (impl_ == nullptr) return;
-    if (auto* c = impl_->registry.get<engine::Camera>(impl_->camera)) {
-        const float cy = std::cos(camera.yaw);
-        const float sy = std::sin(camera.yaw);
-        const float cp = std::cos(camera.pitch);
-        const float sp = std::sin(camera.pitch);
-        const math::Vec3 forward{-cy * cp, -sp, -sy * cp};
-        c->eye = camera.position;
-        c->center = camera.position + forward;
-        c->up = math::Vec3(0.f, 1.f, 0.f);
-    }
+    impl_->syncCamera(camera);
     impl_->renderer.record(
         cb, impl_->camera,
         height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.f);
+}
+
+void NightLightsScene::renderPasses(gfx::CommandBuffer&, const FreeCamera& camera,
+                                    std::uint32_t width, std::uint32_t height,
+                                    gfx::FramebufferHandle target) {
+    if (impl_ == nullptr || width == 0 || height == 0) return;
+    impl_->syncCamera(camera);
+    // Renderer::render() records and submits its own render graph (sun
+    // shadow, point-shadow atlas, main pass, bloom chain); the bench then
+    // draws the HUD on top through its load-only overlay framebuffer.
+    const gfx::GfxError error = impl_->renderer.render(
+        target, impl_->camera, static_cast<float>(width) / static_cast<float>(height),
+        gfx::Extent{width, height});
+    if (error != gfx::GfxError::None) {
+        std::fprintf(stderr, "[night-lights] render failed: %d\n", static_cast<int>(error));
+    }
 }
 
 } // namespace f4::demo
