@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <limits>
 #include <span>
+#include <string>
+#include <vector>
 
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
@@ -830,6 +832,14 @@ auto validateRendererFrame() -> bool {
     bool bloomOk = false;
     int bloomZeroMaxDelta = 0;
     std::uint64_t bloomGlowPixels = 0;
+    // GPU timers: "true" (timed, plausible, image unchanged), "unavailable"
+    // (no timestamp-query; timers must say so), or "false".
+    const char* gpuTimers = "false";
+    double gpuBinningMs = 0.0;
+    double gpuMainMs = 0.0;
+    double gpuFrameMs = 0.0;
+    std::uint32_t gpuTimingLag = 0;
+    int gpuTimerFrames = 0;
     {
         f4::ecs::Registry registry(16);
         f4::engine::Renderer renderer(registry, *gApp.device);
@@ -915,6 +925,48 @@ auto validateRendererFrame() -> bool {
                     }
                     pointLightsOk = pointRedGain > 2000 && pointRedGain > pointOtherGain * 2u;
                 }
+            }
+            if (pointLightsOk) {
+                // GPU timers on the point-light frame: the image must not change,
+                // and with timestamp-query the binning and main passes must come
+                // back timed within a few frames (mapAsync completes while
+                // waitIdle yields to the browser). Without it, timers must report
+                // unavailable rather than zeros.
+                renderer.pbrSettings().gpuTimers = true;
+                const bool supported = gApp.device->supportsGpuTimestamps();
+                bool timersOk = true;
+                bool timed = false;
+                for (int frame = 0; frame < 12 && timersOk && !timed; ++frame) {
+                    timersOk = renderer.render(framebuffer, cameraEntity, 1.0f) == GfxError::None;
+                    if (!timersOk) break;
+                    gApp.device->waitIdle();
+                    if (frame == 0) {
+                        timersOk = gApp.webGpu->readTexture(color, 0, gApp.effectCaptureA) ==
+                                       GfxError::None &&
+                                   gApp.effectCaptureA == gApp.pointLightCapture;
+                    }
+                    gpuTimerFrames = frame + 1;
+                    const f4::engine::FrameStats& stats = renderer.stats();
+                    timersOk = timersOk && stats.gpuTimersAvailable == supported &&
+                               stats.pointLightBinningDispatches == 1;
+                    timed = stats.gpuTimingValid;
+                    if (!timed) continue;
+                    gpuBinningMs = stats.gpuLightBinningMs;
+                    gpuMainMs = stats.gpuMainPassMs;
+                    gpuFrameMs = stats.gpuFrameMs;
+                    gpuTimingLag = stats.gpuTimingLag;
+                    double passSum = 0.0;
+                    for (std::uint32_t pass = 0; pass < stats.gpuPassCount; ++pass) {
+                        passSum += stats.gpuPasses[pass].ms;
+                    }
+                    timersOk = timersOk && supported && gpuBinningMs > 0.0 && gpuMainMs > 0.0 &&
+                               gpuBinningMs < gpuFrameMs && gpuMainMs < gpuFrameMs &&
+                               gpuFrameMs < 50.0 && gpuTimingLag >= 1 &&
+                               std::abs(passSum - gpuFrameMs) <= 1.0e-6 + gpuFrameMs * 1.0e-9;
+                }
+                if (supported) gpuTimers = timersOk && timed ? "true" : "false";
+                else gpuTimers = timersOk && !timed ? "unavailable" : "false";
+                renderer.pbrSettings().gpuTimers = false;
             }
             const Extent rendererExtent{kRendererExtent, kRendererExtent};
             auto channel = [](const auto& capture, std::size_t index) {
@@ -1061,7 +1113,10 @@ auto validateRendererFrame() -> bool {
             "document.body.dataset.f4PointShadows='%s';"
             "document.body.dataset.f4PointShadowLoss='%llu/%llu';"
             "document.body.dataset.f4Bloom='%s';"
-            "document.body.dataset.f4BloomStats='%d/%llu';",
+            "document.body.dataset.f4BloomStats='%d/%llu';"
+            "document.body.dataset.f4GpuTimers='%s';"
+            "document.body.dataset.f4GpuTimerStats="
+            "'binning=%.4f main=%.4f frame=%.4f lag=%u frames=%d';",
             litPixels, digest, pointLightsOk ? "true" : "false",
             static_cast<unsigned long long>(pointRedGain),
             static_cast<unsigned long long>(pointOtherGain),
@@ -1069,10 +1124,277 @@ auto validateRendererFrame() -> bool {
             static_cast<unsigned long long>(pointShadowLoss),
             static_cast<unsigned long long>(pointShadowBrighter),
             bloomOk ? "true" : "false", bloomZeroMaxDelta,
-            static_cast<unsigned long long>(bloomGlowPixels));
+            static_cast<unsigned long long>(bloomGlowPixels), gpuTimers, gpuBinningMs,
+            gpuMainMs, gpuFrameMs, gpuTimingLag, gpuTimerFrames);
         emscripten_run_script(script);
     }
     return rendered;
+}
+
+// ---------------------------------------------------------------------------
+// Point-light bench (open the page with ?bench=<rounds>): the native night
+// scene of tests/engine/test_point_lights.cpp at 1280x720, 1024 and 4096 lights,
+// "stress" (fixed 2.5 m range) and "scaled" (range follows the grid spacing).
+// CPU and GPU binning alternate per round; frame time is the wall time of 120
+// frames ending in waitIdle, so it measures throughput like the native bench.
+// A last run per variant turns GPU timers on and yields after every frame so
+// mapAsync can deliver the timestamps.
+
+constexpr std::array<std::array<float, 3>, 8> kNightPalette{{
+    {1.0f, 0.55f, 0.18f}, {0.25f, 0.55f, 1.0f}, {1.0f, 0.18f, 0.32f}, {0.25f, 1.0f, 0.45f},
+    {0.95f, 0.3f, 1.0f}, {1.0f, 0.9f, 0.55f}, {0.2f, 0.95f, 1.0f}, {1.0f, 0.8f, 0.1f},
+}};
+
+auto makePbrMesh(std::span<const PbrVertex> vertices, std::span<const std::uint16_t> indices)
+    -> f4::resources::Mesh {
+    f4::resources::Mesh mesh;
+    f4::resources::VertexStream stream;
+    stream.strideBytes = sizeof(PbrVertex);
+    stream.data.resize(vertices.size_bytes());
+    std::memcpy(stream.data.data(), vertices.data(), vertices.size_bytes());
+    mesh.streams.push(std::move(stream));
+    mesh.attributes.push({f4::resources::VertexSemantic::Position,
+                          f4::resources::VertexFormat::F32_3, 0, 0});
+    mesh.attributes.push({f4::resources::VertexSemantic::Normal,
+                          f4::resources::VertexFormat::F32_3, 0, 12});
+    mesh.attributes.push({f4::resources::VertexSemantic::TexCoord0,
+                          f4::resources::VertexFormat::F32_2, 0, 24});
+    mesh.attributes.push({f4::resources::VertexSemantic::Color0,
+                          f4::resources::VertexFormat::UNORM8_4, 0, 32});
+    mesh.indices.resize(indices.size_bytes());
+    std::memcpy(mesh.indices.data(), indices.data(), indices.size_bytes());
+    mesh.submeshes.push({0, static_cast<std::uint32_t>(indices.size())});
+    return mesh;
+}
+
+struct BenchRun {
+    double frameMs = 0.0;
+    double cpuMs = 0.0; // render() CPU time per frame
+    double gpuFrameMs = 0.0;
+    double gpuBinningMs = 0.0;
+    double gpuMainMs = 0.0;
+    int timedFrames = 0;
+    std::uint32_t visible = 0;
+    std::uint32_t maxPerCluster = 0;
+    std::uint32_t dispatches = 0;
+    bool ok = false;
+};
+
+auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool timers) -> BenchRun {
+    constexpr std::uint32_t width = 1280;
+    constexpr std::uint32_t height = 720;
+    constexpr int warmup = 20;
+    const int frames = timers ? 60 : 120;
+    BenchRun run;
+    TextureHandle color;
+    TextureHandle depth;
+    FramebufferHandle framebuffer;
+    TextureDesc colorDesc;
+    colorDesc.width = width;
+    colorDesc.height = height;
+    TextureDesc depthDesc;
+    depthDesc.width = width;
+    depthDesc.height = height;
+    depthDesc.format = TextureFormat::Depth32F;
+    if (!take(gApp.device->createTexture(colorDesc), color, "bench color target failed") ||
+        !take(gApp.device->createTexture(depthDesc), depth, "bench depth target failed")) {
+        return run;
+    }
+    FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {width, height};
+    AttachmentDesc colorAttachment;
+    colorAttachment.texture = color;
+    colorAttachment.clearOnLoad = true;
+    framebufferDesc.attachments.push(colorAttachment);
+    AttachmentDesc depthAttachment;
+    depthAttachment.type = AttachmentType::Depth;
+    depthAttachment.texture = depth;
+    depthAttachment.clearOnLoad = true;
+    framebufferDesc.attachments.push(depthAttachment);
+    if (!take(gApp.device->createFramebuffer(framebufferDesc), framebuffer,
+              "bench framebuffer failed")) {
+        return run;
+    }
+    {
+        f4::ecs::Registry registry(16384);
+        f4::engine::Renderer renderer(registry, *gApp.device);
+        if (renderer.init() == GfxError::None) {
+            auto& settings = renderer.pbrSettings();
+            settings.shadowsEnabled = false;
+            settings.ambientIntensity = 0.02f;
+            settings.pointLightsEnabled = true;
+            settings.gpuLightBinning = gpuBinning;
+            settings.gpuTimers = timers;
+            const float extent = 14.0f;
+            float range = 2.5f;
+            if (scaled) range = std::max(0.75f, 2.0f * (2.0f * extent / static_cast<float>(side - 1u)));
+
+            f4::engine::StandardMaterialDesc groundDesc;
+            groundDesc.tint = f4::math::Vec4(0.16f, 0.16f, 0.18f, 1.0f);
+            groundDesc.roughnessFactor = 0.8f;
+            groundDesc.metallicFactor = 0.0f;
+            groundDesc.doubleSided = true;
+            const auto groundMaterial = renderer.createMaterial(groundDesc);
+            const float half = extent * 1.4f;
+            const std::array<PbrVertex, 4> groundVertices{{
+                {{-half, 0.0f, -half}, {0, 1, 0}, {0, 0}, {255, 255, 255, 255}},
+                {{-half, 0.0f, half}, {0, 1, 0}, {0, 1}, {255, 255, 255, 255}},
+                {{half, 0.0f, half}, {0, 1, 0}, {1, 1}, {255, 255, 255, 255}},
+                {{half, 0.0f, -half}, {0, 1, 0}, {1, 0}, {255, 255, 255, 255}},
+            }};
+            const std::array<std::uint16_t, 6> groundIndices{{0, 1, 2, 0, 2, 3}};
+            const auto groundMesh = renderer.createMesh(makePbrMesh(groundVertices, groundIndices));
+            const f4::ecs::Entity ground = registry.create();
+            registry.emplace<f4::ecs::LocalTransform>(ground, f4::ecs::LocalTransform{});
+            registry.emplace<f4::engine::MeshRenderer>(
+                ground, f4::engine::MeshRenderer{groundMesh, groundMaterial, 0, false, false});
+
+            const auto cubeMesh = renderer.createMesh(makePbrMesh(kCubeVertices, kCubeIndices));
+            const auto lampEmission = renderer.createTexture(makeRendererTexture(255, 255, 255));
+            std::array<f4::resources::MaterialHandle, kNightPalette.size()> lampMaterials{};
+            for (std::size_t i = 0; i < kNightPalette.size(); ++i) {
+                f4::engine::StandardMaterialDesc lampDesc;
+                lampDesc.emissive = lampEmission;
+                lampDesc.tint = f4::math::Vec4(0.02f, 0.02f, 0.02f, 1.0f);
+                lampDesc.emissiveFactor = f4::math::Vec3(kNightPalette[i][0], kNightPalette[i][1],
+                                                         kNightPalette[i][2]) * 2.5f;
+                lampMaterials[i] = renderer.createMaterial(lampDesc);
+            }
+            for (std::uint32_t row = 0; row < side; ++row) {
+                for (std::uint32_t column = 0; column < side; ++column) {
+                    const float fx = static_cast<float>(column) / static_cast<float>(side - 1);
+                    const float fz = static_cast<float>(row) / static_cast<float>(side - 1);
+                    const f4::math::Vec3 position((fx * 2.0f - 1.0f) * extent, 0.6f,
+                                                  (fz * 2.0f - 1.0f) * extent);
+                    const std::size_t palette = (row * 3u + column * 5u) % kNightPalette.size();
+                    const f4::ecs::Entity light = registry.create();
+                    f4::engine::PointLight point;
+                    point.position = position;
+                    point.color = f4::math::Vec3(kNightPalette[palette][0],
+                                                 kNightPalette[palette][1],
+                                                 kNightPalette[palette][2]);
+                    point.intensity = 6.0f;
+                    point.range = range;
+                    registry.emplace<f4::engine::PointLight>(light, point);
+                    const f4::ecs::Entity lamp = registry.create();
+                    auto& transform = registry.emplace<f4::ecs::LocalTransform>(
+                        lamp, f4::ecs::LocalTransform{});
+                    transform.position = position;
+                    transform.scale = f4::math::Vec3(0.12f);
+                    registry.emplace<f4::engine::MeshRenderer>(
+                        lamp, f4::engine::MeshRenderer{cubeMesh, lampMaterials[palette], 0, false,
+                                                       false});
+                }
+            }
+            const f4::ecs::Entity cameraEntity = registry.create();
+            f4::engine::Camera camera;
+            camera.eye = {0.0f, 7.0f, 11.0f};
+            camera.center = {0.0f, 0.0f, 0.0f};
+            camera.nearPlane = 0.1f;
+            camera.farPlane = 60.0f;
+            registry.emplace<f4::engine::Camera>(cameraEntity, camera);
+            f4::ecs::updateWorldTransforms(registry);
+
+            const float aspect = static_cast<float>(width) / static_cast<float>(height);
+            const Extent frameExtent{width, height};
+            bool ok = true;
+            for (int i = 0; i < warmup && ok; ++i) {
+                ok = renderer.render(framebuffer, cameraEntity, aspect, frameExtent) ==
+                     GfxError::None;
+            }
+            gApp.device->waitIdle();
+            const double start = emscripten_get_now();
+            for (int i = 0; i < frames && ok; ++i) {
+                const double frameStart = emscripten_get_now();
+                ok = renderer.render(framebuffer, cameraEntity, aspect, frameExtent) ==
+                     GfxError::None;
+                run.cpuMs += emscripten_get_now() - frameStart;
+                if (timers) {
+                    gApp.device->waitIdle(); // yields, so the timestamp map completes
+                    const f4::engine::FrameStats& stats = renderer.stats();
+                    if (stats.gpuTimingValid) {
+                        ++run.timedFrames;
+                        run.gpuFrameMs += stats.gpuFrameMs;
+                        run.gpuBinningMs += stats.gpuLightBinningMs;
+                        run.gpuMainMs += stats.gpuMainPassMs;
+                    }
+                }
+            }
+            gApp.device->waitIdle();
+            run.frameMs = (emscripten_get_now() - start) / frames;
+            run.cpuMs /= frames;
+            if (run.timedFrames > 0) {
+                run.gpuFrameMs /= run.timedFrames;
+                run.gpuBinningMs /= run.timedFrames;
+                run.gpuMainMs /= run.timedFrames;
+            }
+            const f4::engine::FrameStats& stats = renderer.stats();
+            run.visible = stats.pointLightsVisible;
+            run.maxPerCluster = stats.maxPointLightsPerCluster;
+            run.dispatches = stats.pointLightBinningDispatches;
+            run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
+        }
+    }
+    gApp.device->destroyFramebuffer(framebuffer);
+    gApp.device->destroyTexture(depth);
+    gApp.device->destroyTexture(color);
+    return run;
+}
+
+auto runPointLightBench(int rounds) -> bool {
+    std::string report;
+    char line[512];
+    bool ok = true;
+    for (const bool scaled : {false, true}) {
+        for (const std::uint32_t side : {32u, 64u}) {
+            std::vector<double> frame[2];
+            std::vector<double> cpu[2];
+            BenchRun last[2];
+            for (int round = 0; round < rounds && ok; ++round) {
+                for (int order = 0; order < 2 && ok; ++order) {
+                    const int gpu = (round + order) % 2;
+                    last[gpu] = benchNightScene(side, scaled, gpu == 1, false);
+                    ok = last[gpu].ok && (last[gpu].dispatches == 1) == (gpu == 1);
+                    frame[gpu].push_back(last[gpu].frameMs);
+                    cpu[gpu].push_back(last[gpu].cpuMs);
+                }
+            }
+            if (!ok) break;
+            for (auto* values : {&frame[0], &frame[1], &cpu[0], &cpu[1]}) {
+                std::sort(values->begin(), values->end());
+            }
+            std::snprintf(line, sizeof(line),
+                          "[webgpu bench] %s lights=%u visible=%u max/cluster=%u/%u: CPU binning "
+                          "%.3f ms/frame (render() CPU %.3f), GPU binning %.3f ms/frame "
+                          "(render() CPU %.3f) (median of %d; min %.3f / %.3f)\n",
+                          scaled ? "scaled" : "stress", side * side, last[1].visible,
+                          last[0].maxPerCluster, last[1].maxPerCluster, frame[0][rounds / 2],
+                          cpu[0][rounds / 2], frame[1][rounds / 2], cpu[1][rounds / 2], rounds,
+                          frame[0].front(), frame[1].front());
+            report += line;
+            for (const bool gpu : {false, true}) {
+                const BenchRun timed = benchNightScene(side, scaled, gpu, true);
+                ok = ok && timed.ok;
+                std::snprintf(line, sizeof(line),
+                              "[webgpu bench] %s lights=%u %s binning, GPU timers (%d frames): "
+                              "GPU frame %.3f ms, binning pass %.3f ms, main pass %.3f ms\n",
+                              scaled ? "scaled" : "stress", side * side, gpu ? "GPU" : "CPU",
+                              timed.timedFrames, timed.gpuFrameMs, timed.gpuBinningMs,
+                              timed.gpuMainMs);
+                report += line;
+            }
+        }
+    }
+    std::printf("%s", report.c_str());
+    for (char& c : report) {
+        if (c == '\n') c = '|';
+        if (c == '\'' || c == '\\') c = ' ';
+    }
+    const std::string script = "document.body.dataset.f4Bench='" + report + "';" +
+                               "document.body.dataset.f4BenchDone='" +
+                               (ok ? "true" : "false") + "';";
+    emscripten_run_script(script.c_str());
+    return ok;
 }
 
 auto setValidationScene(std::uint32_t index) -> bool {
@@ -1124,6 +1446,13 @@ int main() {
         return 1;
     }
     gApp.webGpu = static_cast<WebGpuDevice*>(gApp.device);
+    const int benchRounds = EM_ASM_INT({
+        return parseInt(new URLSearchParams(location.search).get('bench') || '0', 10) || 0;
+    });
+    if (benchRounds > 0) {
+        runPointLightBench(benchRounds);
+        return 0;
+    }
     if (!gApp.webGpu->supportsSurfaceFormat(gApp.surfaceFormat)) {
         fail("Browser WebGPU surface does not support RGBA8_UNORM");
         return 1;

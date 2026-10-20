@@ -211,6 +211,9 @@ async function run() {
                 "--headless=new",
                 "--enable-gpu",
                 "--enable-unsafe-webgpu",
+                // Unquantized timestamp-query results (Chrome rounds them to
+                // 100 us otherwise), so the GPU-timer check sees real pass times.
+                "--enable-webgpu-developer-features",
                 "--disable-extensions",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -237,6 +240,29 @@ async function run() {
         await devTools.call("Runtime.enable");
         await devTools.call("Page.enable");
         await devTools.call("Log.enable");
+        // F4_WEBGPU_BENCH=<rounds>: run the point-light bench page instead of
+        // the smoke and print its report.
+        const benchRounds = Number.parseInt(process.env.F4_WEBGPU_BENCH ?? "0", 10) || 0;
+        if (benchRounds > 0) {
+            await devTools.call("Page.navigate", { url: `${url}?bench=${benchRounds}` });
+            const benchDeadline = Date.now() + 900000;
+            let bench;
+            while (Date.now() < benchDeadline) {
+                bench = await evaluateJson(devTools, `({
+                    done: document.body?.dataset.f4BenchDone ?? null,
+                    report: document.body?.dataset.f4Bench ?? null,
+                    output: document.getElementById("output")?.textContent ?? null
+                })`);
+                if (bench.done !== null || bench.output?.includes("Aborted")) break;
+                await delay(500);
+            }
+            console.log((bench?.report ?? "").split("|").join("\n"));
+            if (bench?.done !== "true") {
+                throw new Error(`WebGPU bench failed: ${JSON.stringify(bench)}\n` +
+                                browserErrors(devTools.events).join("\n"));
+            }
+            return;
+        }
         await devTools.call("Page.navigate", { url });
 
         const stateExpression = `({
@@ -257,6 +283,8 @@ async function run() {
             pointShadowLoss: document.body?.dataset.f4PointShadowLoss ?? null,
             bloom: document.body?.dataset.f4Bloom ?? null,
             bloomStats: document.body?.dataset.f4BloomStats ?? null,
+            gpuTimers: document.body?.dataset.f4GpuTimers ?? null,
+            gpuTimerStats: document.body?.dataset.f4GpuTimerStats ?? null,
             validationScene: document.body?.dataset.f4ValidationScene ?? null,
             sceneIndex: document.body?.dataset.f4SceneIndex ?? null,
             resizeCount: document.body?.dataset.f4ResizeCount ?? null,
@@ -297,6 +325,18 @@ async function run() {
         }
         if (state.output) errors.push(state.output.trim());
         if (errors.length !== 0) throw new Error(`Browser validation errors:\n${errors.join("\n")}`);
+
+        // GPU timers: with timestamp-query on the adapter the app must have
+        // timed the binning and main passes; without it, report unavailable.
+        const timestampQuery = await evaluateJsonAsync(devTools, `(async () => {
+            const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+            return adapter ? adapter.features.has("timestamp-query") : false;
+        })()`);
+        const expectedTimers = timestampQuery ? "true" : "unavailable";
+        if (state.gpuTimers !== expectedTimers) {
+            throw new Error(
+                `WebGPU GPU timers ${state.gpuTimers} (expected ${expectedTimers}): ${state.gpuTimerStats}`);
+        }
 
         const initialResizeCount = Number.parseInt(state.resizeCount, 10);
         await devTools.call("Emulation.setDeviceMetricsOverride", {
@@ -576,6 +616,7 @@ async function run() {
             `point-light red/other gain=${state.pointLightGain}; ` +
             `point-shadow red loss/brighter=${state.pointShadowLoss}; ` +
             `bloom zero-delta/glow pixels=${state.bloomStats}; ` +
+            `GPU timers ${state.gpuTimers} (${state.gpuTimerStats}); ` +
             `M11 parity max=${parityMaxChannelDelta}; ` +
             `effect parity ${effectSummaries.join(", ")}; ` +
             `PBR pixels=${visual.foreground}; colors=${visual.colorBins}; ` +
