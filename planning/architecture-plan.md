@@ -563,7 +563,8 @@ Completed delivery and acceptance gates:
   counted in `FrameStats`). The PBR fragment shader on every backend looks up
   its cluster from `viewProj * worldPos` and adds GGX point lighting with a
   smooth range window `(1-(d/r)^4)^2 / (d^2+1)`. Directional light, shadow, IBL,
-  emissive, and tone mapping are unchanged, and point lights cast no shadows.
+  emissive, and tone mapping are unchanged. Point-light shadows and HDR bloom
+  were added afterwards (see below).
   The storage buffer uses RHI slot 7: GL SSBO binding 7, Vulkan/WebGPU flat
   binding 31, and DX12 `t7` (SRVs share `t` registers with textures 0-6). Metal
   uses slot 1 (`[[buffer(17)]]`) because it exposes only seven buffer slots.
@@ -593,9 +594,70 @@ Completed delivery and acceptance gates:
     DX12 1.6 / 5.3 ms.
   - Before the fix, OpenGL and DX12 ran on the Intel Iris Xe iGPU (scaled
     4.2 / 8.2 ms and 8.0 / 17.4 ms; stress 4,096 lights at 27.5 and 67 ms).
-- Point lights are still open on two fronts. Metal has the shader and binding
-  but was not compiled or run (no Apple hardware). There is no bloom, no
-  point-light shadows, and no GPU-side binning.
+- ✅ HDR bloom (2026-10-20, branch `lights/point-lights`). With
+  `PbrRenderSettings::bloomEnabled` the PBR pass writes exposed linear HDR to an
+  RGBA16F target instead of tonemapped sRGB. A threshold/soft-knee prefilter
+  (`bloomThreshold` 1.0, `bloomKnee` 0.5) feeds a 13-tap downsample chain of
+  `bloomLevels` half-resolution mips (default 5) and a tent-filter upsample
+  chain. The composite adds `bloomIntensity` (default 0.6) times the glow, then
+  applies ACES and sRGB encoding exactly as the non-bloom path does. The post
+  shaders (`post_bloom_*`) derive UVs from `fragCoord / targetSize` so every
+  backend samples the same texels. `Renderer::render(fb, camera, aspect, extent)`
+  needs the output extent when bloom is on. Bloom is off by default, so all
+  existing goldens are unchanged. Intensity 0 matches bloom-off within 1 level
+  on GL, Vulkan, and DX12.
+- ✅ Point-light shadows (same branch). `PointLight::castShadows` flags a light.
+  Each frame, up to `pointShadowBudget` (0-16, default 8) flagged lights whose
+  range reaches the view are kept, preferring the brightest and nearest.
+  Each kept light gets six 256-texel tiles in an R16F cube-face atlas (plus
+  D32F depth) that store `distance / range`. Casters are culled against the
+  light sphere and each face frustum, then drawn instanced (the model matrix
+  goes through vertex attributes 9-12 from a `DynamicBufferRing`) once per face.
+  Each draw uses the new viewport/scissor origin in the RHI to target its tile.
+  Clustered light records carry the shadow slot in words 10-14. The PBR fragment
+  shaders pick the cube face, do a 3x3 PCF lookup in the atlas (VK/WebGPU
+  binding 33/34, GL unit 8, DX12 `t8/s8`, Metal texture/sampler 7), and apply a
+  bias of 0.02 x range. With no flagged lights the atlas pass is skipped. The
+  sun shadow is untouched.
+- ✅ RHI: `CommandBuffer::setViewport/setScissor` take an `(x, y)` origin in
+  attachment pixels. OpenGL, Vulkan (flipped-height viewport), DX12, WebGPU, and
+  Metal (unverified) all pass it through.
+- ✅ Evidence (`tests/engine/test_point_lights.cpp`, 461/461 `f4_tests` in
+  release and debug):
+  - NullDevice tests cover face selection and matrices, atlas tiles, budget
+    ordering, slot words, and the bloom mip chain.
+  - A GPU night scene runs on GL, Vulkan, and DX12. Shadows darken 220 pixels
+    and brighten none. Bloom at intensity 1.0 / threshold 0.6 lights 15,318
+    more pixels, raising mean luma from 98.6 to 125.7.
+  - Parity: GL/VK and GL/DX have 0 mismatching pixels for shadows (max delta
+    1), bloom (0), and shadows+bloom (0). Validation is clean in debug.
+  - WebGPU: the Chromium smoke renders an occluder in front of a point light and
+    bloom at intensity 0 and 1.5. It compares both frames against locked
+    fixtures (`tests/fixtures/renderer_{point_shadow,bloom}_reference.rgba`)
+    that a native test renders from the same scene. Max delta is 1 against a
+    tolerance of 2; native GL/VK/DX12 match the fixtures exactly. Regenerate
+    the fixtures with `F4_UPDATE_EFFECT_FIXTURES=1`.
+  - `demo_bench` scene 20 enables both. Keys: B toggles bloom, -/= change
+    intensity, ;/' change threshold, K toggles point shadows, and ,/. change
+    the shadow budget. Pillars cast the shadows.
+- ✅ Frame cost at 1280x720 with 1,024 lights on the RTX 3070 Ti Laptop GPU.
+  Ranges are over two runs:
+
+  | Backend | base | +bloom (10 passes) | +32x32 pillars | 4 / 8 / 16 shadowed | 8 shadowed + bloom |
+  |---|---|---|---|---|---|
+  | Vulkan | 0.83-1.13 | 0.87-0.96 | 1.22-1.24 | 1.8-2.5 / 1.4-1.7 / 2.0 | 2.2-2.7 |
+  | OpenGL | 1.06-1.18 | 1.06-1.13 | 1.38-1.40 | 2.0 / 1.8 / 2.2-2.3 | 2.4-2.8 |
+  | DX12 | 1.26-1.50 | 1.31-1.32 | 1.50-1.58 | 2.0 / 1.8-1.9 / 2.5-2.6 | 2.2-2.3 |
+
+  All times are ms/frame. Bloom is within noise at 720p. Point shadows add
+  about 0.4-1.0 ms on top of the pillar scene for 8-16 lights (6 instanced
+  draws per light). The 4-light case runs first and absorbs the atlas and
+  pipeline warm-up. Before instancing, the per-entity, per-face draws exhausted
+  the device buffer arena (crash at 16 lights x 1,024 pillars).
+- Still open: Metal has every shader and binding written but was not compiled
+  or run (no Apple hardware). Point-light binning stays on the CPU. Shadow
+  tiles are re-rendered every frame with no caching for static lights. Bloom
+  has no lens dirt or anamorphic options.
 - ✅ Adapter selection (2026-10-20). Every backend now picks the strongest
   GPU by default, using one ranking in `graphics/gpu_selection.*`: discrete,
   then integrated, then virtual/other, with software rasterizers (WARP /
