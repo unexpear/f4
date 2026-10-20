@@ -28,6 +28,8 @@ struct SceneUbo {
 @group(0) @binding(22) var environmentSampler: sampler;
 @group(0) @binding(25) var shadowTexture: texture_2d<f32>;
 @group(0) @binding(26) var shadowSampler: sampler;
+// Storage slot 7 flattens to binding 7 * 4 + StorageBuffer(3) = 31.
+@group(0) @binding(31) var<storage, read> pointLightWords: array<u32>;
 
 const PI = 3.14159265358979323846;
 
@@ -125,6 +127,67 @@ fn shadowVisibility(input: FragmentInput, nDotL: f32) -> f32 {
     return visibility / 9.0;
 }
 
+fn pointLightFloat(word: u32) -> f32 {
+    return bitcast<f32>(pointLightWords[word]);
+}
+
+// Clustered point lights: see engine/lighting/clustered_lights.h for the word
+// layout and the shared cluster lookup.
+fn pointLightsDirect(worldPosition: vec3f, n: vec3f, v: vec3f, baseColor: vec3f,
+                     metallic: f32, roughness: f32, f0: vec3f) -> vec3f {
+    let lightCount = pointLightWords[0];
+    if (lightCount == 0u) { return vec3f(0.0); }
+    let clip = scene.viewProj * vec4f(worldPosition, 1.0);
+    if (clip.w <= 0.0) { return vec3f(0.0); }
+    let tilesX = pointLightWords[1];
+    let tilesY = pointLightWords[2];
+    let slices = pointLightWords[3];
+    let ndc = clip.xy / clip.w;
+    let tileX = u32(clamp(floor((ndc.x * 0.5 + 0.5) * f32(tilesX)), 0.0,
+                          f32(tilesX - 1u)));
+    let tileY = u32(clamp(floor((ndc.y * 0.5 + 0.5) * f32(tilesY)), 0.0,
+                          f32(tilesY - 1u)));
+    let sliceValue = floor(log2(max(clip.w, 1.0e-4)) * pointLightFloat(8u) +
+                           pointLightFloat(9u));
+    let slice = u32(clamp(sliceValue, 0.0, f32(slices - 1u)));
+    let cluster = (slice * tilesY + tileY) * tilesX + tileX;
+    let clusterWord = pointLightWords[5] + cluster * 2u;
+    let first = pointLightWords[clusterWord];
+    let count = pointLightWords[clusterWord + 1u];
+    let lightBase = pointLightWords[4];
+    var sum = vec3f(0.0);
+    for (var i = 0u; i < count; i += 1u) {
+        let record = lightBase + pointLightWords[first + i] * 8u;
+        let position = vec3f(pointLightFloat(record), pointLightFloat(record + 1u),
+                             pointLightFloat(record + 2u));
+        let range = pointLightFloat(record + 3u);
+        let toLight = position - worldPosition;
+        let distanceSq = dot(toLight, toLight);
+        let rangeSq = range * range;
+        if (distanceSq >= rangeSq) { continue; }
+        let lightDistance = sqrt(distanceSq);
+        let l = select(n, toLight / lightDistance, lightDistance > 1.0e-5);
+        let nDotL = max(dot(n, l), 0.0);
+        if (nDotL <= 0.0) { continue; }
+        let radiance = vec3f(pointLightFloat(record + 4u), pointLightFloat(record + 5u),
+                             pointLightFloat(record + 6u));
+        let h = normalize(v + l);
+        let nDotV = max(dot(n, v), 0.0);
+        let nDotH = max(dot(n, h), 0.0);
+        let hDotV = max(dot(h, v), 0.0);
+        let f = fresnelSchlick(hDotV, f0);
+        let distribution = distributionGgx(nDotH, roughness);
+        let geometry = geometrySmith(nDotV, nDotL, roughness);
+        let specular = distribution * geometry * f / max(4.0 * nDotV * nDotL, 1.0e-5);
+        let diffuse = (vec3f(1.0) - f) * (1.0 - metallic) * baseColor / PI;
+        let ratio = distanceSq / rangeSq;
+        let window = clamp(1.0 - ratio * ratio, 0.0, 1.0);
+        let attenuation = window * window / (distanceSq + 1.0);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL);
+    }
+    return sum;
+}
+
 fn acesToneMap(color: vec3f) -> vec3f {
     let a = 2.51;
     let b = 0.03;
@@ -181,6 +244,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
         let direct = (diffuse + specular) * radiance * nDotL *
                      shadowVisibility(input, nDotL);
 
+        let pointDirect = pointLightsDirect(input.worldPosition, n, v, base.rgb, metallic,
+                                            roughness, f0);
+
         let reflection = reflect(-v, n);
         let irradiance = textureSampleLevel(environmentTexture, environmentSampler,
                                             environmentUv(n), scene.renderParams.w).rgb;
@@ -198,7 +264,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
                               base.rgb * irradiance;
         let ao = mix(1.0, textureSample(occlusionTexture, occlusionSampler,
                                         input.uv).r, scene.materialParams.z);
-        color = direct + (indirectDiffuse + indirectSpecular) * ao *
+        color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao *
                          scene.ambientFlags.x + emissive;
     }
     return vec4f(linearToSrgb(acesToneMap(color * scene.cameraExposure.w)), base.a);

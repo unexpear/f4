@@ -29,6 +29,10 @@ layout(set = 0, binding = 21) uniform texture2D uTex5;
 layout(set = 0, binding = 22) uniform sampler uSmp5;
 layout(set = 0, binding = 25) uniform texture2D uTex6;
 layout(set = 0, binding = 26) uniform sampler uSmp6;
+// Storage slot 7 flattens to binding 7 * 4 + StorageBuffer(3) = 31.
+layout(set = 0, binding = 31, std430) readonly buffer PointLightData {
+    uint pointLightWords[];
+};
 
 layout(location = 0) in vec3 vWorldPosition;
 layout(location = 1) in vec3 vWorldNormal;
@@ -120,6 +124,67 @@ float shadowVisibility(float nDotL) {
     return visibility / 9.0;
 }
 
+float pointLightFloat(uint word) {
+    return uintBitsToFloat(pointLightWords[word]);
+}
+
+// Clustered point lights: see engine/lighting/clustered_lights.h for the word
+// layout and the shared cluster lookup.
+vec3 pointLightsDirect(vec3 n, vec3 v, vec3 baseColor, float metallic, float roughness,
+                       vec3 f0) {
+    uint lightCount = pointLightWords[0];
+    if (lightCount == 0u) return vec3(0.0);
+    vec4 clip = viewProj * vec4(vWorldPosition, 1.0);
+    if (clip.w <= 0.0) return vec3(0.0);
+    uint tilesX = pointLightWords[1];
+    uint tilesY = pointLightWords[2];
+    uint slices = pointLightWords[3];
+    vec2 ndc = clip.xy / clip.w;
+    uint tileX = uint(clamp(floor((ndc.x * 0.5 + 0.5) * float(tilesX)), 0.0,
+                            float(tilesX - 1u)));
+    uint tileY = uint(clamp(floor((ndc.y * 0.5 + 0.5) * float(tilesY)), 0.0,
+                            float(tilesY - 1u)));
+    float sliceValue = floor(log2(max(clip.w, 1.0e-4)) * pointLightFloat(8u) +
+                             pointLightFloat(9u));
+    uint slice = uint(clamp(sliceValue, 0.0, float(slices - 1u)));
+    uint cluster = (slice * tilesY + tileY) * tilesX + tileX;
+    uint clusterWord = pointLightWords[5] + cluster * 2u;
+    uint first = pointLightWords[clusterWord];
+    uint count = pointLightWords[clusterWord + 1u];
+    uint lightBase = pointLightWords[4];
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < count; ++i) {
+        uint record = lightBase + pointLightWords[first + i] * 8u;
+        vec3 position = vec3(pointLightFloat(record), pointLightFloat(record + 1u),
+                             pointLightFloat(record + 2u));
+        float range = pointLightFloat(record + 3u);
+        vec3 toLight = position - vWorldPosition;
+        float distanceSq = dot(toLight, toLight);
+        float rangeSq = range * range;
+        if (distanceSq >= rangeSq) continue;
+        float lightDistance = sqrt(distanceSq);
+        vec3 l = lightDistance > 1.0e-5 ? toLight / lightDistance : n;
+        float nDotL = max(dot(n, l), 0.0);
+        if (nDotL <= 0.0) continue;
+        vec3 radiance = vec3(pointLightFloat(record + 4u), pointLightFloat(record + 5u),
+                             pointLightFloat(record + 6u));
+        vec3 h = normalize(v + l);
+        float nDotV = max(dot(n, v), 0.0);
+        float nDotH = max(dot(n, h), 0.0);
+        float hDotV = max(dot(h, v), 0.0);
+        vec3 f = fresnelSchlick(hDotV, f0);
+        float d = distributionGgx(nDotH, roughness);
+        float g = geometrySmith(nDotV, nDotL, roughness);
+        vec3 specular = d * g * f / max(4.0 * nDotV * nDotL, 1.0e-5);
+        vec3 diffuse = (vec3(1.0) - f) * (1.0 - metallic) * baseColor / PI;
+        float ratio = distanceSq / rangeSq;
+        float window = clamp(1.0 - ratio * ratio, 0.0, 1.0);
+        float attenuation = window * window / (distanceSq + 1.0);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL);
+    }
+    return sum;
+}
+
 vec3 acesToneMap(vec3 color) {
     const float a = 2.51;
     const float b = 0.03;
@@ -172,6 +237,8 @@ void main() {
         vec3 radiance = lightColorRoughness.rgb * lightDirectionIntensity.w;
         vec3 direct = (diffuse + specular) * radiance * nDotL * shadowVisibility(nDotL);
 
+        vec3 pointDirect = pointLightsDirect(n, v, base.rgb, metallic, roughness, f0);
+
         vec3 reflection = reflect(-v, n);
         vec3 irradiance = textureLod(sampler2D(uTex5, uSmp5), environmentUv(n),
                                      renderParams.w).rgb;
@@ -187,7 +254,7 @@ void main() {
         vec3 indirectDiffuse = (vec3(1.0) - envF) * (1.0 - metallic) *
                                base.rgb * irradiance;
         float ao = mix(1.0, texture(sampler2D(uTex3, uSmp3), vUv).r, materialParams.z);
-        color = direct + (indirectDiffuse + indirectSpecular) * ao * ambientFlags.x +
+        color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao * ambientFlags.x +
                 emissive;
     }
     outColor = vec4(linearToSrgb(acesToneMap(color * cameraExposure.w)), base.a);

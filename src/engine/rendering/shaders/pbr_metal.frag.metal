@@ -123,6 +123,70 @@ float shadowVisibility(VertexOutput input, float nDotL,
     return visibility / 9.0f;
 }
 
+float pointLightFloat(device const uint* words, uint word) {
+    return as_type<float>(words[word]);
+}
+
+// Clustered point lights: see engine/lighting/clustered_lights.h for the word
+// layout and the shared cluster lookup.
+float3 pointLightsDirect(float3 worldPosition, float3 n, float3 v, float3 baseColor,
+                         float metallic, float roughness, float3 f0,
+                         constant SceneUbo& scene, device const uint* words) {
+    const uint lightCount = words[0];
+    if (lightCount == 0u) return float3(0.0f);
+    const float4 clip = scene.viewProj * float4(worldPosition, 1.0f);
+    if (clip.w <= 0.0f) return float3(0.0f);
+    const uint tilesX = words[1];
+    const uint tilesY = words[2];
+    const uint slices = words[3];
+    const float2 ndc = clip.xy / clip.w;
+    const uint tileX = uint(clamp(floor((ndc.x * 0.5f + 0.5f) * float(tilesX)), 0.0f,
+                                  float(tilesX - 1u)));
+    const uint tileY = uint(clamp(floor((ndc.y * 0.5f + 0.5f) * float(tilesY)), 0.0f,
+                                  float(tilesY - 1u)));
+    const float sliceValue = floor(log2(max(clip.w, 1.0e-4f)) * pointLightFloat(words, 8u) +
+                                   pointLightFloat(words, 9u));
+    const uint slice = uint(clamp(sliceValue, 0.0f, float(slices - 1u)));
+    const uint cluster = (slice * tilesY + tileY) * tilesX + tileX;
+    const uint clusterWord = words[5] + cluster * 2u;
+    const uint first = words[clusterWord];
+    const uint count = words[clusterWord + 1u];
+    const uint lightBase = words[4];
+    float3 sum = float3(0.0f);
+    for (uint i = 0u; i < count; ++i) {
+        const uint record = lightBase + words[first + i] * 8u;
+        const float3 position = float3(pointLightFloat(words, record),
+                                       pointLightFloat(words, record + 1u),
+                                       pointLightFloat(words, record + 2u));
+        const float range = pointLightFloat(words, record + 3u);
+        const float3 toLight = position - worldPosition;
+        const float distanceSq = dot(toLight, toLight);
+        const float rangeSq = range * range;
+        if (distanceSq >= rangeSq) continue;
+        const float lightDistance = sqrt(distanceSq);
+        const float3 l = lightDistance > 1.0e-5f ? toLight / lightDistance : n;
+        const float nDotL = max(dot(n, l), 0.0f);
+        if (nDotL <= 0.0f) continue;
+        const float3 radiance = float3(pointLightFloat(words, record + 4u),
+                                       pointLightFloat(words, record + 5u),
+                                       pointLightFloat(words, record + 6u));
+        const float3 h = normalize(v + l);
+        const float nDotV = max(dot(n, v), 0.0f);
+        const float nDotH = max(dot(n, h), 0.0f);
+        const float hDotV = max(dot(h, v), 0.0f);
+        const float3 f = fresnelSchlick(hDotV, f0);
+        const float d = distributionGgx(nDotH, roughness);
+        const float g = geometrySmith(nDotV, nDotL, roughness);
+        const float3 specular = d * g * f / max(4.0f * nDotV * nDotL, 1.0e-5f);
+        const float3 diffuse = (1.0f - f) * (1.0f - metallic) * baseColor / kPi;
+        const float ratio = distanceSq / rangeSq;
+        const float window = clamp(1.0f - ratio * ratio, 0.0f, 1.0f);
+        const float attenuation = window * window / (distanceSq + 1.0f);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL);
+    }
+    return sum;
+}
+
 float3 acesToneMap(float3 color) {
     const float a = 2.51f;
     const float b = 0.03f;
@@ -150,6 +214,8 @@ fragment float4 pbr_fragment(
     sampler environmentSampler [[sampler(5)]],
     texture2d<float> shadowTexture [[texture(6)]],
     sampler shadowSampler [[sampler(6)]],
+    // Metal uses storage slot 1 (see pointLightStorageSlot): 16 + 1 = 17.
+    device const uint* pointLightWords [[buffer(17)]],
     bool frontFacing [[front_facing]]) {
     const int flags = int(scene.ambientFlags.y + 0.5f);
     const float4 baseSample = baseColorTexture.sample(baseColorSampler, input.uv);
@@ -201,6 +267,10 @@ fragment float4 pbr_fragment(
                               shadowVisibility(input, nDotL, scene,
                                                shadowTexture, shadowSampler);
 
+        const float3 pointDirect = pointLightsDirect(input.worldPosition, normal, view,
+                                                     base.rgb, metallic, roughness, f0,
+                                                     scene, pointLightWords);
+
         const float3 reflection = reflect(-view, normal);
         const float3 irradiance = environmentTexture.sample(
             environmentSampler, environmentUv(normal),
@@ -221,7 +291,7 @@ fragment float4 pbr_fragment(
         const float ao = mix(1.0f,
                              occlusionTexture.sample(occlusionSampler, input.uv).r,
                              scene.materialParams.z);
-        color = direct + (indirectDiffuse + indirectSpecular) * ao *
+        color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao *
                          scene.ambientFlags.x + emissive;
     }
     return float4(linearToSrgb(acesToneMap(color * scene.cameraExposure.w)), base.a);

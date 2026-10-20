@@ -99,6 +99,7 @@ add_executable(f4_webgpu_app
     ../demos/demo_cornell_box.cpp
     ../demos/demo_render_validation.cpp
     ../demos/demo_terrain.cpp
+    ../engine/lighting/clustered_lights.cpp
     ../engine/rendering/gpu_mesh.cpp
     ../engine/rendering/material.cpp
     ../engine/rendering/render_queue.cpp

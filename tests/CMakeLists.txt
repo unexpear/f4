@@ -52,6 +52,7 @@ add_executable(f4_tests
     engine/test_m14.cpp
     engine/test_m15.cpp
     engine/test_m16.cpp
+    engine/test_point_lights.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::doctest)

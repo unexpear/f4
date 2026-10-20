@@ -272,6 +272,12 @@ struct DxBufferRecord {
     std::uint64_t allocationBytes = 0;
     bool upload = false;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    // HostWrite storage buffers: CPU writes land in this upload-heap twin and
+    // are copied into the default-heap resource at the start of the next
+    // submit, instead of a blocking executeImmediate per write.
+    ComPtr<ID3D12Resource> staging;
+    std::uint64_t pendingBegin = 0;
+    std::uint64_t pendingEnd = 0;
 };
 
 struct DxTextureRecord {
@@ -349,6 +355,7 @@ struct Dx12Device::Impl {
     std::uint64_t lastSubmittedFence = 0;
     std::uint64_t completedFence = 0;
     HANDLE fenceEvent = nullptr;
+    std::vector<BufferHandle> pendingHostWrites;
     HWND window = nullptr;
     char deviceName[128]{};
     std::uint32_t featureLevel = 0;
@@ -691,6 +698,15 @@ auto Dx12Device::createBuffer(const BufferDesc& desc,
             });
             if (FAILED(result)) return toGfxError(result);
         }
+    }
+    if (!record.upload && hasUsage(desc.usage, BufferUsage::HostWrite)) {
+        const D3D12_HEAP_PROPERTIES stagingProperties = heapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC stagingDesc = bufferResourceDesc(record.allocationBytes);
+        result = impl_->device->CreateCommittedResource(
+            &stagingProperties, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_ID3D12Resource,
+            record.staging.putVoid());
+        if (FAILED(result)) return toGfxError(result);
     }
     const BufferHandle handle = impl_->buffers.create(std::move(record));
     ++impl_->stats.bufferCount;
@@ -1106,6 +1122,7 @@ auto Dx12Device::destroyBuffer(BufferHandle handle) -> GfxError {
     if (record == nullptr) return GfxError::StaleHandle;
     const std::uint64_t bytes = record->rec.sizeBytes;
     retainForRetirement(*impl_, record->resource.get());
+    retainForRetirement(*impl_, record->staging.get());
     impl_->buffers.destroy(handle);
     --impl_->stats.bufferCount;
     impl_->stats.bufferBytes -= bytes;
@@ -1172,6 +1189,25 @@ auto Dx12Device::writeBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (data.empty()) return GfxError::None;
+    if (record->staging) {
+        void* mapped = nullptr;
+        const D3D12_RANGE readRange{0, 0};
+        const HRESULT result = record->staging->Map(0, &readRange, &mapped);
+        if (FAILED(result)) return toGfxError(result);
+        std::memcpy(static_cast<std::byte*>(mapped) + offset, data.data(), data.size());
+        const D3D12_RANGE writtenRange{static_cast<SIZE_T>(offset),
+                                       static_cast<SIZE_T>(offset + data.size())};
+        record->staging->Unmap(0, &writtenRange);
+        if (record->pendingEnd <= record->pendingBegin) {
+            impl_->pendingHostWrites.push_back(handle);
+            record->pendingBegin = offset;
+            record->pendingEnd = offset + data.size();
+        } else {
+            record->pendingBegin = std::min<std::uint64_t>(record->pendingBegin, offset);
+            record->pendingEnd = std::max<std::uint64_t>(record->pendingEnd, offset + data.size());
+        }
+        return GfxError::None;
+    }
     if (record->upload) {
         void* mapped = nullptr;
         const D3D12_RANGE readRange{0, 0};
@@ -1219,6 +1255,21 @@ auto Dx12Device::readBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (destination.empty()) return GfxError::None;
+    if (record->staging && record->pendingEnd > record->pendingBegin) {
+        const HRESULT flushed = impl_->executeImmediate([&](ID3D12GraphicsCommandList* list) {
+            transition(list, record->resource.get(), record->state,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(record->resource.get(), record->pendingBegin,
+                                   record->staging.get(), record->pendingBegin,
+                                   record->pendingEnd - record->pendingBegin);
+            transition(list, record->resource.get(), record->state,
+                       static_cast<D3D12_RESOURCE_STATES>(
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+        });
+        if (FAILED(flushed)) return toGfxError(flushed);
+        record->pendingBegin = record->pendingEnd = 0;
+    }
     if (record->upload) {
         waitIdle();
         void* mapped = nullptr;
@@ -1408,6 +1459,18 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     if (frame.resources) shaderHeaps[shaderHeapCount++] = frame.resources.get();
     if (frame.samplers) shaderHeaps[shaderHeapCount++] = frame.samplers.get();
     if (shaderHeapCount != 0) list->SetDescriptorHeaps(shaderHeapCount, shaderHeaps.data());
+    for (const BufferHandle pending : impl_->pendingHostWrites) {
+        DxBufferRecord* record = impl_->buffers.get(pending);
+        if (record == nullptr || record->pendingEnd <= record->pendingBegin) continue;
+        transition(list, record->resource.get(), record->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(record->resource.get(), record->pendingBegin,
+                               record->staging.get(), record->pendingBegin,
+                               record->pendingEnd - record->pendingBegin);
+        transition(list, record->resource.get(), record->state,
+                   static_cast<D3D12_RESOURCE_STATES>(
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    }
 
     const UINT resourceIncrement = impl_->device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1875,6 +1938,12 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
 
     ID3D12CommandList* lists[] = {list};
     impl_->queue->ExecuteCommandLists(1, lists);
+    for (const BufferHandle pending : impl_->pendingHostWrites) {
+        if (DxBufferRecord* record = impl_->buffers.get(pending)) {
+            record->pendingBegin = record->pendingEnd = 0;
+        }
+    }
+    impl_->pendingHostWrites.clear();
     HRESULT presentResult = S_OK;
     if (usedSwapchain && submissionSwapchain != nullptr) {
         const UINT syncInterval = submissionSwapchain->rec.presentMode == PresentMode::Immediate

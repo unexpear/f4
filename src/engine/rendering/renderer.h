@@ -6,6 +6,7 @@
 #include "core/resources/resource_ids.h"
 #include "core/resources/texture.h"
 #include "engine/cameras/camera.h"
+#include "engine/lighting/clustered_lights.h"
 #include "engine/rendering/gpu_mesh.h"
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
@@ -22,6 +23,13 @@ struct FrameStats {
     std::uint32_t frustumCulled = 0;
     std::uint32_t draws = 0;
     std::uint32_t instances = 0;
+    // Clustered point lights: submitted ECS lights, lights surviving camera
+    // culling, total cluster references, and references dropped by the cap.
+    std::uint32_t pointLights = 0;
+    std::uint32_t pointLightsVisible = 0;
+    std::uint32_t pointLightReferences = 0;
+    std::uint32_t pointLightReferencesDropped = 0;
+    std::uint32_t maxPointLightsPerCluster = 0;
 };
 
 struct PbrRenderSettings {
@@ -36,6 +44,8 @@ struct PbrRenderSettings {
     bool shadowsEnabled = true;
     bool frustumCullingEnabled = true;
     bool batchingEnabled = true;
+    bool pointLightsEnabled = true;
+    ClusterGridConfig pointLightClusters{};
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -88,6 +98,10 @@ public:
     void record(gfx::CommandBuffer& cb, ecs::Entity cameraEntity, float aspect);
 
     [[nodiscard]] auto stats() const -> FrameStats { return stats_; }
+    // Word buffer most recently uploaded for clustered point lights.
+    [[nodiscard]] auto pointLightWords() const -> std::span<const std::uint32_t> {
+        return {pointLightWords_.data(), pointLightWords_.size()};
+    }
     [[nodiscard]] auto graph() -> gfx::RenderGraph& { return graph_; }
 
 private:
@@ -109,6 +123,8 @@ private:
     };
 
     void recordShadow(gfx::CommandBuffer& cb);
+    [[nodiscard]] auto preparePointLights(const Camera& camera, float aspect)
+        -> gfx::BufferHandle;
     void releaseInitializationResources();
     [[nodiscard]] auto resolveTexture(resources::TextureHandle texture,
                                       gfx::TextureHandle fallback) const
@@ -128,6 +144,11 @@ private:
     ConstantRing sceneConstants_;
     ConstantRing shadowConstants_;
     DynamicBufferRing sceneInstances_;
+    // Read-only storage buffer per frame holding the clustered point lights.
+    DynamicBufferRing pointLightBuffers_;
+    containers::Array<ClusteredLightInput> pointLightInputs_;
+    containers::Array<std::uint32_t> pointLightWords_;
+    gfx::BufferHandle framePointLights_{};
     gfx::TextureHandle whiteTex_{};
     gfx::TextureHandle neutralNormalTex_{};
     gfx::TextureHandle blackTex_{};

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <limits>
 
+#include "engine/lighting/clustered_lights.h"
 #include "graphics/shader/shader_desc.h"
 
 #if defined(F4_WEBGPU_SHADER_HEADER)
@@ -210,7 +211,7 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
     return static_cast<bool>(file.read(reinterpret_cast<char*>(output.blob.data()), size));
 }
 
-void addPbrBindings(gfx::PipelineStateDesc& pipeline) {
+void addPbrBindings(gfx::PipelineStateDesc& pipeline, gfx::Backend backend) {
     gfx::BindGroup group;
     group.bindPoint = 0;
     group.slots.push({0, gfx::BindingType::UniformBuffer,
@@ -223,6 +224,9 @@ void addPbrBindings(gfx::PipelineStateDesc& pipeline) {
         group.slots.push({slot, gfx::BindingType::Sampler,
                           gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
     }
+    // Clustered point lights: one read-only word buffer for the fragment stage.
+    group.slots.push({pointLightStorageSlot(backend), gfx::BindingType::StorageBuffer,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
     pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
 }
 
@@ -410,7 +414,7 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
         color.dstAlpha = gfx::BlendFactor::OneMinusSrcAlpha;
     }
     pipeline.colorAttachments.push(color);
-    addPbrBindings(pipeline);
+    addPbrBindings(pipeline, dev.backend());
 
     auto result = dev.createPipeline(pipeline);
     if (!result.hasValue()) return result.error();

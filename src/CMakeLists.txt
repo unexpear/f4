@@ -157,6 +157,7 @@ f4_set_float_precision(f4_graphics)
 f4_enable_sanitizers(f4_graphics)
 
 add_library(f4_engine STATIC
+    engine/lighting/clustered_lights.cpp
     engine/world/world_data.cpp
     engine/world/terrain_meshing.cpp
     engine/world/world_streaming.cpp

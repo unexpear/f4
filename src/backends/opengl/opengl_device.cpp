@@ -821,7 +821,8 @@ auto OpenGLDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
     // For Uniform buffers (updated every frame), orphan the buffer to avoid
     // GPU pipeline stalls. Other buffer types are typically uploaded once and
     // read by the GPU, so glBufferSubData is fine.
-    if (hasUsage(b->rec.usage, BufferUsage::Uniform)) {
+    if (hasUsage(b->rec.usage, BufferUsage::Uniform) ||
+        hasUsage(b->rec.usage, BufferUsage::HostWrite)) {
         glBufferData(b->target, static_cast<GLsizeiptr>(b->rec.sizeBytes),
                      nullptr, GL_DYNAMIC_DRAW);
     }

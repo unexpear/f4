@@ -251,6 +251,8 @@ async function run() {
             renderer: document.body?.dataset.f4Renderer ?? null,
             rendererPixels: document.body?.dataset.f4RendererPixels ?? null,
             rendererHash: document.body?.dataset.f4RendererHash ?? null,
+            pointLights: document.body?.dataset.f4PointLights ?? null,
+            pointLightGain: document.body?.dataset.f4PointLightGain ?? null,
             validationScene: document.body?.dataset.f4ValidationScene ?? null,
             sceneIndex: document.body?.dataset.f4SceneIndex ?? null,
             resizeCount: document.body?.dataset.f4ResizeCount ?? null,
@@ -281,6 +283,7 @@ async function run() {
             state.renderer !== "true" ||
             Number.parseInt(state.rendererPixels, 10) <= 100 ||
             !/^[0-9a-f]{8}$/.test(state.rendererHash ?? "") ||
+            state.pointLights !== "true" ||
             state.validationErrors !== "0") {
             throw new Error(`WebGPU conformance markers are invalid: ${JSON.stringify(state)}`);
         }
@@ -528,6 +531,7 @@ async function run() {
         }
         console.log(
             `WebGPU ready; renderer=${state.rendererPixels} pixels/${state.rendererHash}; ` +
+            `point-light red/other gain=${state.pointLightGain}; ` +
             `M11 parity max=${parityMaxChannelDelta}; ` +
             `PBR pixels=${visual.foreground}; colors=${visual.colorBins}; ` +
             `${validationScenes.length} demo scenes stable ` +

@@ -191,7 +191,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M8 Renderer + render graph v1 | ✅ Complete | `Renderer::render()` executes through the graph and graph lifetimes/rollback are covered. The constant ring grows geometrically instead of silently stopping at 64 slots; direct 130-slot and 65-object renderer regressions verify the former boundary. Cross-backend parity remains an M9/M10 acceptance item rather than an M8 requirement. |
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
-| M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
+| M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. Clustered forward point lights (hundreds to thousands per frame) now shade on OpenGL/Vulkan/DX12/WebGPU with GL/VK/DX image parity; Metal point lights are written but unverified. |
 | M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
 | M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
@@ -551,6 +551,50 @@ Completed delivery and acceptance gates:
 - ✅ Renderer-generated normal/UV/color fallback streams make position-only
   meshes valid on every backend without depending on API-specific missing-input
   behavior. Single-sided front faces remain visible in all three native paths.
+- ✅ Clustered forward point lights (2026-10-20, branch `lights/point-lights`).
+  `engine::PointLight` (world or `WorldMatrix`-local position, color, intensity,
+  range) is no longer a stub. Each frame the CPU bins visible lights into a
+  16x9-tile, 24-slice logarithmic froxel grid
+  (`engine/lighting/clustered_lights.*`). Binning is conservative: a
+  brute-force test over 600 lights and 40,000 samples finds no light missing
+  from its cluster. Lights, cluster ranges, and indices pack into one read-only
+  `u32` storage buffer (16-word header, 8-word light records, 2-word cluster
+  records, 1-word indices; the index list is capped at 2^20 and overflow is
+  counted in `FrameStats`). The PBR fragment shader on every backend looks up
+  its cluster from `viewProj * worldPos` and adds GGX point lighting with a
+  smooth range window `(1-(d/r)^4)^2 / (d^2+1)`. Directional light, shadow, IBL,
+  emissive, and tone mapping are unchanged, and point lights cast no shadows.
+  The storage buffer uses RHI slot 7: GL SSBO binding 7, Vulkan/WebGPU flat
+  binding 31, and DX12 `t7` (SRVs share `t` registers with textures 0-6). Metal
+  uses slot 1 (`[[buffer(17)]]`) because it exposes only seven buffer slots.
+  The buffer is a triple-buffered `DynamicBufferRing` with the new
+  `BufferUsage::HostWrite`. On DX12, HostWrite storage writes go to an
+  upload-heap twin and are copied at the start of the next submit instead of
+  through a blocking `executeImmediate` per write. On OpenGL, HostWrite buffers
+  are orphaned like uniforms.
+- ✅ Evidence. `tests/engine/test_point_lights.cpp` covers:
+  - CPU binning: empty header, culling, near-plane-crossing lights,
+    conservativeness, and the index cap.
+  - A NullDevice renderer run with 324 lights.
+  - A 256-light night scene on a dark ground at 160x96, rendered on OpenGL,
+    Vulkan, and DX12. GL/VK and GL/DX agree with 0 mismatching pixels (max
+    channel delta 1).
+  - Lights placed out of reach produce an image byte-identical to the lights-off
+    frame, and validation reports zero warnings or errors.
+
+  The Chromium WebGPU smoke binds the same buffer in its standalone PBR pipeline
+  and requires a red point light to add red light through the engine renderer.
+  `demo_bench` scene 20 ("Night Lights") shows 64-4096 animated colored lights.
+- Point lights are open on two fronts. Metal has the shader and binding but was
+  not compiled or run (no Apple hardware). There is no bloom, no point-light
+  shadows, and no GPU-side binning. Frame time (`F4_POINT_LIGHT_BENCH=1`,
+  1280x720, 2026-10-20 laptop) was measured on mixed GPUs, because OpenGL and
+  DX12 picked the Intel Iris Xe iGPU while Vulkan picked the RTX 3070 Ti, so the
+  numbers are not a backend comparison:
+  - Vulkan: 1,024 / 4,096 lights at 0.77 / 1.7 ms with range scaled to spacing,
+    and 1.0 / 3.6 ms in the fixed-2.5 m stress case.
+  - Intel OpenGL: 4.2 / 8.2 ms (scaled) and 6.7 / 27.5 ms (stress).
+  - Intel DX12: 8.0 / 17.4 ms (scaled) and 13.4 / 67 ms (stress).
 
 ### Milestone 12 — Optimization
 - ✅ World-space AABB frustum culling with per-frame candidate/visible/culled

@@ -337,6 +337,8 @@ void Renderer::releaseInitializationResources() {
     shadowConstants_.destroy(device_);
     sceneConstants_.destroy(device_);
     sceneInstances_.destroy(device_);
+    pointLightBuffers_.destroy(device_);
+    framePointLights_ = {};
     defaultEnvironmentMipCount_ = 1;
     inited_ = false;
 }
@@ -371,6 +373,11 @@ auto Renderer::init() -> gfx::GfxError {
         return fail(error);
     }
     if (const auto error = sceneInstances_.create(device_, gfx::BufferUsage::Vertex);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
+    if (const auto error = pointLightBuffers_.create(
+            device_, gfx::BufferUsage::Storage | gfx::BufferUsage::HostWrite);
         error != gfx::GfxError::None) {
         return fail(error);
     }
@@ -593,6 +600,12 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
     const math::Frustum frustum = math::Frustum::fromViewProjection(camera->viewProj);
     sceneConstants_.beginFrame();
     sceneInstances_.beginFrame();
+    pointLightBuffers_.beginFrame();
+    framePointLights_ = preparePointLights(*camera, aspect);
+    if (!framePointLights_.isValid()) {
+        recordError_ = gfx::GfxError::OutOfMemory;
+        return;
+    }
     queue_.clear();
 
     for (auto [entity, renderer, world] :
@@ -720,6 +733,9 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
 
         commandBuffer.bindPipeline(pipeline);
         sceneConstants_.bind(commandBuffer, slot);
+        commandBuffer.bindResource(pointLightStorageSlot(device_.backend()),
+                                   gfx::BindingType::StorageBuffer,
+                                   framePointLights_.index, framePointLights_.generation);
         const gfx::TextureHandle textures[7] = {
             resolveTexture(material->desc.albedo, whiteTex_),
             resolveTexture(material->desc.normal, neutralNormalTex_),
@@ -750,6 +766,38 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         ++stats_.draws;
         stats_.instances += static_cast<std::uint32_t>(instanceStaging_.size());
     }
+}
+
+auto Renderer::preparePointLights(const Camera& camera, float aspect) -> gfx::BufferHandle {
+    pointLightInputs_.clear();
+    if (pbrSettings_.pointLightsEnabled) {
+        for (auto [entity, light] : ecs::View<PointLight>(registry_)) {
+            ClusteredLightInput input;
+            input.position = light.position;
+            if (const ecs::WorldMatrix* world = registry_.get<ecs::WorldMatrix>(entity)) {
+                input.position = world->matrix.transformPoint(light.position);
+            }
+            input.radiance = math::maxComponentwise(light.color, math::Vec3(0.0f)) *
+                             std::max(light.intensity, 0.0f);
+            input.range = light.range;
+            pointLightInputs_.push(input);
+        }
+    }
+    const float safeAspect = aspect > 0.0f ? aspect : 1.0f;
+    const ClusteredLightStats lightStats = buildClusteredLightBuffer(
+        std::span<const ClusteredLightInput>(pointLightInputs_.data(),
+                                             pointLightInputs_.size()),
+        cameraView(camera), cameraProj(camera, safeAspect), camera.nearPlane,
+        camera.farPlane, pbrSettings_.pointLightClusters, pointLightWords_);
+    stats_.pointLights = lightStats.submitted;
+    stats_.pointLightsVisible = lightStats.visible;
+    stats_.pointLightReferences = lightStats.indexCount;
+    stats_.pointLightReferencesDropped = lightStats.droppedIndices;
+    stats_.maxPointLightsPerCluster = lightStats.maxLightsPerCluster;
+    const DynamicBufferRing::Slot slot = pointLightBuffers_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(pointLightWords_.data()),
+                           pointLightWords_.size() * sizeof(std::uint32_t)));
+    return slot.valid ? slot.handle : gfx::BufferHandle{};
 }
 
 void Renderer::recordShadow(gfx::CommandBuffer& commandBuffer) {

@@ -1,0 +1,213 @@
+#include "engine/lighting/clustered_lights.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+#include "core/math/vec4.h"
+
+namespace f4::engine {
+
+namespace {
+
+[[nodiscard]] auto floatBits(float value) -> std::uint32_t {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+[[nodiscard]] auto tileFor(float ndc, std::uint32_t tiles) -> std::uint32_t {
+    const float scaled = std::floor((ndc * 0.5f + 0.5f) * static_cast<float>(tiles));
+    if (!(scaled > 0.0f)) return 0;
+    const float last = static_cast<float>(tiles - 1);
+    return static_cast<std::uint32_t>(std::min(scaled, last));
+}
+
+struct LightRange {
+    std::uint32_t source = 0;
+    std::uint32_t x0 = 0, x1 = 0;
+    std::uint32_t y0 = 0, y1 = 0;
+    std::uint32_t z0 = 0, z1 = 0;
+};
+
+} // namespace
+
+auto clusterSliceParams(float nearPlane, float farPlane, std::uint32_t slices)
+    -> ClusterSliceParams {
+    const float nearClamped = std::max(nearPlane, 1.0e-4f);
+    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
+    const float logRange = std::log2(farClamped) - std::log2(nearClamped);
+    ClusterSliceParams params;
+    params.scale = static_cast<float>(std::max(slices, 1u)) / logRange;
+    params.bias = -std::log2(nearClamped) * params.scale;
+    return params;
+}
+
+auto clusterSliceForDepth(float viewDepth, const ClusterSliceParams& params,
+                          std::uint32_t slices) -> std::uint32_t {
+    const std::uint32_t count = std::max(slices, 1u);
+    const float slice =
+        std::floor(std::log2(std::max(viewDepth, 1.0e-4f)) * params.scale + params.bias);
+    if (!(slice > 0.0f)) return 0;
+    return static_cast<std::uint32_t>(std::min(slice, static_cast<float>(count - 1)));
+}
+
+auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
+                               const math::Mat4& view, const math::Mat4& projection,
+                               float nearPlane, float farPlane,
+                               const ClusterGridConfig& config,
+                               containers::Array<std::uint32_t>& words)
+    -> ClusteredLightStats {
+    ClusteredLightStats stats;
+    const std::uint32_t tilesX = std::max(config.tilesX, 1u);
+    const std::uint32_t tilesY = std::max(config.tilesY, 1u);
+    const std::uint32_t slices = std::max(config.slices, 1u);
+    const float nearClamped = std::max(nearPlane, 1.0e-4f);
+    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
+    const ClusterSliceParams sliceParams = clusterSliceParams(nearClamped, farClamped, slices);
+    const std::uint32_t clusterCount = tilesX * tilesY * slices;
+
+    containers::Array<LightRange> ranges;
+    ranges.reserve(lights.size());
+    containers::Array<std::uint32_t> counts;
+    for (std::size_t index = 0; index < lights.size(); ++index) {
+        const ClusteredLightInput& light = lights[index];
+        ++stats.submitted;
+        const float range = light.range;
+        if (!std::isfinite(range) || range <= 0.0f || !std::isfinite(light.position.x) ||
+            !std::isfinite(light.position.y) || !std::isfinite(light.position.z)) {
+            continue;
+        }
+        if (std::max({light.radiance.x, light.radiance.y, light.radiance.z}) <= 0.0f) {
+            continue;
+        }
+        const math::Vec3 viewCenter = view.transformPoint(light.position);
+        const float depth = -viewCenter.z;
+        const float zMin = depth - range;
+        const float zMax = depth + range;
+        if (zMax < nearClamped || zMin > farClamped) continue;
+
+        LightRange lightRange;
+        lightRange.source = static_cast<std::uint32_t>(index);
+        lightRange.z0 = clusterSliceForDepth(std::max(zMin, nearClamped), sliceParams, slices);
+        lightRange.z1 = clusterSliceForDepth(std::min(zMax, farClamped), sliceParams, slices);
+        if (zMin <= nearClamped) {
+            // The sphere crosses the near plane, so its screen footprint is
+            // unbounded; cover every tile conservatively.
+            lightRange.x1 = tilesX - 1;
+            lightRange.y1 = tilesY - 1;
+        } else {
+            float minX = std::numeric_limits<float>::max();
+            float minY = std::numeric_limits<float>::max();
+            float maxX = -std::numeric_limits<float>::max();
+            float maxY = -std::numeric_limits<float>::max();
+            for (std::uint32_t corner = 0; corner < 8; ++corner) {
+                const math::Vec3 offset((corner & 1u) != 0 ? range : -range,
+                                        (corner & 2u) != 0 ? range : -range,
+                                        (corner & 4u) != 0 ? range : -range);
+                const math::Vec4 clip =
+                    projection.mul(math::Vec4(viewCenter + offset, 1.0f));
+                const float ndcX = clip.x / clip.w;
+                const float ndcY = clip.y / clip.w;
+                minX = std::min(minX, ndcX);
+                maxX = std::max(maxX, ndcX);
+                minY = std::min(minY, ndcY);
+                maxY = std::max(maxY, ndcY);
+            }
+            if (maxX < -1.0f || minX > 1.0f || maxY < -1.0f || minY > 1.0f) continue;
+            lightRange.x0 = tileFor(minX, tilesX);
+            lightRange.x1 = tileFor(maxX, tilesX);
+            lightRange.y0 = tileFor(minY, tilesY);
+            lightRange.y1 = tileFor(maxY, tilesY);
+        }
+        if (counts.isEmpty()) {
+            counts.resize(clusterCount);
+            std::fill(counts.begin(), counts.end(), 0u);
+        }
+        for (std::uint32_t z = lightRange.z0; z <= lightRange.z1; ++z) {
+            for (std::uint32_t y = lightRange.y0; y <= lightRange.y1; ++y) {
+                for (std::uint32_t x = lightRange.x0; x <= lightRange.x1; ++x) {
+                    ++counts[(z * tilesY + y) * tilesX + x];
+                }
+            }
+        }
+        ranges.push(lightRange);
+    }
+
+    const std::uint32_t visible = static_cast<std::uint32_t>(ranges.size());
+    stats.visible = visible;
+    const std::uint32_t lightOffset = kPointLightHeaderWords;
+    const std::uint32_t gridOffset = lightOffset + visible * kPointLightRecordWords;
+    const std::uint32_t indexOffset =
+        visible == 0 ? gridOffset : gridOffset + clusterCount * kPointLightClusterWords;
+
+    // Clip per-cluster counts to the global index budget in cluster order.
+    std::uint32_t totalIndices = 0;
+    if (visible != 0) {
+        for (std::uint32_t cluster = 0; cluster < clusterCount; ++cluster) {
+            const std::uint32_t remaining = config.maxIndexCount - totalIndices;
+            const std::uint32_t allowed = std::min(counts[cluster], remaining);
+            stats.droppedIndices += counts[cluster] - allowed;
+            counts[cluster] = allowed;
+            totalIndices += allowed;
+            stats.maxLightsPerCluster = std::max(stats.maxLightsPerCluster, allowed);
+        }
+    }
+    stats.indexCount = totalIndices;
+
+    words.clear();
+    words.resize(static_cast<std::size_t>(indexOffset) + totalIndices);
+    std::fill(words.begin(), words.end(), 0u);
+    words[0] = visible;
+    words[1] = tilesX;
+    words[2] = tilesY;
+    words[3] = slices;
+    words[4] = lightOffset;
+    words[5] = gridOffset;
+    words[6] = indexOffset;
+    words[7] = totalIndices;
+    words[8] = floatBits(sliceParams.scale);
+    words[9] = floatBits(sliceParams.bias);
+    if (visible == 0) return stats;
+
+    for (std::uint32_t lightIndex = 0; lightIndex < visible; ++lightIndex) {
+        const ClusteredLightInput& light = lights[ranges[lightIndex].source];
+        std::uint32_t* record = words.data() + lightOffset + lightIndex * kPointLightRecordWords;
+        record[0] = floatBits(light.position.x);
+        record[1] = floatBits(light.position.y);
+        record[2] = floatBits(light.position.z);
+        record[3] = floatBits(light.range);
+        record[4] = floatBits(std::max(light.radiance.x, 0.0f));
+        record[5] = floatBits(std::max(light.radiance.y, 0.0f));
+        record[6] = floatBits(std::max(light.radiance.z, 0.0f));
+        record[7] = 0;
+    }
+
+    std::uint32_t cursor = indexOffset;
+    for (std::uint32_t cluster = 0; cluster < clusterCount; ++cluster) {
+        std::uint32_t* record = words.data() + gridOffset + cluster * kPointLightClusterWords;
+        record[0] = cursor;
+        record[1] = 0;
+        cursor += counts[cluster];
+    }
+    for (std::uint32_t lightIndex = 0; lightIndex < visible; ++lightIndex) {
+        const LightRange& lightRange = ranges[lightIndex];
+        for (std::uint32_t z = lightRange.z0; z <= lightRange.z1; ++z) {
+            for (std::uint32_t y = lightRange.y0; y <= lightRange.y1; ++y) {
+                for (std::uint32_t x = lightRange.x0; x <= lightRange.x1; ++x) {
+                    const std::uint32_t cluster = (z * tilesY + y) * tilesX + x;
+                    std::uint32_t* record =
+                        words.data() + gridOffset + cluster * kPointLightClusterWords;
+                    if (record[1] >= counts[cluster]) continue;
+                    words[record[0] + record[1]] = lightIndex;
+                    ++record[1];
+                }
+            }
+        }
+    }
+    return stats;
+}
+
+} // namespace f4::engine

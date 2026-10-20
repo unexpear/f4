@@ -21,6 +21,7 @@
 #include "demos/demo_render_validation.h"
 #include "demos/demo_terrain.h"
 #include "engine/cameras/camera.h"
+#include "engine/lighting/clustered_lights.h"
 #include "engine/lighting/light.h"
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
@@ -156,6 +157,7 @@ struct App {
     BufferHandle vertexBuffer{};
     BufferHandle indexBuffer{};
     BufferHandle uniformBuffer{};
+    BufferHandle pointLightBuffer{}; // empty clustered point-light header
     std::array<TextureHandle, 7> textures{};
     SamplerHandle sampler{};
     PipelineHandle pipeline{};
@@ -163,6 +165,7 @@ struct App {
     SwapchainHandle swapchain{};
     FramebufferHandle framebuffer{};
     std::array<std::byte, kRendererCaptureBytes> rendererCapture{};
+    std::array<std::byte, kRendererCaptureBytes> pointLightCapture{};
     TextureFormat surfaceFormat = TextureFormat::RGBA8_UNORM;
     Extent extent{};
     std::uint32_t frameCount = 0;
@@ -415,6 +418,9 @@ void renderFrame() {
     commands.setScissor(gApp.extent);
     commands.bindResource(0, 0, BindingType::UniformBuffer,
                           gApp.uniformBuffer.index, gApp.uniformBuffer.generation);
+    commands.bindResource(0, f4::engine::pointLightStorageSlot(gApp.device->backend()),
+                          BindingType::StorageBuffer, gApp.pointLightBuffer.index,
+                          gApp.pointLightBuffer.generation);
     for (std::uint32_t slot = 0; slot < gApp.textures.size(); ++slot) {
         commands.bindResource(0, slot, BindingType::Texture,
                               gApp.textures[slot].index, gApp.textures[slot].generation);
@@ -802,6 +808,9 @@ auto validateRendererFrame() -> bool {
     std::size_t litPixels = 0;
     std::uint32_t digest = 2166136261u;
     bool rendered = false;
+    bool pointLightsOk = false;
+    std::uint64_t pointRedGain = 0;
+    std::uint64_t pointOtherGain = 0;
     {
         f4::ecs::Registry registry(16);
         f4::engine::Renderer renderer(registry, *gApp.device);
@@ -849,6 +858,42 @@ auto validateRendererFrame() -> bool {
                                GfxError::None &&
                            renderer.stats().draws == 1 && renderer.stats().instances == 1;
             }
+            if (rendered) {
+                // Clustered point lights: a red light just in front of the
+                // triangle must add red light and almost nothing else.
+                const f4::ecs::Entity pointEntity = registry.create();
+                f4::engine::PointLight point;
+                point.position = {0.0f, 0.0f, 0.6f};
+                point.color = {1.0f, 0.05f, 0.05f};
+                point.intensity = 4.0f;
+                point.range = 2.0f;
+                registry.emplace<f4::engine::PointLight>(pointEntity, point);
+                pointLightsOk =
+                    renderer.render(framebuffer, cameraEntity, 1.0f) == GfxError::None;
+                if (pointLightsOk) {
+                    gApp.device->waitIdle();
+                    pointLightsOk =
+                        gApp.webGpu->readTexture(color, 0, gApp.pointLightCapture) ==
+                            GfxError::None &&
+                        renderer.stats().pointLights == 1 &&
+                        renderer.stats().pointLightsVisible == 1;
+                }
+                if (pointLightsOk) {
+                    for (std::size_t offset = 0; offset < gApp.pointLightCapture.size();
+                         offset += 4) {
+                        for (std::size_t channel = 0; channel < 3; ++channel) {
+                            const int lit = std::to_integer<int>(
+                                gApp.pointLightCapture[offset + channel]);
+                            const int base = std::to_integer<int>(
+                                gApp.rendererCapture[offset + channel]);
+                            const auto gain = static_cast<std::uint64_t>(std::max(0, lit - base));
+                            if (channel == 0) pointRedGain += gain;
+                            else pointOtherGain += gain;
+                        }
+                    }
+                    pointLightsOk = pointRedGain > 2000 && pointRedGain > pointOtherGain * 2u;
+                }
+            }
         }
     }
 
@@ -867,13 +912,17 @@ auto validateRendererFrame() -> bool {
     }
     cleanup();
     if (rendered) {
-        char script[256]{};
+        char script[512]{};
         std::snprintf(
             script, sizeof(script),
             "document.body.dataset.f4Renderer='true';"
             "document.body.dataset.f4RendererPixels='%zu';"
-            "document.body.dataset.f4RendererHash='%08x';",
-            litPixels, digest);
+            "document.body.dataset.f4RendererHash='%08x';"
+            "document.body.dataset.f4PointLights='%s';"
+            "document.body.dataset.f4PointLightGain='%llu/%llu';",
+            litPixels, digest, pointLightsOk ? "true" : "false",
+            static_cast<unsigned long long>(pointRedGain),
+            static_cast<unsigned long long>(pointOtherGain));
         emscripten_run_script(script);
     }
     return rendered;
@@ -989,6 +1038,17 @@ int main() {
               gApp.uniformBuffer,
               "WebGPU uniform buffer creation failed")) return 1;
 
+    // The PBR fragment shader always declares the clustered point-light
+    // storage buffer; an all-zero header means "no point lights".
+    const std::array<std::uint32_t, f4::engine::kPointLightHeaderWords> noPointLights{};
+    BufferDesc pointLightDesc;
+    pointLightDesc.sizeBytes = sizeof(noPointLights);
+    pointLightDesc.usage = BufferUsage::Storage;
+    if (!take(gApp.device->createBuffer(
+                  pointLightDesc, std::as_bytes(std::span{noPointLights})),
+              gApp.pointLightBuffer,
+              "WebGPU point-light buffer creation failed")) return 1;
+
     TextureDesc textureDesc;
     textureDesc.format = TextureFormat::RGBA8_UNORM;
     textureDesc.width = 1;
@@ -1037,6 +1097,9 @@ int main() {
         resources.slots.push(BindingSlot{
             slot, BindingType::Sampler, shaderStageBit(ShaderStage::Fragment), 1});
     }
+    resources.slots.push(BindingSlot{
+        f4::engine::pointLightStorageSlot(gApp.device->backend()), BindingType::StorageBuffer,
+        shaderStageBit(ShaderStage::Fragment), 1});
     pipelineDesc.layout.groups.push(std::move(resources));
     ColorAttachmentState colorState;
     colorState.format = gApp.surfaceFormat;
