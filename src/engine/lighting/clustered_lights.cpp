@@ -32,46 +32,16 @@ struct LightRange {
     std::uint32_t z0 = 0, z1 = 0;
 };
 
-} // namespace
-
-auto clusterSliceParams(float nearPlane, float farPlane, std::uint32_t slices)
-    -> ClusterSliceParams {
-    const float nearClamped = std::max(nearPlane, 1.0e-4f);
-    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
-    const float logRange = std::log2(farClamped) - std::log2(nearClamped);
-    ClusterSliceParams params;
-    params.scale = static_cast<float>(std::max(slices, 1u)) / logRange;
-    params.bias = -std::log2(nearClamped) * params.scale;
-    return params;
-}
-
-auto clusterSliceForDepth(float viewDepth, const ClusterSliceParams& params,
-                          std::uint32_t slices) -> std::uint32_t {
-    const std::uint32_t count = std::max(slices, 1u);
-    const float slice =
-        std::floor(std::log2(std::max(viewDepth, 1.0e-4f)) * params.scale + params.bias);
-    if (!(slice > 0.0f)) return 0;
-    return static_cast<std::uint32_t>(std::min(slice, static_cast<float>(count - 1)));
-}
-
-auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
-                               const math::Mat4& view, const math::Mat4& projection,
-                               float nearPlane, float farPlane,
-                               const ClusterGridConfig& config,
-                               containers::Array<std::uint32_t>& words)
-    -> ClusteredLightStats {
-    ClusteredLightStats stats;
-    const std::uint32_t tilesX = std::max(config.tilesX, 1u);
-    const std::uint32_t tilesY = std::max(config.tilesY, 1u);
-    const std::uint32_t slices = std::max(config.slices, 1u);
-    const float nearClamped = std::max(nearPlane, 1.0e-4f);
-    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
-    const ClusterSliceParams sliceParams = clusterSliceParams(nearClamped, farClamped, slices);
-    const std::uint32_t clusterCount = tilesX * tilesY * slices;
-
-    containers::Array<LightRange> ranges;
+// Culls `lights` against the camera and computes each survivor's cluster box.
+// Shared by the CPU binning and the GPU binning input so both bin from the
+// exact same boxes.
+void gatherLightRanges(std::span<const ClusteredLightInput> lights, const math::Mat4& view,
+                       const math::Mat4& projection, float nearClamped, float farClamped,
+                       const ClusterSliceParams& sliceParams, std::uint32_t tilesX,
+                       std::uint32_t tilesY, std::uint32_t slices,
+                       containers::Array<LightRange>& ranges, ClusteredLightStats& stats) {
+    ranges.clear();
     ranges.reserve(lights.size());
-    containers::Array<std::uint32_t> counts;
     for (std::size_t index = 0; index < lights.size(); ++index) {
         const ClusteredLightInput& light = lights[index];
         ++stats.submitted;
@@ -122,10 +92,72 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
             lightRange.y0 = tileFor(minY, tilesY);
             lightRange.y1 = tileFor(maxY, tilesY);
         }
-        if (counts.isEmpty()) {
-            counts.resize(clusterCount);
-            std::fill(counts.begin(), counts.end(), 0u);
-        }
+        ranges.push(lightRange);
+    }
+}
+
+void writeLightRecords(std::span<const ClusteredLightInput> lights,
+                       const containers::Array<LightRange>& ranges, std::uint32_t* records) {
+    for (std::size_t lightIndex = 0; lightIndex < ranges.size(); ++lightIndex) {
+        const ClusteredLightInput& light = lights[ranges[lightIndex].source];
+        std::uint32_t* record = records + lightIndex * kPointLightRecordWords;
+        record[0] = floatBits(light.position.x);
+        record[1] = floatBits(light.position.y);
+        record[2] = floatBits(light.position.z);
+        record[3] = floatBits(light.range);
+        record[4] = floatBits(std::max(light.radiance.x, 0.0f));
+        record[5] = floatBits(std::max(light.radiance.y, 0.0f));
+        record[6] = floatBits(std::max(light.radiance.z, 0.0f));
+        record[7] = light.shadowSlot;
+    }
+}
+
+} // namespace
+
+auto clusterSliceParams(float nearPlane, float farPlane, std::uint32_t slices)
+    -> ClusterSliceParams {
+    const float nearClamped = std::max(nearPlane, 1.0e-4f);
+    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
+    const float logRange = std::log2(farClamped) - std::log2(nearClamped);
+    ClusterSliceParams params;
+    params.scale = static_cast<float>(std::max(slices, 1u)) / logRange;
+    params.bias = -std::log2(nearClamped) * params.scale;
+    return params;
+}
+
+auto clusterSliceForDepth(float viewDepth, const ClusterSliceParams& params,
+                          std::uint32_t slices) -> std::uint32_t {
+    const std::uint32_t count = std::max(slices, 1u);
+    const float slice =
+        std::floor(std::log2(std::max(viewDepth, 1.0e-4f)) * params.scale + params.bias);
+    if (!(slice > 0.0f)) return 0;
+    return static_cast<std::uint32_t>(std::min(slice, static_cast<float>(count - 1)));
+}
+
+auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
+                               const math::Mat4& view, const math::Mat4& projection,
+                               float nearPlane, float farPlane,
+                               const ClusterGridConfig& config,
+                               containers::Array<std::uint32_t>& words)
+    -> ClusteredLightStats {
+    ClusteredLightStats stats;
+    const std::uint32_t tilesX = std::max(config.tilesX, 1u);
+    const std::uint32_t tilesY = std::max(config.tilesY, 1u);
+    const std::uint32_t slices = std::max(config.slices, 1u);
+    const float nearClamped = std::max(nearPlane, 1.0e-4f);
+    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
+    const ClusterSliceParams sliceParams = clusterSliceParams(nearClamped, farClamped, slices);
+    const std::uint32_t clusterCount = tilesX * tilesY * slices;
+
+    containers::Array<LightRange> ranges;
+    gatherLightRanges(lights, view, projection, nearClamped, farClamped, sliceParams, tilesX,
+                      tilesY, slices, ranges, stats);
+    containers::Array<std::uint32_t> counts;
+    if (!ranges.isEmpty()) {
+        counts.resize(clusterCount);
+        std::fill(counts.begin(), counts.end(), 0u);
+    }
+    for (const LightRange& lightRange : ranges) {
         for (std::uint32_t z = lightRange.z0; z <= lightRange.z1; ++z) {
             for (std::uint32_t y = lightRange.y0; y <= lightRange.y1; ++y) {
                 for (std::uint32_t x = lightRange.x0; x <= lightRange.x1; ++x) {
@@ -133,7 +165,6 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
                 }
             }
         }
-        ranges.push(lightRange);
     }
 
     const std::uint32_t visible = static_cast<std::uint32_t>(ranges.size());
@@ -172,18 +203,7 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
     words[9] = floatBits(sliceParams.bias);
     if (visible == 0) return stats;
 
-    for (std::uint32_t lightIndex = 0; lightIndex < visible; ++lightIndex) {
-        const ClusteredLightInput& light = lights[ranges[lightIndex].source];
-        std::uint32_t* record = words.data() + lightOffset + lightIndex * kPointLightRecordWords;
-        record[0] = floatBits(light.position.x);
-        record[1] = floatBits(light.position.y);
-        record[2] = floatBits(light.position.z);
-        record[3] = floatBits(light.range);
-        record[4] = floatBits(std::max(light.radiance.x, 0.0f));
-        record[5] = floatBits(std::max(light.radiance.y, 0.0f));
-        record[6] = floatBits(std::max(light.radiance.z, 0.0f));
-        record[7] = light.shadowSlot;
-    }
+    writeLightRecords(lights, ranges, words.data() + lightOffset);
 
     std::uint32_t cursor = indexOffset;
     for (std::uint32_t cluster = 0; cluster < clusterCount; ++cluster) {
@@ -207,6 +227,84 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
             }
         }
     }
+    return stats;
+}
+
+auto buildClusteredLightBinningInput(std::span<const ClusteredLightInput> lights,
+                                     const math::Mat4& view, const math::Mat4& projection,
+                                     float nearPlane, float farPlane,
+                                     const ClusterGridConfig& config,
+                                     std::uint32_t reservedWords,
+                                     containers::Array<std::uint32_t>& words,
+                                     ClusteredLightGpuParams& params) -> ClusteredLightStats {
+    ClusteredLightStats stats;
+    params = {};
+    const std::uint32_t tilesX = std::max(config.tilesX, 1u);
+    const std::uint32_t tilesY = std::max(config.tilesY, 1u);
+    const std::uint32_t slices = std::max(config.slices, 1u);
+    const float nearClamped = std::max(nearPlane, 1.0e-4f);
+    const float farClamped = std::max(farPlane, nearClamped * 1.001f);
+    const ClusterSliceParams sliceParams = clusterSliceParams(nearClamped, farClamped, slices);
+    const std::uint32_t clusterCount = tilesX * tilesY * slices;
+
+    containers::Array<LightRange> ranges;
+    gatherLightRanges(lights, view, projection, nearClamped, farClamped, sliceParams, tilesX,
+                      tilesY, slices, ranges, stats);
+    const std::uint32_t visible = static_cast<std::uint32_t>(ranges.size());
+    stats.visible = visible;
+
+    // Every reference a light contributes is one cell of its cluster box, so
+    // the total (and the cut to maxIndexCount) is known without binning.
+    std::uint64_t references = 0;
+    for (const LightRange& range : ranges) {
+        references += static_cast<std::uint64_t>(range.x1 - range.x0 + 1u) *
+                      (range.y1 - range.y0 + 1u) * (range.z1 - range.z0 + 1u);
+    }
+    const std::uint32_t totalIndices = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(references, config.maxIndexCount));
+    stats.indexCount = totalIndices;
+    stats.droppedIndices = static_cast<std::uint32_t>(references - totalIndices);
+
+    const std::uint32_t lightOffset = kPointLightHeaderWords;
+    const std::uint32_t reservedOffset = lightOffset + visible * kPointLightRecordWords;
+    const std::uint32_t gridOffset = reservedOffset + reservedWords;
+    const std::uint32_t indexOffset = gridOffset + clusterCount * kPointLightClusterWords;
+    const std::uint32_t rangeOffset = gridOffset;
+
+    words.clear();
+    words.resize(static_cast<std::size_t>(rangeOffset) + visible * kPointLightGpuRangeWords);
+    std::fill(words.begin(), words.end(), 0u);
+    words[0] = visible;
+    words[1] = tilesX;
+    words[2] = tilesY;
+    words[3] = slices;
+    words[4] = lightOffset;
+    words[5] = gridOffset;
+    words[6] = indexOffset;
+    words[7] = totalIndices;
+    words[8] = floatBits(sliceParams.scale);
+    words[9] = floatBits(sliceParams.bias);
+    writeLightRecords(lights, ranges, words.data() + lightOffset);
+    for (std::uint32_t lightIndex = 0; lightIndex < visible; ++lightIndex) {
+        const LightRange& range = ranges[lightIndex];
+        std::uint32_t* box = words.data() + rangeOffset + lightIndex * kPointLightGpuRangeWords;
+        box[0] = range.x0 | (range.x1 << 16);
+        box[1] = range.y0 | (range.y1 << 16);
+        box[2] = range.z0 | (range.z1 << 16);
+    }
+
+    params.tilesX = tilesX;
+    params.tilesY = tilesY;
+    params.slices = slices;
+    params.clusterCount = clusterCount;
+    params.visible = visible;
+    params.copyWords = gridOffset;
+    params.rangeOffset = rangeOffset;
+    params.maxIndexCount = config.maxIndexCount;
+    params.gridOffset = gridOffset;
+    params.indexOffset = indexOffset;
+    params.reservedOffset = reservedOffset;
+    params.totalWords = indexOffset + totalIndices;
     return stats;
 }
 
