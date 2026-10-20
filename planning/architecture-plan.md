@@ -695,61 +695,120 @@ Completed delivery and acceptance gates:
     machine (other apps using the CPU, everything ~1 ms slower) kept cached
     ahead in 7 of 9 mins, but medians were within noise.
 - ✅ GPU light binning (2026-10-20, commits b66144a, 4316e62, d6e8949,
-  850ba8e, ea6fc66). `PbrRenderSettings::gpuLightBinning` (default on) runs
-  cluster assignment as a compute pass on OpenGL 4.3+, Vulkan, DX12, and
+  850ba8e, ea6fc66; rewritten in a5cce4e and 90d65af).
+  `PbrRenderSettings::gpuLightBinning` (default on, every backend) builds the
+  per-cluster light lists in a compute pass on OpenGL 4.3+, Vulkan, DX12, and
   WebGPU. CPU binning stays as the fallback and the reference.
-  - The CPU still culls and writes light records with the same helpers as the
-    CPU path (`gatherLightRanges`, `writeLightRecords`). It also appends three
-    packed words per visible light with its tile/slice range
-    (`buildClusteredLightBinningInput`). The cluster grid and index list are
-    left for the GPU.
-  - A "light-binning" graph pass runs three dispatches on the output buffer
-    (64-thread groups, buffer barriers in between):
-    1. Copy the header and records, and count each cluster's lights. Light
-       ranges are staged in shared memory.
-    2. One workgroup does a prefix scan with the 2^20 index cap.
-    3. Each cluster writes its list in ascending light order.
-    There are no atomics, so the output matches the CPU buffer word for word.
+  - CPU side (`buildClusteredLightBinningInput`): cull and write light records
+    with the same helpers as the CPU path (`gatherLightRanges`,
+    `writeLightRecords`). Per-cluster counts come from a 3D difference array
+    over the light boxes (+/-1 at 8 corners, then prefix sums along x, y, z),
+    which is O(lights + clusters) instead of visiting every cluster of every
+    box. The counts are capped to the 2^20 index budget in cluster order, so
+    the cluster records (list offset, count) and
+    `FrameStats::maxPointLightsPerCluster` are exact and uploaded with the
+    prefix. The CPU also uploads per-axis light masks, one bit per visible
+    light for each of the 16 tile columns, 9 tile rows, and 24 depth slices its
+    box covers. That is 49 x ceil(visible/32) words, or 25 KB at 4,096 lights.
+  - GPU side: one dispatch of max(clusters, ceil(prefixWords/64)) 64-lane
+    workgroups. Each workgroup copies 64 prefix words. Workgroup c ANDs cluster
+    c's column, row, and slice masks one word per lane, takes a workgroup prefix
+    sum of the popcounts to get each lane's write position, and writes the set
+    bits lowest first. Lists stay in ascending light order without atomics, so
+    the buffer matches the CPU path word for word.
   - Shaders: `light_binning.comp` (GL, and Vulkan via `-DF4_VULKAN=1`),
-    `light_binning_dx12.hlsl` (cs_6_0), and `light_binning_webgpu.wgsl`.
-    WebGPU `BeginRenderPass` now ends an open compute pass.
+    `light_binning_dx12.hlsl` (cs_6_0), and `light_binning_webgpu.wgsl`. The
+    WGSL keeps its barriers in uniform control flow, with no early exit on
+    per-cluster counts. WebGPU `BeginRenderPass` ends an open compute pass.
   - Fallbacks: Null, Metal (no shader yet), callers that use `record()`
-    directly, frames with no visible lights, and pipeline failures all use CPU
-    binning. `FrameStats::pointLightBinningDispatches` reports which path ran.
+    directly, frames with no visible lights, grids or prefixes that would need
+    more than 65,535 workgroups, and pipeline failures all use CPU binning.
+    `FrameStats::pointLightBinningDispatches` is 1 on the GPU path and 0 on the
+    CPU path.
   - Vulkan storage buffers that are neither HostWrite nor vertex/index/uniform
-    are now DEVICE_LOCAL (with a host-visible fallback). `writeBuffer`/
-    `readBuffer` on them go through a staging copy.
-  - Evidence: a NullDevice emulation of the three passes reproduces the CPU
-    buffer. A GPU test on GL, Vulkan, and DX12 compares CPU vs GPU binning for
-    1,024 lights, 1,024 lights with an index cap of 20,000, and shadowed
-    lights. All have 0 differing pixels (tolerance 0) and 0 differing buffer
-    words. Cross-backend parity with GPU binning stays within max delta 1. The
-    Chromium WebGPU smoke requires the 3 dispatches and still matches the
-    point-light and point-shadow fixtures (max delta 1).
-  - Frame time (`F4_POINT_LIGHT_BENCH=binning`, 1280x720, RTX 3070 Ti Laptop,
-    median of 5 interleaved rounds, ms/frame with `render()` CPU time in
-    parentheses, CPU binning → GPU binning):
+    are DEVICE_LOCAL (with a host-visible fallback). `writeBuffer`/`readBuffer`
+    on them go through a staging copy.
+  - Evidence:
+    - A NullDevice emulation of the kernel reproduces the CPU buffer word for
+      word, including `maxLightsPerCluster`, with and without an index cap.
+    - A GPU test on GL, Vulkan, and DX12 compares CPU and GPU binning for 1,024
+      lights, 1,024 lights with an index cap of 20,000, and shadowed lights. It
+      finds 0 differing pixels (tolerance 0) and 0 differing buffer words,
+      equal max-per-cluster, and the same image with GPU timers on.
+    - Cross-backend parity stays within max delta 1.
+    - The Chromium WebGPU smoke requires the single dispatch and still matches
+      the point-light and point-shadow fixtures (max delta 1).
+- ✅ GPU timers (2026-10-20, commit e632531). `CommandBuffer::writeTimestamp(i)`
+  (outside render passes, up to 32 per submit) is backed by:
+  - GL `glQueryCounter(GL_TIMESTAMP)`
+  - Vulkan `vkCmdWriteTimestamp2` on a query pool reset inside the command
+    buffer, read only after the submission's fence signals
+  - DX12 `EndQuery` + `ResolveQueryData` into a readback buffer, read after the
+    fence
 
-    | Backend | stress 1,024 | stress 4,096 | scaled 1,024 | scaled 4,096 |
-    |---|---|---|---|---|
-    | OpenGL | 1.39 (1.36) → 1.51 (0.51) | 7.76 (5.74) → 8.44 (1.67) | 1.19 (1.18) → 1.37 (0.54) | 2.32 (2.29) → 2.51 (1.72) |
-    | Vulkan | 1.31 → 1.81 | 7.58 → 8.57 | 1.00 → 1.34 | 2.04 → 2.71 |
-    | DX12 | 2.01 → 1.66 | 8.67 → 9.43 | 1.54 → 1.23 | 2.58 → 2.29 |
+  Each timestamped submit takes one of 4 query sets in a ring
+  (`graphics/device/gpu_timestamps.h`). `IDevice::latestGpuTimestamps()` never
+  waits; it returns the newest finished set, usually 1-2 frames old.
+  `RenderGraph::setGpuTimestamps` writes a timestamp before each pass and one
+  after the last. `PbrRenderSettings::gpuTimers` (off by default) fills
+  `FrameStats::gpuPasses[]` (name, ms), `gpuFrameMs`, `gpuLightBinningMs`,
+  `gpuMainPassMs`, and `gpuTimingLag`. WebGPU and Metal validate and ignore the
+  command. WebGPU timestamp-query is optional and only writes at pass
+  boundaries, so it is not wired yet.
+- ✅ Where the binning time went, measured with the timers
+  (`F4_POINT_LIGHT_BENCH=binning`). The old 3-dispatch kernel cost 0.22-0.42
+  ms of GPU time at 1,024 lights and 0.72-1.62 ms at 4,096. Each of the 3,456
+  cluster threads (only 54 workgroups) tested every visible light twice (count
+  and fill), and one workgroup did the scan. The main pass took the same time
+  with either binning path, and no CPU stall showed up. Vulkan/DX12 `render()`
+  time tracks frame time only because `submit` waits on the 2-deep frame
+  fence. So the pass itself was the whole loss in GPU-bound frames. Some
+  scenes are CPU-bound: DX12 at 1,024 lights (GPU frame 0.6-1.2 ms against
+  1.4-1.6 ms wall), and Vulkan and OpenGL with 4,096 scaled lights (GPU frame
+  1.3 ms against 1.7-2.2 ms wall). There, CPU binning time removed from the
+  frame shows up directly.
+- ✅ Before/after, 1280x720, RTX 3070 Ti Laptop, ms/frame, CPU binning / GPU
+  binning frame time (median of interleaved rounds) and the GPU binning pass
+  (timed run). Before: commit e632531, 5 rounds. After: commit 90d65af, 9
+  rounds. The laptop warmed up during the session, and CPU-binning stress-4,096
+  frames drifted from about 6.5 to 7.3-9.1 ms. Compare CPU and GPU within one
+  run, not across runs.
 
-    On Vulkan and DX12, `render()` CPU time tracks frame time because it waits
-    for the frame in flight. DX12 gains about 0.3 ms except at 4,096 stress
-    lights. GPU binning cuts OpenGL `render()` CPU time 2.6-3.4x, but frame time
-    is 0.1-0.7 ms worse. Vulkan is 0.3-1.0 ms worse. The kernel is brute force:
-    each cluster tests every visible light, which is 3,456 clusters x 4,096
-    lights for each of two passes.
-- Still open: Metal has every shader and binding written but was not compiled
-  or run (no Apple hardware), and it bins on the CPU. GPU binning is not yet a
-  frame-time win on Vulkan/OpenGL. Next steps are a per-tile or per-slice
-  light pre-cull before the per-cluster loop, and GPU timestamp queries in the
-  RHI (none today) to measure the pass itself. `FrameStats::maxLightsPerCluster`
-  reads 0 in GPU mode. Bloom has no lens dirt or anamorphic options. The
-  1,024-per-type object stores crash on overflow instead of returning an error,
-  so two renderers cannot share one GL device.
+  | Backend | Scene | Before CPU / GPU | Before pass | After CPU / GPU | After pass |
+  |---|---|---|---|---|---|
+  | OpenGL | stress 1,024 | 1.20 / 1.28 | 0.220 | 1.42 / 1.36 | 0.035 |
+  | OpenGL | stress 4,096 | 6.50 / 7.23 | 1.009 | 8.03 / 8.12 | 0.147 |
+  | OpenGL | scaled 1,024 | 1.04 / 1.15 | 0.262 | 1.22 / 1.06 | 0.042 |
+  | OpenGL | scaled 4,096 | 2.24 / 2.06 | 0.722 | 2.28 / 1.85 | 0.039 |
+  | Vulkan | stress 1,024 | 1.47 / 1.78 | 0.410 | 1.32 / 1.29 | 0.047 |
+  | Vulkan | stress 4,096 | 6.34 / 6.84 | 1.615 | 7.31 / 7.84 | 0.171 |
+  | Vulkan | scaled 1,024 | 0.86 / 1.19 | 0.424 | 0.96 / 0.89 | 0.045 |
+  | Vulkan | scaled 4,096 | 1.74 / 2.34 | 1.146 | 2.03 / 1.61 | 0.050 |
+  | DX12 | stress 1,024 | 1.56 / 1.56 | 0.324 | 1.95 / 1.32 | 0.040 |
+  | DX12 | stress 4,096 | 6.79 / 6.92 | 1.099 | 9.10 / 9.48 | 0.145 |
+  | DX12 | scaled 1,024 | 1.43 / 1.10 | 0.288 | 1.53 / 0.95 | 0.035 |
+  | DX12 | scaled 4,096 | 2.38 / 2.13 | 0.813 | 2.47 / 2.04 | 0.038 |
+
+  The pass is 6-23x cheaper (0.035-0.05 ms except the stress-4,096 scene).
+  GPU binning is now faster in 9 of 12 rows. With OpenGL, `render()` CPU
+  time also drops from 1.18-5.65 to 0.51-1.76 ms. The exception is the
+  stress-4,096 scene, which is GPU-bound (main pass 7-9 ms) and close to the
+  2^20 index cap. There GPU binning adds its 0.15-0.17 ms of index writes to
+  the frame, and the medians are within run-to-run noise. In this run they
+  were +1% GL, +7% VK, and +4% DX12. In the previous run (90d65af, 5 rounds)
+  they were -1% GL, -6% VK, and -1% DX12. GPU binning stays the default on
+  every backend because no backend is slower in every scene.
+- Still open:
+  - Metal has every shader and binding written but was not compiled or run
+    (no Apple hardware). It bins on the CPU and has no timer queries.
+  - WebGPU has GPU binning but no timer queries, and its tiny smoke scene
+    cannot measure frame time.
+  - In GPU-bound scenes near the index cap, the binning pass's index writes
+    (0.15 ms) are not hidden. Async compute or overlapping the pass with the
+    shadow passes could hide them.
+  - Bloom has no lens dirt or anamorphic options.
+  - The 1,024-per-type object stores crash on overflow instead of returning
+    an error, so two renderers cannot share one GL device.
 - ✅ Adapter selection (2026-10-20). Every backend now picks the strongest
   GPU by default, using one ranking in `graphics/gpu_selection.*`: discrete,
   then integrated, then virtual/other, with software rasterizers (WARP /
