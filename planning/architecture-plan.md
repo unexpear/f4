@@ -654,10 +654,102 @@ Completed delivery and acceptance gates:
   draws per light). The 4-light case runs first and absorbs the atlas and
   pipeline warm-up. Before instancing, the per-entity, per-face draws exhausted
   the device buffer arena (crash at 16 lights x 1,024 pillars).
+- ✅ Static point-shadow caching (2026-10-20, commits f0bf4ec, f59be27,
+  0fb4662). `PbrRenderSettings::pointShadowCaching` (default on) keeps a
+  shadowed light's six atlas tiles from the previous frame when nothing they
+  depend on changed.
+  - Slots are stable. `assignStablePointShadowSlots` keeps a surviving light
+    in its old slot and gives freed slots to new lights, so a light entering or
+    leaving the budget does not move the others.
+  - Dirty tracking uses content signatures instead of ECS dirty flags, because
+    `TransformDirty` is consumed before rendering and tests write `WorldMatrix`
+    directly. Each slot hashes the light's position, range, and tile, plus every
+    caster inside its sphere (entity, mesh, submesh, material, world matrix, and
+    alpha inputs). A light is redrawn when its signature changes or the slot is
+    new, and the whole atlas is cleared when the atlas is (re)created.
+  - Partial redraw loads the atlas and resets only the dirty tiles with a
+    full-tile triangle from a `tileReset` pipeline variant (depth compare
+    Always, no depth test or write, still bound to the D32F attachment). It
+    writes exactly what the clear writes, so the result is bit-identical. A
+    zero-work "point-shadow-atlas-keep" graph pass declares the atlas as last
+    frame's fragment-shader read, so the Vulkan barrier into the load pass
+    orders after those reads and requests `ColorRead` for the load op.
+  - `FrameStats::pointShadowLightsRedrawn` reports the redraw count. With
+    nothing moving it is 0 on every frame after the first.
+  - Evidence: NullDevice tests cover slot stability and reuse. A GPU test on
+    GL, Vulkan, and DX12 renders an 8-step sequence with caching on and
+    off: first frame, static, one caster moved, static, one light moved, camera
+    moved (the shadow selection changes), static, and every caster moved. Every frame is pixel-identical (tolerance 0) and
+    Vulkan/DX12 validation is clean in debug.
+  - Savings (`F4_POINT_LIGHT_BENCH=cache`: 1,024 lights, 1,024 pillars, static
+    scene, 7 interleaved rounds, min ms/frame, cached / uncached):
+
+    | Backend | 4 shadowed | 8 shadowed | 16 shadowed |
+    |---|---|---|---|
+    | OpenGL | 1.39 / 1.46 | 1.54 / 1.71 | 1.68 / 1.94 |
+    | Vulkan | 1.34 / 1.44 | 1.37 / 1.59 | 1.38 / 1.68 |
+    | DX12 | 1.81 / 1.91 | 1.83 / 2.07 | 1.92 / 2.05 |
+
+    With nothing dirty the atlas pass is skipped, so cached cost grows more
+    slowly with the shadowed-light count (flat on Vulkan); uncached grows by about 0.01-0.04 ms per light. A later rerun on a busier
+    machine (other apps using the CPU, everything ~1 ms slower) kept cached
+    ahead in 7 of 9 mins, but medians were within noise.
+- ✅ GPU light binning (2026-10-20, commits b66144a, 4316e62, d6e8949,
+  850ba8e, ea6fc66). `PbrRenderSettings::gpuLightBinning` (default on) runs
+  cluster assignment as a compute pass on OpenGL 4.3+, Vulkan, DX12, and
+  WebGPU. CPU binning stays as the fallback and the reference.
+  - The CPU still culls and writes light records with the same helpers as the
+    CPU path (`gatherLightRanges`, `writeLightRecords`). It also appends three
+    packed words per visible light with its tile/slice range
+    (`buildClusteredLightBinningInput`). The cluster grid and index list are
+    left for the GPU.
+  - A "light-binning" graph pass runs three dispatches on the output buffer
+    (64-thread groups, buffer barriers in between):
+    1. Copy the header and records, and count each cluster's lights. Light
+       ranges are staged in shared memory.
+    2. One workgroup does a prefix scan with the 2^20 index cap.
+    3. Each cluster writes its list in ascending light order.
+    There are no atomics, so the output matches the CPU buffer word for word.
+  - Shaders: `light_binning.comp` (GL, and Vulkan via `-DF4_VULKAN=1`),
+    `light_binning_dx12.hlsl` (cs_6_0), and `light_binning_webgpu.wgsl`.
+    WebGPU `BeginRenderPass` now ends an open compute pass.
+  - Fallbacks: Null, Metal (no shader yet), callers that use `record()`
+    directly, frames with no visible lights, and pipeline failures all use CPU
+    binning. `FrameStats::pointLightBinningDispatches` reports which path ran.
+  - Vulkan storage buffers that are neither HostWrite nor vertex/index/uniform
+    are now DEVICE_LOCAL (with a host-visible fallback). `writeBuffer`/
+    `readBuffer` on them go through a staging copy.
+  - Evidence: a NullDevice emulation of the three passes reproduces the CPU
+    buffer. A GPU test on GL, Vulkan, and DX12 compares CPU vs GPU binning for
+    1,024 lights, 1,024 lights with an index cap of 20,000, and shadowed
+    lights. All have 0 differing pixels (tolerance 0) and 0 differing buffer
+    words. Cross-backend parity with GPU binning stays within max delta 1. The
+    Chromium WebGPU smoke requires the 3 dispatches and still matches the
+    point-light and point-shadow fixtures (max delta 1).
+  - Frame time (`F4_POINT_LIGHT_BENCH=binning`, 1280x720, RTX 3070 Ti Laptop,
+    median of 5 interleaved rounds, ms/frame with `render()` CPU time in
+    parentheses, CPU binning → GPU binning):
+
+    | Backend | stress 1,024 | stress 4,096 | scaled 1,024 | scaled 4,096 |
+    |---|---|---|---|---|
+    | OpenGL | 1.39 (1.36) → 1.51 (0.51) | 7.76 (5.74) → 8.44 (1.67) | 1.19 (1.18) → 1.37 (0.54) | 2.32 (2.29) → 2.51 (1.72) |
+    | Vulkan | 1.31 → 1.81 | 7.58 → 8.57 | 1.00 → 1.34 | 2.04 → 2.71 |
+    | DX12 | 2.01 → 1.66 | 8.67 → 9.43 | 1.54 → 1.23 | 2.58 → 2.29 |
+
+    On Vulkan and DX12, `render()` CPU time tracks frame time because it waits
+    for the frame in flight. DX12 gains about 0.3 ms except at 4,096 stress
+    lights. GPU binning cuts OpenGL `render()` CPU time 2.6-3.4x, but frame time
+    is 0.1-0.7 ms worse. Vulkan is 0.3-1.0 ms worse. The kernel is brute force:
+    each cluster tests every visible light, which is 3,456 clusters x 4,096
+    lights for each of two passes.
 - Still open: Metal has every shader and binding written but was not compiled
-  or run (no Apple hardware). Point-light binning stays on the CPU. Shadow
-  tiles are re-rendered every frame with no caching for static lights. Bloom
-  has no lens dirt or anamorphic options.
+  or run (no Apple hardware), and it bins on the CPU. GPU binning is not yet a
+  frame-time win on Vulkan/OpenGL. Next steps are a per-tile or per-slice
+  light pre-cull before the per-cluster loop, and GPU timestamp queries in the
+  RHI (none today) to measure the pass itself. `FrameStats::maxLightsPerCluster`
+  reads 0 in GPU mode. Bloom has no lens dirt or anamorphic options. The
+  1,024-per-type object stores crash on overflow instead of returning an error,
+  so two renderers cannot share one GL device.
 - ✅ Adapter selection (2026-10-20). Every backend now picks the strongest
   GPU by default, using one ranking in `graphics/gpu_selection.*`: discrete,
   then integrated, then virtual/other, with software rasterizers (WARP /
