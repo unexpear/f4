@@ -467,6 +467,170 @@ TEST_CASE("Point lights: the light-reference cap drops and counts overflow") {
     CHECK(words.size() == words[6] + 10);
 }
 
+namespace {
+
+// What light_binning.comp computes, step for step, on the CPU: copy the
+// prefix, count per cluster, prefix-sum with the index cap, fill the lists.
+[[nodiscard]] auto emulateGpuBinning(const containers::Array<std::uint32_t>& input,
+                                     const engine::ClusteredLightGpuParams& p)
+    -> std::vector<std::uint32_t> {
+    std::vector<std::uint32_t> out(p.totalWords, 0xdeadbeefu);
+    for (std::uint32_t word = 0; word < p.copyWords; ++word) out[word] = input[word];
+    const auto covers = [&](std::uint32_t light, std::uint32_t x, std::uint32_t y,
+                            std::uint32_t z) {
+        const std::uint32_t* box = input.data() + p.rangeOffset + light * 3u;
+        return x >= (box[0] & 0xffffu) && x <= (box[0] >> 16) && y >= (box[1] & 0xffffu) &&
+               y <= (box[1] >> 16) && z >= (box[2] & 0xffffu) && z <= (box[2] >> 16);
+    };
+    std::vector<std::uint32_t> counts(p.clusterCount, 0);
+    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
+        const std::uint32_t x = cluster % p.tilesX;
+        const std::uint32_t y = (cluster / p.tilesX) % p.tilesY;
+        const std::uint32_t z = cluster / (p.tilesX * p.tilesY);
+        for (std::uint32_t light = 0; light < p.visible; ++light) {
+            if (covers(light, x, y, z)) ++counts[cluster];
+        }
+    }
+    std::uint32_t prefix = 0;
+    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
+        const std::uint32_t start = std::min(prefix, p.maxIndexCount);
+        out[p.gridOffset + cluster * 2u] = p.indexOffset + start;
+        out[p.gridOffset + cluster * 2u + 1u] = std::min(counts[cluster], p.maxIndexCount - start);
+        prefix += counts[cluster];
+    }
+    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
+        const std::uint32_t x = cluster % p.tilesX;
+        const std::uint32_t y = (cluster / p.tilesX) % p.tilesY;
+        const std::uint32_t z = cluster / (p.tilesX * p.tilesY);
+        const std::uint32_t first = out[p.gridOffset + cluster * 2u];
+        const std::uint32_t allowed = out[p.gridOffset + cluster * 2u + 1u];
+        std::uint32_t count = 0;
+        for (std::uint32_t light = 0; light < p.visible; ++light) {
+            if (!covers(light, x, y, z)) continue;
+            if (count < allowed) out[first + count] = light;
+            ++count;
+        }
+    }
+    return out;
+}
+
+// Compares two clustered-light buffers by meaning: same header values, light
+// records, shadow matrices, and per-cluster lists, wherever each buffer
+// places its sections. Returns the number of differing items.
+[[nodiscard]] auto compareLightBuffers(std::span<const std::uint32_t> a,
+                                       std::span<const std::uint32_t> b) -> std::size_t {
+    std::size_t differences = 0;
+    if (a.size() < engine::kPointLightHeaderWords || b.size() < engine::kPointLightHeaderWords) {
+        return 1;
+    }
+    for (std::size_t word : {0, 1, 2, 3, 7, 8, 9, 11, 12, 13, 14}) {
+        if (a[word] != b[word]) ++differences;
+    }
+    if (differences != 0) return differences;
+    const std::uint32_t visible = a[0];
+    for (std::uint32_t i = 0; i < visible * engine::kPointLightRecordWords; ++i) {
+        if (a[a[4] + i] != b[b[4] + i]) ++differences;
+    }
+    const std::uint32_t matrixWords = a[11] * 6u * 16u;
+    for (std::uint32_t i = 0; i < matrixWords; ++i) {
+        if (a[a[10] + i] != b[b[10] + i]) ++differences;
+    }
+    if (visible == 0) return differences;
+    const std::uint32_t clusters = a[1] * a[2] * a[3];
+    for (std::uint32_t cluster = 0; cluster < clusters; ++cluster) {
+        const std::uint32_t* ra = a.data() + a[5] + cluster * engine::kPointLightClusterWords;
+        const std::uint32_t* rb = b.data() + b[5] + cluster * engine::kPointLightClusterWords;
+        if (ra[1] != rb[1] || ra[0] - a[6] != rb[0] - b[6]) {
+            ++differences;
+            continue;
+        }
+        for (std::uint32_t k = 0; k < ra[1]; ++k) {
+            if (a[ra[0] + k] != b[rb[0] + k]) ++differences;
+        }
+    }
+    return differences;
+}
+
+} // namespace
+
+TEST_CASE("Point lights: the GPU binning algorithm reproduces the CPU cluster buffer") {
+    const math::Mat4 view = math::Mat4::lookAtRH({0.0f, 6.0f, 18.0f}, {0, 0, 0}, {0, 1, 0});
+    const math::Mat4 projection =
+        math::Mat4::perspectiveRH_ZO(1.04719758f, 16.0f / 9.0f, 0.1f, 80.0f);
+    Lcg random;
+    std::vector<engine::ClusteredLightInput> lights;
+    for (int i = 0; i < 700; ++i) {
+        engine::ClusteredLightInput light{{random.range(-24.0f, 24.0f), random.range(0.0f, 7.0f),
+                                           random.range(-30.0f, 20.0f)},
+                                          {random.range(0.1f, 1.0f), random.range(0.1f, 1.0f),
+                                           random.range(0.1f, 1.0f)},
+                                          random.range(0.4f, 4.0f)};
+        if (i % 37 == 0) light.radiance = {}; // culled for having no energy
+        if (i % 11 == 0) light.shadowSlot = static_cast<std::uint32_t>(i % 5);
+        lights.push_back(light);
+    }
+    // A light around the camera crosses the near plane and covers every tile.
+    lights.push_back({{0.0f, 6.0f, 17.5f}, {1, 1, 1}, 2.0f});
+
+    for (const std::uint32_t cap : {engine::ClusterGridConfig{}.maxIndexCount, 3000u}) {
+        CAPTURE(cap);
+        engine::ClusterGridConfig config;
+        config.maxIndexCount = cap;
+        containers::Array<std::uint32_t> cpu;
+        const auto cpuStats =
+            engine::buildClusteredLightBuffer(lights, view, projection, 0.1f, 80.0f, config, cpu);
+        // No reserved words: the GPU output must be the CPU buffer word for word.
+        containers::Array<std::uint32_t> input;
+        engine::ClusteredLightGpuParams params;
+        const auto gpuStats = engine::buildClusteredLightBinningInput(
+            lights, view, projection, 0.1f, 80.0f, config, 0, input, params);
+        CHECK(gpuStats.submitted == cpuStats.submitted);
+        CHECK(gpuStats.visible == cpuStats.visible);
+        CHECK(gpuStats.indexCount == cpuStats.indexCount);
+        CHECK(gpuStats.droppedIndices == cpuStats.droppedIndices);
+        CHECK(cpuStats.visible > 200);
+        if (cap == 3000u) CHECK(cpuStats.droppedIndices > 0);
+        REQUIRE(params.totalWords == cpu.size());
+        const std::vector<std::uint32_t> emulated = emulateGpuBinning(input, params);
+        std::size_t mismatches = 0;
+        for (std::size_t i = 0; i < cpu.size(); ++i) {
+            if (emulated[i] != cpu[i]) ++mismatches;
+        }
+        CHECK(mismatches == 0);
+
+        // Reserved words (the renderer's shadow matrices) only move the grid.
+        containers::Array<std::uint32_t> shifted;
+        engine::ClusteredLightGpuParams shiftedParams;
+        (void)engine::buildClusteredLightBinningInput(lights, view, projection, 0.1f, 80.0f,
+                                                      config, 96, shifted, shiftedParams);
+        CHECK(shiftedParams.gridOffset == params.gridOffset + 96);
+        CHECK(shiftedParams.reservedOffset == params.gridOffset);
+        const std::vector<std::uint32_t> moved = emulateGpuBinning(shifted, shiftedParams);
+        CHECK(compareLightBuffers(std::span<const std::uint32_t>(cpu.data(), cpu.size()),
+                                  std::span<const std::uint32_t>(moved)) == 0);
+    }
+}
+
+TEST_CASE("Point lights: the null device always bins on the CPU") {
+    gfx::NullDevice device;
+    ecs::Registry registry(256);
+    engine::Renderer renderer(registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    NightSceneOptions options;
+    options.lightsPerSide = 4;
+    const ecs::Entity camera = buildNightScene(renderer, registry, options);
+    gfx::FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {64, 64};
+    framebufferDesc.attachments.push(gfx::AttachmentDesc{});
+    auto framebuffer = device.createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+    REQUIRE(renderer.pbrSettings().gpuLightBinning);
+    REQUIRE(renderer.render(framebuffer.value(), camera, 1.0f) == gfx::GfxError::None);
+    CHECK(renderer.stats().pointLightBinningDispatches == 0);
+    CHECK(renderer.stats().pointLightsVisible > 0);
+    CHECK(device.stats().dispatchCalls == 0);
+}
+
 TEST_CASE("Point lights: the renderer uploads and binds clustered lights for every draw") {
     gfx::NullDevice device;
     ecs::Registry registry(4096);
@@ -1655,6 +1819,153 @@ TEST_CASE("Point-light shadow cache: cached frames equal uncached frames on Open
                       kEffectHeight);
 }
 
+namespace {
+
+// CPU vs GPU light binning on one renderer: the same static frame rendered
+// with gpuLightBinning off and on.
+struct BinningFrame {
+    const char* scene;
+    Capture cpu;
+    Capture gpu;
+    std::vector<std::uint32_t> cpuWords;
+    std::vector<std::uint32_t> gpuWords;
+    engine::FrameStats cpuStats{};
+    engine::FrameStats gpuStats{};
+};
+
+[[nodiscard]] auto readLightBuffer(gfx::IDevice& device, gfx::BufferHandle buffer)
+    -> std::vector<std::uint32_t> {
+    std::vector<std::uint32_t> header(engine::kPointLightHeaderWords);
+    REQUIRE(device.readBuffer(buffer, 0, std::as_writable_bytes(std::span(header))) ==
+            gfx::GfxError::None);
+    std::size_t size = static_cast<std::size_t>(header[6]) + header[7];
+    if (header[11] != 0) size = std::max<std::size_t>(size, header[10] + header[11] * 96u);
+    std::vector<std::uint32_t> words(size);
+    REQUIRE(device.readBuffer(buffer, 0, std::as_writable_bytes(std::span(words))) ==
+            gfx::GfxError::None);
+    return words;
+}
+
+template <typename Reader>
+[[nodiscard]] auto captureBinningScenes(gfx::IDevice& device, Reader&& reader)
+    -> std::vector<BinningFrame> {
+    struct Scene {
+        const char* name;
+        NightSceneOptions options;
+        std::uint32_t maxIndexCount;
+    };
+    NightSceneOptions dense;
+    dense.lightsPerSide = 32; // 1024 lights
+    dense.extent = 14.0f;
+    dense.range = 2.5f;
+    const Scene scenes[] = {
+        {"1024 lights", dense, engine::ClusterGridConfig{}.maxIndexCount},
+        {"1024 lights, index cap 20000", dense, 20000u},
+        {"shadowed lights", shadowCacheOptions(), engine::ClusterGridConfig{}.maxIndexCount},
+    };
+    std::vector<BinningFrame> frames;
+    for (const Scene& scene : scenes) {
+        NightTarget target(device, kEffectWidth, kEffectHeight);
+        auto world = std::make_unique<NightWorld>(device, scene.options);
+        world->renderer.pbrSettings().pointLightClusters.maxIndexCount = scene.maxIndexCount;
+        BinningFrame frame;
+        frame.scene = scene.name;
+        world->renderer.pbrSettings().gpuLightBinning = false;
+        frame.cpu = target.render(world->renderer, world->camera, reader);
+        frame.cpuStats = world->renderer.stats();
+        const auto cpuWords = world->renderer.pointLightWords();
+        frame.cpuWords.assign(cpuWords.begin(), cpuWords.end());
+        world->renderer.pbrSettings().gpuLightBinning = true;
+        frame.gpu = target.render(world->renderer, world->camera, reader);
+        frame.gpuStats = world->renderer.stats();
+        frame.gpuWords = readLightBuffer(device, world->renderer.pointLightBuffer());
+        frames.push_back(static_cast<BinningFrame&&>(frame));
+    }
+    return frames;
+}
+
+void checkBinningFrames(const char* backend, const std::vector<BinningFrame>& frames) {
+    for (const BinningFrame& frame : frames) {
+        const auto diff = engine::compareShaderImagesRgba8(frame.cpu, frame.gpu, 0);
+        const std::size_t bufferDifferences =
+            compareLightBuffers(std::span<const std::uint32_t>(frame.cpuWords),
+                                std::span<const std::uint32_t>(frame.gpuWords));
+        MESSAGE(std::string(backend) << " " << std::string(frame.scene)
+                << ": visible=" << frame.cpuStats.pointLightsVisible
+                << " refs=" << frame.cpuStats.pointLightReferences
+                << " dropped=" << frame.cpuStats.pointLightReferencesDropped
+                << " dispatches cpu/gpu=" << frame.cpuStats.pointLightBinningDispatches << "/"
+                << frame.gpuStats.pointLightBinningDispatches
+                << " pixel mismatches=" << diff.mismatchPixelCount
+                << " buffer differences=" << bufferDifferences);
+        CHECK(frame.cpuStats.pointLightBinningDispatches == 0);
+        CHECK(frame.gpuStats.pointLightBinningDispatches == 3);
+        CHECK(frame.cpuStats.pointLightsVisible >= 16);
+        CHECK(frame.gpuStats.pointLightsVisible == frame.cpuStats.pointLightsVisible);
+        CHECK(frame.gpuStats.pointLightReferences == frame.cpuStats.pointLightReferences);
+        CHECK(frame.gpuStats.pointLightReferencesDropped ==
+              frame.cpuStats.pointLightReferencesDropped);
+        CHECK(diff.mismatchPixelCount == 0);
+        CHECK(bufferDifferences == 0);
+    }
+    CHECK(frames[1].cpuStats.pointLightReferencesDropped > 0);
+    CHECK(frames[2].cpuStats.pointShadowLights > 0);
+}
+
+} // namespace
+
+TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan, and DX12") {
+    auto windowResult =
+        platform::Window::create({"GPU light binning", kEffectWidth, kEffectHeight, false});
+    REQUIRE(windowResult.hasValue());
+    platform::Window* window = windowResult.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    gfx::IDevice* openGlBase = gfx::createOpenGLDevice();
+    REQUIRE(openGlBase != nullptr);
+    const auto gl = captureBinningScenes(
+        *openGlBase, [](gfx::TextureHandle, std::span<std::byte> out) {
+            glReadPixels(0, 0, static_cast<GLsizei>(kEffectWidth),
+                         static_cast<GLsizei>(kEffectHeight), GL_RGBA, GL_UNSIGNED_BYTE,
+                         out.data());
+            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+        });
+    gfx::deleteDevice(openGlBase);
+    delete window;
+    checkBinningFrames("OpenGL", gl);
+
+    gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
+    REQUIRE(vulkanBase != nullptr);
+    auto* vulkan = static_cast<gfx::VulkanDevice*>(vulkanBase);
+    const auto vk = captureBinningScenes(
+        *vulkan, [vulkan](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return vulkan->readTexture(texture, 0, out);
+        });
+    CHECK(vulkan->validationWarningCount() == 0);
+    CHECK(vulkan->validationErrorCount() == 0);
+    gfx::deleteDevice(vulkanBase);
+    checkBinningFrames("Vulkan", vk);
+
+    gfx::IDevice* dx12Base = gfx::createDx12Device();
+    REQUIRE(dx12Base != nullptr);
+    auto* dx12 = static_cast<gfx::Dx12Device*>(dx12Base);
+    const auto dx = captureBinningScenes(
+        *dx12, [dx12](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return dx12->readTexture(texture, 0, out);
+        });
+    CHECK(dx12->validationWarningCount() == 0);
+    CHECK(dx12->validationErrorCount() == 0);
+    gfx::deleteDevice(dx12Base);
+    checkBinningFrames("DX12", dx);
+
+    for (std::size_t i = 0; i < gl.size(); ++i) {
+        checkEffectParity(std::string("GPU binning ") + gl[i].scene + " GL/VK", gl[i].gpu,
+                          vk[i].gpu);
+        checkEffectParity(std::string("GPU binning ") + gl[i].scene + " GL/DX", gl[i].gpu,
+                          dx[i].gpu);
+    }
+}
+
 TEST_CASE("Bloom and point-light shadows: WebGPU validation frames match the locked references") {
     auto windowResult = platform::Window::create(
         {"Effect references", kWebFrameExtent, kWebFrameExtent, false});
@@ -1729,8 +2040,11 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     // "1": every row once. "cache": shadow-cache rows only, cached and
     // uncached interleaved over several rounds, reporting the median.
     const std::string mode = enabled;
-    if (mode != "1" && mode != "cache") return;
+    // "binning": CPU vs GPU light binning at 1024/4096 lights, interleaved.
+    if (mode != "1" && mode != "cache" && mode != "binning") return;
     bool verbose = true;
+    bool benchGpuBinning = true;
+    double lastCpuMs = 0.0; // CPU time inside render() per frame, last bench() call
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 30;
@@ -1795,6 +2109,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             }
             const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
             renderer.pbrSettings().pointShadowCaching = shadowCache;
+            renderer.pbrSettings().gpuLightBinning = benchGpuBinning;
             const float aspect = static_cast<float>(width) / static_cast<float>(height);
             const gfx::Extent extent{width, height};
             for (int i = 0; i < warmup; ++i) {
@@ -1803,13 +2118,20 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             }
             device.waitIdle();
             const auto start = std::chrono::steady_clock::now();
+            double cpuMs = 0.0;
             for (int i = 0; i < frames; ++i) {
-                REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect, extent) ==
-                        gfx::GfxError::None);
+                const auto frameStart = std::chrono::steady_clock::now();
+                const gfx::GfxError error =
+                    renderer.render(framebuffer.value(), cameraEntity, aspect, extent);
+                cpuMs += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - frameStart)
+                             .count();
+                REQUIRE(error == gfx::GfxError::None);
             }
             device.waitIdle();
             const auto end = std::chrono::steady_clock::now();
             ms = std::chrono::duration<double, std::milli>(end - start).count() / frames;
+            lastCpuMs = cpuMs / frames;
             const engine::FrameStats stats = renderer.stats();
             char variant[64];
             std::snprintf(variant, sizeof(variant), "%s%s%s%s",
@@ -1818,18 +2140,50 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                           shadows > 0 && !shadowCache ? "(uncached)" : "");
             if (verbose) std::printf("[point-light bench] %s %s %ux%u lights=%u range=%.2f visible=%u "
                         "refs=%u max/cluster=%u draws=%u shadowed=%u shadowDraws=%u "
-                        "redrawn=%u bloomPasses=%u: %.3f ms/frame\n",
+                        "redrawn=%u bloomPasses=%u binning=%s: %.3f ms/frame "
+                        "(render() CPU %.3f ms)\n",
                         backend, variant, width, height,
                         stats.pointLights, static_cast<double>(options.range),
                         stats.pointLightsVisible,
                         stats.pointLightReferences, stats.maxPointLightsPerCluster,
                         stats.draws, stats.pointShadowLights, stats.pointShadowDraws,
-                        stats.pointShadowLightsRedrawn, stats.bloomPasses, ms);
+                        stats.pointShadowLightsRedrawn, stats.bloomPasses,
+                        stats.pointLightBinningDispatches != 0 ? "gpu" : "cpu", ms, lastCpuMs);
         }
         CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
         CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
         CHECK(device.destroyTexture(color.value()) == gfx::GfxError::None);
         return ms;
+    };
+    // CPU vs GPU binning on the plain night scene, 1024 and 4096 lights, both
+    // range models; interleaved rounds, median frame and render() CPU time.
+    const auto binningRows = [&](gfx::IDevice& device, const char* backend) {
+        constexpr int rounds = 5;
+        verbose = false;
+        for (const bool scaled : {false, true}) {
+            for (const std::uint32_t side : {32u, 64u}) {
+                std::vector<double> frame[2], cpu[2];
+                for (int round = 0; round < rounds; ++round) {
+                    for (int order = 0; order < 2; ++order) {
+                        const int gpu = (round + order) % 2;
+                        benchGpuBinning = gpu == 1;
+                        frame[gpu].push_back(bench(device, backend, side, scaled));
+                        cpu[gpu].push_back(lastCpuMs);
+                    }
+                }
+                for (auto* values : {&frame[0], &frame[1], &cpu[0], &cpu[1]}) {
+                    std::sort(values->begin(), values->end());
+                }
+                std::printf("[point-light bench] %s binning %s lights=%u: CPU binning %.3f "
+                            "ms/frame (render() CPU %.3f), GPU binning %.3f ms/frame "
+                            "(render() CPU %.3f) (median of %d)\n",
+                            backend, scaled ? "scaled" : "stress", side * side,
+                            frame[0][rounds / 2], cpu[0][rounds / 2], frame[1][rounds / 2],
+                            cpu[1][rounds / 2], rounds);
+            }
+        }
+        benchGpuBinning = true;
+        verbose = true;
     };
     // Static night scene with 32x32 pillars: cached vs uncached point shadows,
     // interleaved so clock drift hits both alike; median of the rounds.
@@ -1871,6 +2225,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                     reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
         if (mode == "cache") {
             cacheRows(*device, "OpenGL");
+        } else if (mode == "binning") {
+            binningRows(*device, "OpenGL");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "OpenGL", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "OpenGL", side, true);
@@ -1888,6 +2244,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         REQUIRE(device != nullptr);
         if (mode == "cache") {
             cacheRows(*device, "Vulkan");
+        } else if (mode == "binning") {
+            binningRows(*device, "Vulkan");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "Vulkan", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "Vulkan", side, true);
@@ -1906,6 +2264,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                     static_cast<gfx::Dx12Device*>(device)->deviceName());
         if (mode == "cache") {
             cacheRows(*device, "DX12");
+        } else if (mode == "binning") {
+            binningRows(*device, "DX12");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "DX12", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "DX12", side, true);
