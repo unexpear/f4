@@ -253,6 +253,10 @@ async function run() {
             rendererHash: document.body?.dataset.f4RendererHash ?? null,
             pointLights: document.body?.dataset.f4PointLights ?? null,
             pointLightGain: document.body?.dataset.f4PointLightGain ?? null,
+            pointShadows: document.body?.dataset.f4PointShadows ?? null,
+            pointShadowLoss: document.body?.dataset.f4PointShadowLoss ?? null,
+            bloom: document.body?.dataset.f4Bloom ?? null,
+            bloomStats: document.body?.dataset.f4BloomStats ?? null,
             validationScene: document.body?.dataset.f4ValidationScene ?? null,
             sceneIndex: document.body?.dataset.f4SceneIndex ?? null,
             resizeCount: document.body?.dataset.f4ResizeCount ?? null,
@@ -273,7 +277,9 @@ async function run() {
         const errors = browserErrors(devTools.events);
         if (!state?.webgpu) throw new Error("navigator.gpu is unavailable; WebGL fallback is forbidden");
         if (state.ready !== "true") {
-            throw new Error(`WebGPU app did not become ready: ${JSON.stringify(state)}\n${browserOutput}`);
+            throw new Error(
+                `WebGPU app did not become ready: ${JSON.stringify(state)}\n` +
+                `${errors.join("\n")}\n${browserOutput}`);
         }
         if (state.draws !== "130" || state.noiseParity !== "true" ||
             state.retirement !== "true" ||
@@ -284,6 +290,8 @@ async function run() {
             Number.parseInt(state.rendererPixels, 10) <= 100 ||
             !/^[0-9a-f]{8}$/.test(state.rendererHash ?? "") ||
             state.pointLights !== "true" ||
+            state.pointShadows !== "true" ||
+            state.bloom !== "true" ||
             state.validationErrors !== "0") {
             throw new Error(`WebGPU conformance markers are invalid: ${JSON.stringify(state)}`);
         }
@@ -415,6 +423,40 @@ async function run() {
             );
         }
         writeFileSync(join(captureDirectory, "renderer.rgba"), rendererBytes);
+
+        // Point-light shadow and bloom frames, held to the references the
+        // native OpenGL / Vulkan / DX12 test locks (tests/engine/test_point_lights.cpp).
+        const effectSummaries = [];
+        for (const [which, name] of [[0, "point_shadow"], [1, "bloom"]]) {
+            const effectPixels = await evaluateJson(devTools, `(() => {
+                const address = Module._f4EffectCaptureData(${which});
+                return Array.from(HEAPU8.subarray(address, address + 64 * 64 * 4));
+            })()`);
+            const effectBytes = Buffer.from(effectPixels);
+            const effectReference = readFileSync(
+                new URL(`../tests/fixtures/renderer_${name}_reference.rgba`, import.meta.url));
+            if (effectReference.length !== effectBytes.length) {
+                throw new Error(`${name} reference size ${effectReference.length} != ${effectBytes.length}`);
+            }
+            let effectMismatch = 0;
+            let effectMaxDelta = 0;
+            for (let pixel = 0; pixel < 64 * 64; ++pixel) {
+                let mismatch = false;
+                for (let channel = 0; channel < 4; ++channel) {
+                    const index = pixel * 4 + channel;
+                    const delta = Math.abs(effectBytes[index] - effectReference[index]);
+                    effectMaxDelta = Math.max(effectMaxDelta, delta);
+                    if (delta > 2) mismatch = true;
+                }
+                if (mismatch) ++effectMismatch;
+            }
+            writeFileSync(join(captureDirectory, `renderer_${name}.rgba`), effectBytes);
+            if (effectMismatch !== 0) {
+                throw new Error(
+                    `WebGPU ${name} parity failed: ${effectMismatch} pixels, max channel delta ${effectMaxDelta}`);
+            }
+            effectSummaries.push(`${name} max=${effectMaxDelta}`);
+        }
         const hashes = [];
         for (let frame = 1; frame <= 3; ++frame) {
             const capture = await devTools.call("Page.captureScreenshot", {
@@ -532,7 +574,10 @@ async function run() {
         console.log(
             `WebGPU ready; renderer=${state.rendererPixels} pixels/${state.rendererHash}; ` +
             `point-light red/other gain=${state.pointLightGain}; ` +
+            `point-shadow red loss/brighter=${state.pointShadowLoss}; ` +
+            `bloom zero-delta/glow pixels=${state.bloomStats}; ` +
             `M11 parity max=${parityMaxChannelDelta}; ` +
+            `effect parity ${effectSummaries.join(", ")}; ` +
             `PBR pixels=${visual.foreground}; colors=${visual.colorBins}; ` +
             `${validationScenes.length} demo scenes stable ` +
             `(${validationSummaries.join(", ")}); ` +

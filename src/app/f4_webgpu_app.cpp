@@ -23,6 +23,7 @@
 #include "engine/cameras/camera.h"
 #include "engine/lighting/clustered_lights.h"
 #include "engine/lighting/light.h"
+#include "engine/lighting/point_shadows.h"
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
 #include "engine/rendering/renderer.h"
@@ -166,6 +167,11 @@ struct App {
     FramebufferHandle framebuffer{};
     std::array<std::byte, kRendererCaptureBytes> rendererCapture{};
     std::array<std::byte, kRendererCaptureBytes> pointLightCapture{};
+    std::array<std::byte, kRendererCaptureBytes> effectCaptureA{};
+    std::array<std::byte, kRendererCaptureBytes> effectCaptureB{};
+    // Frames the smoke compares with tests/fixtures/renderer_*_reference.rgba.
+    std::array<std::byte, kRendererCaptureBytes> pointShadowCapture{};
+    std::array<std::byte, kRendererCaptureBytes> bloomCapture{};
     TextureFormat surfaceFormat = TextureFormat::RGBA8_UNORM;
     Extent extent{};
     std::uint32_t frameCount = 0;
@@ -425,6 +431,13 @@ void renderFrame() {
         commands.bindResource(0, slot, BindingType::Texture,
                               gApp.textures[slot].index, gApp.textures[slot].generation);
         commands.bindResource(0, slot, BindingType::Sampler,
+                              gApp.sampler.index, gApp.sampler.generation);
+    }
+    {
+        const auto atlasBinding = f4::engine::pointShadowAtlasBinding(gApp.device->backend());
+        commands.bindResource(atlasBinding.bindPoint, atlasBinding.slot, BindingType::Texture,
+                              gApp.textures[6].index, gApp.textures[6].generation);
+        commands.bindResource(atlasBinding.bindPoint, atlasBinding.slot, BindingType::Sampler,
                               gApp.sampler.index, gApp.sampler.generation);
     }
     for (std::uint32_t draw = 0; draw < kDrawsPerFrame; ++draw) {
@@ -811,6 +824,12 @@ auto validateRendererFrame() -> bool {
     bool pointLightsOk = false;
     std::uint64_t pointRedGain = 0;
     std::uint64_t pointOtherGain = 0;
+    bool pointShadowsOk = false;
+    std::uint64_t pointShadowLoss = 0;
+    std::uint64_t pointShadowBrighter = 0;
+    bool bloomOk = false;
+    int bloomZeroMaxDelta = 0;
+    std::uint64_t bloomGlowPixels = 0;
     {
         f4::ecs::Registry registry(16);
         f4::engine::Renderer renderer(registry, *gApp.device);
@@ -858,10 +877,11 @@ auto validateRendererFrame() -> bool {
                                GfxError::None &&
                            renderer.stats().draws == 1 && renderer.stats().instances == 1;
             }
+            f4::ecs::Entity pointEntity{};
             if (rendered) {
                 // Clustered point lights: a red light just in front of the
                 // triangle must add red light and almost nothing else.
-                const f4::ecs::Entity pointEntity = registry.create();
+                pointEntity = registry.create();
                 f4::engine::PointLight point;
                 point.position = {0.0f, 0.0f, 0.6f};
                 point.color = {1.0f, 0.05f, 0.05f};
@@ -894,6 +914,121 @@ auto validateRendererFrame() -> bool {
                     pointLightsOk = pointRedGain > 2000 && pointRedGain > pointOtherGain * 2u;
                 }
             }
+            const Extent rendererExtent{kRendererExtent, kRendererExtent};
+            auto channel = [](const auto& capture, std::size_t index) {
+                return std::to_integer<int>(capture[index]);
+            };
+            if (pointLightsOk) {
+                // Point-light shadow: a small shadow-casting triangle between the
+                // red light and the big triangle. Shadowing the light may only
+                // darken pixels, and must remove a visible amount of red.
+                const f4::ecs::Entity occluder = registry.create();
+                auto& occluderTransform = registry.emplace<f4::ecs::LocalTransform>(
+                    occluder, f4::ecs::LocalTransform{});
+                occluderTransform.position = {0.15f, -0.2f, 0.3f};
+                occluderTransform.scale = f4::math::Vec3(0.2f);
+                registry.emplace<f4::engine::MeshRenderer>(
+                    occluder, f4::engine::MeshRenderer{mesh, material, 0, true, false});
+                f4::ecs::updateWorldTransforms(registry);
+                pointShadowsOk =
+                    renderer.render(framebuffer, cameraEntity, 1.0f, rendererExtent) ==
+                    GfxError::None;
+                if (pointShadowsOk) {
+                    gApp.device->waitIdle();
+                    pointShadowsOk = gApp.webGpu->readTexture(color, 0, gApp.effectCaptureA) ==
+                                         GfxError::None &&
+                                     renderer.stats().pointShadowLights == 0;
+                }
+                if (auto* shadowed = registry.get<f4::engine::PointLight>(pointEntity)) {
+                    shadowed->castShadows = true;
+                }
+                if (pointShadowsOk) {
+                    pointShadowsOk =
+                        renderer.render(framebuffer, cameraEntity, 1.0f, rendererExtent) ==
+                        GfxError::None;
+                }
+                if (pointShadowsOk) {
+                    gApp.device->waitIdle();
+                    pointShadowsOk = gApp.webGpu->readTexture(color, 0, gApp.effectCaptureB) ==
+                                         GfxError::None &&
+                                     renderer.stats().pointShadowLights == 1 &&
+                                     renderer.stats().pointShadowDraws > 0;
+                }
+                if (pointShadowsOk) {
+                    for (std::size_t offset = 0; offset < gApp.effectCaptureA.size();
+                         offset += 4) {
+                        for (std::size_t c = 0; c < 3; ++c) {
+                            const int unshadowed = channel(gApp.effectCaptureA, offset + c);
+                            const int shadowed = channel(gApp.effectCaptureB, offset + c);
+                            if (shadowed > unshadowed + 1) ++pointShadowBrighter;
+                            if (c == 0 && unshadowed > shadowed) {
+                                pointShadowLoss +=
+                                    static_cast<std::uint64_t>(unshadowed - shadowed);
+                            }
+                        }
+                    }
+                    pointShadowsOk = pointShadowLoss > 500 && pointShadowBrighter == 0;
+                    gApp.pointShadowCapture = gApp.effectCaptureB;
+                }
+            }
+            if (pointShadowsOk) {
+                // HDR bloom. Intensity 0 must reproduce the non-bloom frame on
+                // geometry (only fp16 HDR rounding differs; the background is
+                // the bloom clear colour instead of the framebuffer clear), and
+                // a real intensity must spread light into dark pixels.
+                renderer.pbrSettings().bloomEnabled = true;
+                renderer.pbrSettings().bloomIntensity = 0.0f;
+                bloomOk = renderer.render(framebuffer, cameraEntity, 1.0f, rendererExtent) ==
+                          GfxError::None;
+                if (bloomOk) {
+                    gApp.device->waitIdle();
+                    bloomOk = gApp.webGpu->readTexture(color, 0, gApp.effectCaptureA) ==
+                                  GfxError::None &&
+                              renderer.stats().bloomPasses > 2;
+                }
+                if (bloomOk) {
+                    for (std::size_t offset = 0; offset < gApp.effectCaptureB.size();
+                         offset += 4) {
+                        bool geometry = false;
+                        for (std::size_t c = 0; c < 3; ++c) {
+                            geometry = geometry || channel(gApp.effectCaptureB, offset + c) > 6;
+                        }
+                        if (!geometry) continue;
+                        for (std::size_t c = 0; c < 3; ++c) {
+                            bloomZeroMaxDelta = std::max(
+                                bloomZeroMaxDelta,
+                                std::abs(channel(gApp.effectCaptureA, offset + c) -
+                                         channel(gApp.effectCaptureB, offset + c)));
+                        }
+                    }
+                    renderer.pbrSettings().bloomIntensity = 1.5f;
+                    renderer.pbrSettings().bloomThreshold = 0.3f;
+                    bloomOk = bloomZeroMaxDelta <= 2 &&
+                              renderer.render(framebuffer, cameraEntity, 1.0f,
+                                              rendererExtent) == GfxError::None;
+                }
+                if (bloomOk) {
+                    gApp.device->waitIdle();
+                    bloomOk = gApp.webGpu->readTexture(color, 0, gApp.effectCaptureB) ==
+                              GfxError::None;
+                    gApp.bloomCapture = gApp.effectCaptureB;
+                }
+                if (bloomOk) {
+                    for (std::size_t offset = 0; offset < gApp.effectCaptureA.size();
+                         offset += 4) {
+                        bool dark = true;
+                        bool glow = false;
+                        for (std::size_t c = 0; c < 3; ++c) {
+                            dark = dark && channel(gApp.effectCaptureA, offset + c) <= 6;
+                            glow = glow || channel(gApp.effectCaptureB, offset + c) >
+                                               channel(gApp.effectCaptureA, offset + c) + 2;
+                        }
+                        if (dark && glow) ++bloomGlowPixels;
+                    }
+                    bloomOk = bloomGlowPixels > 50;
+                }
+                renderer.pbrSettings().bloomEnabled = false;
+            }
         }
     }
 
@@ -912,17 +1047,26 @@ auto validateRendererFrame() -> bool {
     }
     cleanup();
     if (rendered) {
-        char script[512]{};
+        char script[1024]{};
         std::snprintf(
             script, sizeof(script),
             "document.body.dataset.f4Renderer='true';"
             "document.body.dataset.f4RendererPixels='%zu';"
             "document.body.dataset.f4RendererHash='%08x';"
             "document.body.dataset.f4PointLights='%s';"
-            "document.body.dataset.f4PointLightGain='%llu/%llu';",
+            "document.body.dataset.f4PointLightGain='%llu/%llu';"
+            "document.body.dataset.f4PointShadows='%s';"
+            "document.body.dataset.f4PointShadowLoss='%llu/%llu';"
+            "document.body.dataset.f4Bloom='%s';"
+            "document.body.dataset.f4BloomStats='%d/%llu';",
             litPixels, digest, pointLightsOk ? "true" : "false",
             static_cast<unsigned long long>(pointRedGain),
-            static_cast<unsigned long long>(pointOtherGain));
+            static_cast<unsigned long long>(pointOtherGain),
+            pointShadowsOk ? "true" : "false",
+            static_cast<unsigned long long>(pointShadowLoss),
+            static_cast<unsigned long long>(pointShadowBrighter),
+            bloomOk ? "true" : "false", bloomZeroMaxDelta,
+            static_cast<unsigned long long>(bloomGlowPixels));
         emscripten_run_script(script);
     }
     return rendered;
@@ -956,6 +1100,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto f4RendererCaptureData() -> const std::byte*
 
 extern "C" EMSCRIPTEN_KEEPALIVE auto f4RendererCaptureSize() -> std::size_t {
     return gApp.rendererCapture.size();
+}
+
+// 0: point-shadow frame, 1: bloom frame (both kRendererCaptureBytes long).
+extern "C" EMSCRIPTEN_KEEPALIVE auto f4EffectCaptureData(int which) -> const std::byte* {
+    return which == 0 ? gApp.pointShadowCapture.data() : gApp.bloomCapture.data();
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE auto f4SetValidationScene(std::uint32_t index) -> int {
@@ -1100,6 +1249,13 @@ int main() {
     resources.slots.push(BindingSlot{
         f4::engine::pointLightStorageSlot(gApp.device->backend()), BindingType::StorageBuffer,
         shaderStageBit(ShaderStage::Fragment), 1});
+    // The PBR shader always declares the point-shadow atlas; nothing samples
+    // it while no light has a shadow slot.
+    const auto atlasBinding = f4::engine::pointShadowAtlasBinding(gApp.device->backend());
+    resources.slots.push(BindingSlot{atlasBinding.slot, BindingType::Texture,
+                                     shaderStageBit(ShaderStage::Fragment), 1});
+    resources.slots.push(BindingSlot{atlasBinding.slot, BindingType::Sampler,
+                                     shaderStageBit(ShaderStage::Fragment), 1});
     pipelineDesc.layout.groups.push(std::move(resources));
     ColorAttachmentState colorState;
     colorState.format = gApp.surfaceFormat;

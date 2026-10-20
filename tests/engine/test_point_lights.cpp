@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include "engine/cameras/camera.h"
 #include "engine/lighting/clustered_lights.h"
 #include "engine/lighting/light.h"
+#include "engine/lighting/point_shadows.h"
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
 #include "engine/rendering/renderer.h"
@@ -43,11 +45,16 @@ using namespace f4;
 
 namespace {
 
-[[nodiscard]] auto wordFloat(const containers::Array<std::uint32_t>& words, std::size_t index)
+[[nodiscard]] auto wordFloat(std::span<const std::uint32_t> words, std::size_t index)
     -> float {
     float value = 0.0f;
     std::memcpy(&value, &words[index], sizeof(value));
     return value;
+}
+
+[[nodiscard]] auto wordFloat(const containers::Array<std::uint32_t>& words, std::size_t index)
+    -> float {
+    return wordFloat(std::span<const std::uint32_t>(words.data(), words.size()), index);
 }
 
 // CPU mirror of the shader cluster lookup documented in clustered_lights.h.
@@ -194,6 +201,15 @@ struct NightSceneOptions {
     float intensity = 6.0f;
     bool pointLightsEnabled = true;
     bool lampCubes = true;
+    // Point-light shadows: flag every light castShadows and let the renderer
+    // shadow `shadowBudget` of them; pillars (pillarsPerSide^2) are the casters.
+    bool castShadows = false;
+    std::uint32_t shadowBudget = 8;
+    std::uint32_t pillarsPerSide = 0;
+    // HDR bloom.
+    bool bloom = false;
+    float bloomIntensity = 0.6f;
+    float bloomThreshold = 1.0f;
 };
 
 // Builds the night scene into `registry` and returns the camera entity.
@@ -202,6 +218,10 @@ auto buildNightScene(engine::Renderer& renderer, ecs::Registry& registry,
     renderer.pbrSettings().shadowsEnabled = false;
     renderer.pbrSettings().ambientIntensity = 0.02f;
     renderer.pbrSettings().pointLightsEnabled = options.pointLightsEnabled;
+    renderer.pbrSettings().pointShadowBudget = options.shadowBudget;
+    renderer.pbrSettings().bloomEnabled = options.bloom;
+    renderer.pbrSettings().bloomIntensity = options.bloomIntensity;
+    renderer.pbrSettings().bloomThreshold = options.bloomThreshold;
 
     engine::StandardMaterialDesc groundDesc;
     groundDesc.tint = math::Vec4(0.16f, 0.16f, 0.18f, 1.0f);
@@ -248,6 +268,7 @@ auto buildNightScene(engine::Renderer& renderer, ecs::Registry& registry,
             point.color = math::Vec3(color[0], color[1], color[2]);
             point.intensity = options.intensity;
             point.range = options.range;
+            point.castShadows = options.castShadows;
             registry.emplace<engine::PointLight>(light, point);
             if (options.lampCubes) {
                 const ecs::Entity lamp = registry.create();
@@ -257,6 +278,29 @@ auto buildNightScene(engine::Renderer& renderer, ecs::Registry& registry,
                 registry.emplace<engine::MeshRenderer>(
                     lamp, engine::MeshRenderer{cubeMesh, lampMaterials[paletteIndex], 0, false,
                                                false});
+            }
+        }
+    }
+
+    if (options.pillarsPerSide > 0) {
+        engine::StandardMaterialDesc pillarDesc;
+        pillarDesc.tint = math::Vec4(0.55f, 0.52f, 0.48f, 1.0f);
+        pillarDesc.roughnessFactor = 0.7f;
+        const auto pillarMaterial = renderer.createMaterial(pillarDesc);
+        REQUIRE(pillarMaterial.isValid());
+        const std::uint32_t pillars = options.pillarsPerSide;
+        for (std::uint32_t row = 0; row < pillars; ++row) {
+            for (std::uint32_t column = 0; column < pillars; ++column) {
+                const float fx = (static_cast<float>(column) + 0.5f) / static_cast<float>(pillars);
+                const float fz = (static_cast<float>(row) + 0.5f) / static_cast<float>(pillars);
+                const ecs::Entity pillar = registry.create();
+                auto& transform =
+                    registry.emplace<ecs::LocalTransform>(pillar, ecs::LocalTransform{});
+                transform.position = {(fx * 2.0f - 1.0f) * options.extent, 0.8f,
+                                      (fz * 2.0f - 1.0f) * options.extent};
+                transform.scale = math::Vec3(0.3f, 1.6f, 0.3f);
+                registry.emplace<engine::MeshRenderer>(
+                    pillar, engine::MeshRenderer{cubeMesh, pillarMaterial, 0, true, false});
             }
         }
     }
@@ -457,6 +501,189 @@ TEST_CASE("Point lights: the renderer uploads and binds clustered lights for eve
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
 }
 
+TEST_CASE("Point-light shadows: face selection, face matrices, and atlas tiles agree") {
+    CHECK(engine::pointShadowFaceFor({1.0f, 0.2f, -0.1f}) == 0);
+    CHECK(engine::pointShadowFaceFor({-1.0f, 0.2f, 0.3f}) == 1);
+    CHECK(engine::pointShadowFaceFor({0.1f, 2.0f, 0.3f}) == 2);
+    CHECK(engine::pointShadowFaceFor({0.1f, -2.0f, 0.3f}) == 3);
+    CHECK(engine::pointShadowFaceFor({0.1f, 0.2f, 3.0f}) == 4);
+    CHECK(engine::pointShadowFaceFor({0.1f, 0.2f, -3.0f}) == 5);
+
+    const math::Vec3 light(1.0f, 2.0f, -3.0f);
+    const float range = 5.0f;
+    const math::Vec3 axes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (std::uint32_t face = 0; face < 6; ++face) {
+        const math::Mat4 viewProj = engine::pointShadowFaceViewProj(light, range, face);
+        const math::Vec4 clip = viewProj.mul(math::Vec4(light + axes[face] * 2.0f, 1.0f));
+        REQUIRE(clip.w > 0.0f);
+        CHECK(std::abs(clip.x / clip.w) < 1.0e-4f);
+        CHECK(std::abs(clip.y / clip.w) < 1.0e-4f);
+        CHECK(clip.z / clip.w > 0.0f);
+        CHECK(clip.z / clip.w < 1.0f);
+    }
+    // Any direction lands inside the [-1, 1] square of the face the shaders pick.
+    Lcg random;
+    for (int i = 0; i < 2000; ++i) {
+        const math::Vec3 d(random.range(-1.0f, 1.0f), random.range(-1.0f, 1.0f),
+                           random.range(-1.0f, 1.0f));
+        if (math::length(d) < 0.05f) continue;
+        const math::Vec3 point = light + d * (range * 0.9f / math::length(d));
+        const std::uint32_t face = engine::pointShadowFaceFor(point - light);
+        const math::Vec4 clip =
+            engine::pointShadowFaceViewProj(light, range, face).mul(math::Vec4(point, 1.0f));
+        REQUIRE(clip.w > 0.0f);
+        CHECK(std::abs(clip.x / clip.w) <= 1.0001f);
+        CHECK(std::abs(clip.y / clip.w) <= 1.0001f);
+    }
+
+    const math::Vec4 tile = engine::pointShadowTileTransform(1, 2, 4);
+    CHECK(tile.x == doctest::Approx(1.0f / 6.0f));
+    CHECK(tile.y == doctest::Approx(0.25f));
+    CHECK(tile.z == doctest::Approx(-1.0f + 5.0f / 6.0f));
+    CHECK(tile.w == doctest::Approx(-1.0f + 3.0f / 4.0f));
+    // Tiles of one row cover [-1, 1] in X without overlap.
+    CHECK(engine::pointShadowTileTransform(0, 0, 1).z - 1.0f / 6.0f == doctest::Approx(-1.0f));
+    CHECK(engine::pointShadowTileTransform(0, 5, 1).z + 1.0f / 6.0f == doctest::Approx(1.0f));
+
+    CHECK(engine::pointShadowAtlasBinding(gfx::Backend::Vulkan).slot == 8);
+    CHECK(engine::pointShadowAtlasBinding(gfx::Backend::Metal).bindPoint == 1);
+    CHECK(engine::pointShadowAtlasBinding(gfx::Backend::Metal).slot == 0);
+}
+
+TEST_CASE("Point-light shadows: the budget keeps the brightest lights nearest the camera") {
+    const std::vector<engine::PointShadowCandidate> candidates = {
+        {{10.0f, 0.0f, 0.0f}, {5.0f, 5.0f, 5.0f}, 1.0f},  // bright but far: 5 / 82
+        {{2.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, 1.0f},   // 1 / 2
+        {{0.0f, 0.0f, 3.0f}, {4.0f, 1.0f, 1.0f}, 0.5f},   // 4 / 7.25
+        {{0.5f, 0.0f, 0.0f}, {0.2f, 0.2f, 0.2f}, 1.0f},   // camera inside: 0.2
+        {{-2.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, 1.0f},  // ties with [1]
+        {{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 3.0f},   // no energy: never picked
+        {{0.0f, -1.0f, 0.0f}, {9.0f, 9.0f, 9.0f}, 0.0f},  // no range: never picked
+    };
+    containers::Array<std::uint32_t> selected;
+    engine::selectShadowedPointLights(candidates, {0.0f, 0.0f, 0.0f}, 3, selected);
+    REQUIRE(selected.size() == 3);
+    CHECK(selected[0] == 2);
+    CHECK(selected[1] == 1);
+    CHECK(selected[2] == 4);
+    engine::selectShadowedPointLights(candidates, {0.0f, 0.0f, 0.0f}, 16, selected);
+    CHECK(selected.size() == 5);
+    CHECK(selected[3] == 3);
+    CHECK(selected[4] == 0);
+    engine::selectShadowedPointLights(candidates, {0.0f, 0.0f, 0.0f}, 0, selected);
+    CHECK(selected.size() == 0);
+}
+
+TEST_CASE("Point-light shadows: the renderer assigns atlas slots and writes face matrices") {
+    gfx::NullDevice device;
+    ecs::Registry registry(4096);
+    engine::Renderer renderer(registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    NightSceneOptions options;
+    options.lightsPerSide = 4;
+    options.extent = 6.0f;
+    options.range = 4.0f;
+    options.castShadows = true;
+    options.shadowBudget = 3;
+    options.pillarsPerSide = 4;
+    const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
+
+    gfx::FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {64, 64};
+    framebufferDesc.attachments.push(gfx::AttachmentDesc{});
+    auto framebuffer = device.createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
+    CHECK(renderer.stats().pointShadowLights == 3);
+    CHECK(renderer.stats().pointShadowDraws > 0);
+    {
+        const auto words = renderer.pointLightWords();
+        REQUIRE(words.size() > engine::kPointLightHeaderWords);
+        CHECK(words[10] != 0);
+        CHECK(words[11] == 3);
+        CHECK(words[12] == 3);
+        CHECK(wordFloat(words, 13) == doctest::Approx(renderer.pbrSettings().pointShadowBias));
+        CHECK(wordFloat(words, 14) == doctest::Approx(2.0f / 256.0f));
+        CHECK(words.size() >= words[10] + 3u * engine::kPointShadowFaces *
+                                              engine::kPointShadowMatrixWords);
+        std::array<std::uint32_t, 4> slotUse{};
+        for (std::uint32_t light = 0; light < words[0]; ++light) {
+            const std::uint32_t slot = words[words[4] + light * engine::kPointLightRecordWords + 7];
+            REQUIRE(slot <= 3);
+            ++slotUse[slot];
+            if (slot == 0) continue;
+            // The stored +X face matrix maps a point 1 m along +X to the face centre.
+            const std::uint32_t record = words[4] + light * engine::kPointLightRecordWords;
+            const math::Vec3 position(wordFloat(words, record), wordFloat(words, record + 1),
+                                      wordFloat(words, record + 2));
+            const std::uint32_t base =
+                words[10] + (slot - 1u) * engine::kPointShadowFaces * engine::kPointShadowMatrixWords;
+            const math::Vec4 p(position.x + 1.0f, position.y, position.z, 1.0f);
+            math::Vec4 clip{};
+            for (int row = 0; row < 4; ++row) {
+                float value = 0.0f;
+                for (int column = 0; column < 4; ++column) {
+                    const float component = column == 0 ? p.x : column == 1 ? p.y : column == 2 ? p.z : p.w;
+                    value += wordFloat(words, base + static_cast<std::uint32_t>(column * 4 + row)) *
+                             component;
+                }
+                (row == 0 ? clip.x : row == 1 ? clip.y : row == 2 ? clip.z : clip.w) = value;
+            }
+            REQUIRE(clip.w > 0.0f);
+            CHECK(std::abs(clip.x / clip.w) < 1.0e-3f);
+            CHECK(std::abs(clip.y / clip.w) < 1.0e-3f);
+        }
+        CHECK(slotUse[1] == 1);
+        CHECK(slotUse[2] == 1);
+        CHECK(slotUse[3] == 1);
+    }
+
+    // Disabled, or no casters: no slots, and the header says so.
+    renderer.pbrSettings().pointShadowsEnabled = false;
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
+    CHECK(renderer.stats().pointShadowLights == 0);
+    CHECK(renderer.stats().pointShadowDraws == 0);
+    CHECK(renderer.pointLightWords()[10] == 0);
+    CHECK(renderer.pointLightWords()[11] == 0);
+    renderer.pbrSettings().pointShadowsEnabled = true;
+    renderer.pbrSettings().pointShadowBudget = 0;
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
+    CHECK(renderer.stats().pointShadowLights == 0);
+    CHECK(renderer.pointLightWords()[10] == 0);
+    CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
+}
+
+TEST_CASE("Bloom: the renderer requires an extent and declares the full mip chain") {
+    gfx::NullDevice device;
+    ecs::Registry registry(4096);
+    engine::Renderer renderer(registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    NightSceneOptions options;
+    options.lightsPerSide = 4;
+    options.bloom = true;
+    const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
+    gfx::FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {64, 64};
+    framebufferDesc.attachments.push(gfx::AttachmentDesc{});
+    auto framebuffer = device.createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+    CHECK(!engine::PbrRenderSettings{}.bloomEnabled);
+    CHECK(renderer.render(framebuffer.value(), cameraEntity, 1.0f) ==
+          gfx::GfxError::BadDescriptor);
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f, gfx::Extent{64, 64}) ==
+            gfx::GfxError::None);
+    CHECK(renderer.stats().bloomPasses == 10); // prefilter + 4 down + 4 up + composite
+    CHECK(renderer.stats().draws > 0);
+    renderer.pbrSettings().bloomLevels = 1;
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f, gfx::Extent{64, 64}) ==
+            gfx::GfxError::None);
+    CHECK(renderer.stats().bloomPasses == 2);
+    renderer.pbrSettings().bloomEnabled = false;
+    REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
+    CHECK(renderer.stats().bloomPasses == 0);
+    CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
+}
+
 #if defined(F4_POINT_LIGHT_GPU)
 namespace {
 
@@ -510,8 +737,8 @@ template <typename Reader>
         REQUIRE(renderer.init() == gfx::GfxError::None);
         const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
         const float aspect = static_cast<float>(width) / static_cast<float>(height);
-        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect) ==
-                gfx::GfxError::None);
+        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect,
+                                gfx::Extent{width, height}) == gfx::GfxError::None);
         if (statsOut != nullptr) *statsOut = renderer.stats();
         device.waitIdle();
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
@@ -671,6 +898,430 @@ TEST_CASE("Point lights: clustered night scene matches across OpenGL, Vulkan, an
     CHECK(glDxDark.matches());
 }
 
+namespace {
+
+// Bloom and point-shadow frames for one backend.
+struct EffectCaptures {
+    Capture shadowOff;   // pillars, no light flagged
+    Capture shadowOn;    // pillars, 8 of 16 lights shadowed
+    Capture bloomOff;    // night scene, bloom disabled
+    Capture bloomZero;   // night scene, bloom enabled at intensity 0
+    Capture bloomOn;     // night scene, bloom enabled
+    Capture combined;    // pillars + shadows + bloom
+    engine::FrameStats shadowStats{};
+    engine::FrameStats bloomStats{};
+};
+
+constexpr std::uint32_t kEffectWidth = 160;
+constexpr std::uint32_t kEffectHeight = 96;
+
+[[nodiscard]] auto shadowSceneOptions() -> NightSceneOptions {
+    NightSceneOptions options;
+    options.lightsPerSide = 4;
+    options.extent = 6.0f;
+    options.lightHeight = 0.7f;
+    options.range = 4.5f;
+    options.intensity = 8.0f;
+    options.pillarsPerSide = 4;
+    options.shadowBudget = 8;
+    return options;
+}
+
+template <typename Reader>
+[[nodiscard]] auto captureEffects(gfx::IDevice& device, Reader&& reader) -> EffectCaptures {
+    EffectCaptures result;
+    NightSceneOptions shadows = shadowSceneOptions();
+    result.shadowOff = captureNightFrame(device, shadows, kEffectWidth, kEffectHeight, reader);
+    shadows.castShadows = true;
+    result.shadowOn = captureNightFrame(device, shadows, kEffectWidth, kEffectHeight, reader,
+                                        &result.shadowStats);
+    NightSceneOptions bloom;
+    result.bloomOff = captureNightFrame(device, bloom, kEffectWidth, kEffectHeight, reader);
+    bloom.bloom = true;
+    bloom.bloomIntensity = 0.0f;
+    result.bloomZero = captureNightFrame(device, bloom, kEffectWidth, kEffectHeight, reader);
+    bloom.bloomIntensity = 1.0f;
+    bloom.bloomThreshold = 0.6f;
+    result.bloomOn = captureNightFrame(device, bloom, kEffectWidth, kEffectHeight, reader,
+                                       &result.bloomStats);
+    shadows.bloom = true;
+    shadows.bloomIntensity = 1.0f;
+    shadows.bloomThreshold = 0.6f;
+    result.combined = captureNightFrame(device, shadows, kEffectWidth, kEffectHeight, reader);
+    return result;
+}
+
+void writeEffectCaptures(const char* backend, const EffectCaptures& captures) {
+    const std::string suffix = std::string("_") + backend;
+    maybeWriteCapture(("night_point_shadows_off" + suffix).c_str(), captures.shadowOff,
+                      kEffectWidth, kEffectHeight);
+    maybeWriteCapture(("night_point_shadows" + suffix).c_str(), captures.shadowOn, kEffectWidth,
+                      kEffectHeight);
+    maybeWriteCapture(("night_bloom" + suffix).c_str(), captures.bloomOn, kEffectWidth,
+                      kEffectHeight);
+    maybeWriteCapture(("night_bloom_zero" + suffix).c_str(), captures.bloomZero, kEffectWidth,
+                      kEffectHeight);
+    maybeWriteCapture(("night_shadows_bloom" + suffix).c_str(), captures.combined, kEffectWidth,
+                      kEffectHeight);
+}
+
+void checkEffectParity(const std::string& name, const Capture& reference,
+                       const Capture& other) {
+    const auto result = engine::compareShaderImagesRgba8(reference, other, 2);
+    MESSAGE(name << ": mismatches=" << result.mismatchPixelCount
+                 << " max delta=" << static_cast<int>(result.maxChannelDelta));
+    CHECK(result.matches());
+}
+
+} // namespace
+
+TEST_CASE("Bloom and point-light shadows match across OpenGL, Vulkan, and DX12") {
+    auto windowResult =
+        platform::Window::create({"Bloom and point shadows", kEffectWidth, kEffectHeight, false});
+    REQUIRE(windowResult.hasValue());
+    platform::Window* window = windowResult.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    gfx::IDevice* openGlBase = gfx::createOpenGLDevice();
+    REQUIRE(openGlBase != nullptr);
+    const auto gl = captureEffects(*openGlBase, [](gfx::TextureHandle, std::span<std::byte> out) {
+        glReadPixels(0, 0, static_cast<GLsizei>(kEffectWidth), static_cast<GLsizei>(kEffectHeight),
+                     GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+    });
+    gfx::deleteDevice(openGlBase);
+    delete window;
+
+    gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
+    REQUIRE(vulkanBase != nullptr);
+    auto* vulkan = static_cast<gfx::VulkanDevice*>(vulkanBase);
+    const auto vk = captureEffects(*vulkan, [vulkan](gfx::TextureHandle texture,
+                                                     std::span<std::byte> out) {
+        return vulkan->readTexture(texture, 0, out);
+    });
+    CHECK(vulkan->validationWarningCount() == 0);
+    CHECK(vulkan->validationErrorCount() == 0);
+    gfx::deleteDevice(vulkanBase);
+
+    gfx::IDevice* dx12Base = gfx::createDx12Device();
+    REQUIRE(dx12Base != nullptr);
+    auto* dx12 = static_cast<gfx::Dx12Device*>(dx12Base);
+    const auto dx = captureEffects(*dx12, [dx12](gfx::TextureHandle texture,
+                                                 std::span<std::byte> out) {
+        return dx12->readTexture(texture, 0, out);
+    });
+    CHECK(dx12->validationWarningCount() == 0);
+    CHECK(dx12->validationErrorCount() == 0);
+    gfx::deleteDevice(dx12Base);
+
+    writeEffectCaptures("opengl", gl);
+    writeEffectCaptures("vulkan", vk);
+    writeEffectCaptures("dx12", dx);
+
+    // Point shadows: 8 slots used, shadows only ever darken, and they darken
+    // a real area of the ground behind the pillars.
+    CHECK(gl.shadowStats.pointShadowLights == 8);
+    CHECK(gl.shadowStats.pointShadowDraws > 0);
+    std::size_t darkened = 0;
+    std::size_t brightened = 0;
+    for (std::size_t i = 0; i + 3 < gl.shadowOn.size(); i += 4) {
+        int loss = 0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const int delta = static_cast<int>(gl.shadowOff[i + c]) - gl.shadowOn[i + c];
+            loss = std::max(loss, delta);
+            if (delta < -1) ++brightened;
+        }
+        if (loss > 8) ++darkened;
+    }
+    MESSAGE("point shadows: darkened pixels=" << darkened << " brightened channels="
+            << brightened << " luma off=" << meanLuma(gl.shadowOff)
+            << " on=" << meanLuma(gl.shadowOn) << " draws=" << gl.shadowStats.pointShadowDraws);
+    CHECK(darkened > 150);
+    CHECK(brightened == 0);
+
+    // Bloom: intensity 0 reproduces the non-bloom frame (fp16 HDR rounding
+    // only); a real intensity brightens the frame around the emissive lamps.
+    CHECK(gl.bloomStats.bloomPasses == 10);
+    const auto zeroGl = engine::compareShaderImagesRgba8(gl.bloomOff, gl.bloomZero, 2);
+    const auto zeroVk = engine::compareShaderImagesRgba8(vk.bloomOff, vk.bloomZero, 2);
+    const auto zeroDx = engine::compareShaderImagesRgba8(dx.bloomOff, dx.bloomZero, 2);
+    MESSAGE("bloom intensity 0 vs off: GL max delta=" << static_cast<int>(zeroGl.maxChannelDelta)
+            << " VK=" << static_cast<int>(zeroVk.maxChannelDelta)
+            << " DX=" << static_cast<int>(zeroDx.maxChannelDelta));
+    CHECK(zeroGl.matches());
+    CHECK(zeroVk.matches());
+    CHECK(zeroDx.matches());
+    std::size_t glowing = 0;
+    std::size_t dimmed = 0;
+    for (std::size_t i = 0; i + 3 < gl.bloomOn.size(); i += 4) {
+        bool glow = false;
+        for (std::size_t c = 0; c < 3; ++c) {
+            if (gl.bloomOn[i + c] > gl.bloomOff[i + c] + 3) glow = true;
+            if (gl.bloomOn[i + c] + 2 < gl.bloomOff[i + c]) ++dimmed;
+        }
+        if (glow) ++glowing;
+    }
+    MESSAGE("bloom: glowing pixels=" << glowing << " luma off=" << meanLuma(gl.bloomOff)
+            << " on=" << meanLuma(gl.bloomOn));
+    CHECK(glowing > 500);
+    CHECK(dimmed == 0);
+    CHECK(meanLuma(gl.bloomOn) > meanLuma(gl.bloomOff) + 1.0);
+
+    checkEffectParity("shadows GL/VK", gl.shadowOn, vk.shadowOn);
+    checkEffectParity("shadows GL/DX", gl.shadowOn, dx.shadowOn);
+    checkEffectParity("bloom GL/VK", gl.bloomOn, vk.bloomOn);
+    checkEffectParity("bloom GL/DX", gl.bloomOn, dx.bloomOn);
+    checkEffectParity("shadows+bloom GL/VK", gl.combined, vk.combined);
+    checkEffectParity("shadows+bloom GL/DX", gl.combined, dx.combined);
+}
+
+namespace {
+
+// Mirror of validateRendererFrame() in src/app/f4_webgpu_app.cpp: the same
+// 64x64 lit triangle with a red point light, a small shadow-casting triangle
+// between them, and then bloom. The browser smoke compares its WebGPU frames
+// with the reference files this test locks, which is how WebGPU joins the
+// OpenGL / Vulkan / DX12 parity check.
+constexpr std::uint32_t kWebFrameExtent = 64;
+
+struct WebValidationFrames {
+    Capture pointShadow;
+    Capture bloom;
+};
+
+[[nodiscard]] auto webValidationTexture(std::uint8_t red, std::uint8_t green, std::uint8_t blue)
+    -> resources::Texture {
+    resources::Texture texture;
+    texture.format = resources::TextureFormat::RGBA8_UNORM;
+    resources::TextureMip mip;
+    mip.width = 2;
+    mip.height = 2;
+    mip.bytes.resize(16);
+    for (std::size_t offset = 0; offset < mip.bytes.size(); offset += 4) {
+        mip.bytes[offset + 0] = static_cast<std::byte>(red);
+        mip.bytes[offset + 1] = static_cast<std::byte>(green);
+        mip.bytes[offset + 2] = static_cast<std::byte>(blue);
+        mip.bytes[offset + 3] = std::byte{255};
+    }
+    texture.mips.push(static_cast<resources::TextureMip&&>(mip));
+    return texture;
+}
+
+[[nodiscard]] auto webValidationTriangle() -> resources::Mesh {
+    resources::Mesh mesh = makeMesh({-0.6f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                     0.6f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f,
+                                     0.0f, 0.6f, 0.0f, 0.0f, 0.0f, 1.0f, 0.5f, 1.0f},
+                                    {0, 1, 2});
+    return mesh;
+}
+
+template <typename Reader>
+[[nodiscard]] auto captureWebValidationFrames(gfx::IDevice& device, Reader&& reader)
+    -> WebValidationFrames {
+    constexpr std::uint32_t size = kWebFrameExtent;
+    gfx::TextureDesc colorDesc;
+    colorDesc.width = size;
+    colorDesc.height = size;
+    auto color = device.createTexture(colorDesc);
+    REQUIRE(color.hasValue());
+    gfx::TextureDesc depthDesc;
+    depthDesc.width = size;
+    depthDesc.height = size;
+    depthDesc.format = gfx::TextureFormat::Depth32F;
+    auto depth = device.createTexture(depthDesc);
+    REQUIRE(depth.hasValue());
+    gfx::FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {size, size};
+    gfx::AttachmentDesc colorAttachment;
+    colorAttachment.texture = color.value();
+    colorAttachment.clearOnLoad = true;
+    colorAttachment.clear.color[0] = 0.01f;
+    colorAttachment.clear.color[1] = 0.015f;
+    colorAttachment.clear.color[2] = 0.02f;
+    framebufferDesc.attachments.push(colorAttachment);
+    gfx::AttachmentDesc depthAttachment;
+    depthAttachment.type = gfx::AttachmentType::Depth;
+    depthAttachment.texture = depth.value();
+    depthAttachment.clearOnLoad = true;
+    framebufferDesc.attachments.push(depthAttachment);
+    auto framebuffer = device.createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+
+    const auto read = [&](Capture& pixels) {
+        pixels.assign(static_cast<std::size_t>(size) * size * 4u, 0);
+        device.waitIdle();
+        REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
+                gfx::GfxError::None);
+        if (device.backend() == gfx::Backend::OpenGL) {
+            const std::size_t row = static_cast<std::size_t>(size) * 4u;
+            for (std::uint32_t y = 0; y < size / 2; ++y) {
+                std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
+                                 pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
+                                 pixels.begin() +
+                                     static_cast<std::ptrdiff_t>((size - 1 - y) * row));
+            }
+        }
+    };
+
+    WebValidationFrames frames;
+    {
+        ecs::Registry registry(16);
+        engine::Renderer renderer(registry, device);
+        renderer.pbrSettings().shadowsEnabled = false;
+        renderer.pbrSettings().ambientIntensity = 0.2f;
+        REQUIRE(renderer.init() == gfx::GfxError::None);
+        const auto albedo = renderer.createTexture(webValidationTexture(205, 96, 35));
+        const auto normal = renderer.createTexture(webValidationTexture(145, 178, 238));
+        const auto metallicRoughness = renderer.createTexture(webValidationTexture(0, 140, 76));
+        engine::StandardMaterialDesc materialDesc;
+        materialDesc.albedo = albedo;
+        materialDesc.normal = normal;
+        materialDesc.metallicRoughness = metallicRoughness;
+        materialDesc.metallicFactor = 0.8f;
+        materialDesc.roughnessFactor = 0.85f;
+        const auto material = renderer.createMaterial(materialDesc);
+        const auto mesh = renderer.createMesh(webValidationTriangle());
+        REQUIRE(material.isValid());
+        REQUIRE(mesh.isValid());
+        const ecs::Entity cameraEntity = registry.create();
+        engine::Camera camera;
+        camera.eye = {0.0f, 0.0f, 2.0f};
+        camera.center = {0.0f, 0.0f, 0.0f};
+        registry.emplace<engine::Camera>(cameraEntity, camera);
+        const ecs::Entity lightEntity = registry.create();
+        engine::DirectionalLight light;
+        light.direction = {-0.25f, -0.15f, -1.0f};
+        light.color = {1.0f, 0.92f, 0.8f};
+        light.intensity = 2.5f;
+        registry.emplace<engine::DirectionalLight>(lightEntity, light);
+        const ecs::Entity object = registry.create();
+        registry.emplace<ecs::LocalTransform>(object, ecs::LocalTransform{});
+        registry.emplace<engine::MeshRenderer>(object,
+                                               engine::MeshRenderer{mesh, material, 0, false, false});
+        const ecs::Entity pointEntity = registry.create();
+        engine::PointLight point;
+        point.position = {0.0f, 0.0f, 0.6f};
+        point.color = {1.0f, 0.05f, 0.05f};
+        point.intensity = 4.0f;
+        point.range = 2.0f;
+        point.castShadows = true;
+        registry.emplace<engine::PointLight>(pointEntity, point);
+        const ecs::Entity occluder = registry.create();
+        auto& occluderTransform =
+            registry.emplace<ecs::LocalTransform>(occluder, ecs::LocalTransform{});
+        occluderTransform.position = {0.15f, -0.2f, 0.3f};
+        occluderTransform.scale = math::Vec3(0.2f);
+        registry.emplace<engine::MeshRenderer>(occluder,
+                                               engine::MeshRenderer{mesh, material, 0, true, false});
+        ecs::updateWorldTransforms(registry);
+
+        const gfx::Extent extent{size, size};
+        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f, extent) ==
+                gfx::GfxError::None);
+        CHECK(renderer.stats().pointShadowLights == 1);
+        read(frames.pointShadow);
+        renderer.pbrSettings().bloomEnabled = true;
+        renderer.pbrSettings().bloomIntensity = 1.5f;
+        renderer.pbrSettings().bloomThreshold = 0.3f;
+        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f, extent) ==
+                gfx::GfxError::None);
+        CHECK(renderer.stats().bloomPasses > 2);
+        read(frames.bloom);
+    }
+    CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
+    CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
+    CHECK(device.destroyTexture(color.value()) == gfx::GfxError::None);
+    return frames;
+}
+
+[[nodiscard]] auto readFixture(const std::string& path) -> Capture {
+    Capture bytes;
+    if (std::FILE* file = std::fopen(path.c_str(), "rb")) {
+        bytes.resize(static_cast<std::size_t>(kWebFrameExtent) * kWebFrameExtent * 4u);
+        const std::size_t read = std::fread(bytes.data(), 1, bytes.size(), file);
+        std::fclose(file);
+        if (read != bytes.size()) bytes.clear();
+    }
+    return bytes;
+}
+
+void writeFixture(const std::string& path, const Capture& bytes) {
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    REQUIRE(file != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size());
+    std::fclose(file);
+}
+
+} // namespace
+
+TEST_CASE("Bloom and point-light shadows: WebGPU validation frames match the locked references") {
+    auto windowResult = platform::Window::create(
+        {"Effect references", kWebFrameExtent, kWebFrameExtent, false});
+    REQUIRE(windowResult.hasValue());
+    platform::Window* window = windowResult.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    gfx::IDevice* openGlBase = gfx::createOpenGLDevice();
+    REQUIRE(openGlBase != nullptr);
+    const auto gl = captureWebValidationFrames(
+        *openGlBase, [](gfx::TextureHandle, std::span<std::byte> out) {
+            glReadPixels(0, 0, static_cast<GLsizei>(kWebFrameExtent),
+                         static_cast<GLsizei>(kWebFrameExtent), GL_RGBA, GL_UNSIGNED_BYTE,
+                         out.data());
+            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+        });
+    gfx::deleteDevice(openGlBase);
+    delete window;
+
+    gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
+    REQUIRE(vulkanBase != nullptr);
+    auto* vulkan = static_cast<gfx::VulkanDevice*>(vulkanBase);
+    const auto vk = captureWebValidationFrames(
+        *vulkan, [vulkan](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return vulkan->readTexture(texture, 0, out);
+        });
+    CHECK(vulkan->validationErrorCount() == 0);
+    gfx::deleteDevice(vulkanBase);
+
+    gfx::IDevice* dx12Base = gfx::createDx12Device();
+    REQUIRE(dx12Base != nullptr);
+    auto* dx12 = static_cast<gfx::Dx12Device*>(dx12Base);
+    const auto dx = captureWebValidationFrames(
+        *dx12, [dx12](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return dx12->readTexture(texture, 0, out);
+        });
+    CHECK(dx12->validationErrorCount() == 0);
+    gfx::deleteDevice(dx12Base);
+
+    checkEffectParity("web frame point shadow GL/VK", gl.pointShadow, vk.pointShadow);
+    checkEffectParity("web frame point shadow GL/DX", gl.pointShadow, dx.pointShadow);
+    checkEffectParity("web frame bloom GL/VK", gl.bloom, vk.bloom);
+    checkEffectParity("web frame bloom GL/DX", gl.bloom, dx.bloom);
+
+    const std::string shadowPath = std::string(F4_EFFECT_FIXTURE_DIR) +
+                                   "/renderer_point_shadow_reference.rgba";
+    const std::string bloomPath = std::string(F4_EFFECT_FIXTURE_DIR) +
+                                  "/renderer_bloom_reference.rgba";
+    if (const char* update = std::getenv("F4_UPDATE_EFFECT_FIXTURES");
+        update != nullptr && update[0] == '1') {
+        // Vulkan is the reference writer; the other backends are held to it.
+        writeFixture(shadowPath, vk.pointShadow);
+        writeFixture(bloomPath, vk.bloom);
+        MESSAGE("wrote " << shadowPath << " and " << bloomPath);
+        return;
+    }
+    const Capture shadowReference = readFixture(shadowPath);
+    const Capture bloomReference = readFixture(bloomPath);
+    REQUIRE(!shadowReference.empty());
+    REQUIRE(!bloomReference.empty());
+    checkEffectParity("web frame point shadow reference/GL", shadowReference, gl.pointShadow);
+    checkEffectParity("web frame point shadow reference/VK", shadowReference, vk.pointShadow);
+    checkEffectParity("web frame point shadow reference/DX", shadowReference, dx.pointShadow);
+    checkEffectParity("web frame bloom reference/GL", bloomReference, gl.bloom);
+    checkEffectParity("web frame bloom reference/VK", bloomReference, vk.bloom);
+    checkEffectParity("web frame bloom reference/DX", bloomReference, dx.bloom);
+}
+
 TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BENCH=1)") {
     const char* enabled = std::getenv("F4_POINT_LIGHT_BENCH");
     if (enabled == nullptr || enabled[0] != '1') return;
@@ -682,8 +1333,12 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     // "stress": fixed 2.5 m range, so denser grids pile hundreds of lights into
     // each cluster. "scaled": range shrinks with the grid spacing (2x spacing),
     // the way a level designer would place many small lights.
+    // `bloom` enables the HDR bloom chain; `shadows` < 0 means the plain night
+    // scene, 0 adds 32x32 shadow-casting pillars (one beside each lamp of the
+    // 32x32 grid), N > 0 also shadows the N best-ranked lights.
     const auto bench = [&](gfx::IDevice& device, const char* backend,
-                           std::uint32_t lightsPerSide, bool scaledRange) {
+                           std::uint32_t lightsPerSide, bool scaledRange, bool bloom = false,
+                           int shadows = -1) {
         gfx::TextureDesc colorDesc;
         colorDesc.width = width;
         colorDesc.height = height;
@@ -724,16 +1379,24 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                 options.range = std::max(0.75f, 2.0f * spacing);
             }
             options.pointLightsEnabled = lightsPerSide > 0;
+            options.bloom = bloom;
+            options.bloomIntensity = 0.8f;
+            if (shadows >= 0) options.pillarsPerSide = 32;
+            if (shadows > 0) {
+                options.castShadows = true;
+                options.shadowBudget = static_cast<std::uint32_t>(shadows);
+            }
             const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
             const float aspect = static_cast<float>(width) / static_cast<float>(height);
+            const gfx::Extent extent{width, height};
             for (int i = 0; i < warmup; ++i) {
-                REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect) ==
+                REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect, extent) ==
                         gfx::GfxError::None);
             }
             device.waitIdle();
             const auto start = std::chrono::steady_clock::now();
             for (int i = 0; i < frames; ++i) {
-                REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect) ==
+                REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect, extent) ==
                         gfx::GfxError::None);
             }
             device.waitIdle();
@@ -741,13 +1404,19 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             const double ms =
                 std::chrono::duration<double, std::milli>(end - start).count() / frames;
             const engine::FrameStats stats = renderer.stats();
+            char variant[64];
+            std::snprintf(variant, sizeof(variant), "%s%s%s", scaledRange ? "scaled" : "stress",
+                          bloom ? "+bloom" : "",
+                          shadows < 0 ? "" : shadows == 0 ? "+pillars" : "+pillars+shadows");
             std::printf("[point-light bench] %s %s %ux%u lights=%u range=%.2f visible=%u "
-                        "refs=%u max/cluster=%u draws=%u: %.3f ms/frame\n",
-                        backend, scaledRange ? "scaled" : "stress", width, height,
+                        "refs=%u max/cluster=%u draws=%u shadowed=%u shadowDraws=%u "
+                        "bloomPasses=%u: %.3f ms/frame\n",
+                        backend, variant, width, height,
                         stats.pointLights, static_cast<double>(options.range),
                         stats.pointLightsVisible,
                         stats.pointLightReferences, stats.maxPointLightsPerCluster,
-                        stats.draws, ms);
+                        stats.draws, stats.pointShadowLights, stats.pointShadowDraws,
+                        stats.bloomPasses, ms);
         }
         CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
         CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
@@ -766,6 +1435,9 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                     reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
         for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "OpenGL", side, false);
         for (std::uint32_t side : {32u, 64u}) bench(*device, "OpenGL", side, true);
+        bench(*device, "OpenGL", 32u, true, true);
+        for (int shadows : {0, 4, 8, 16}) bench(*device, "OpenGL", 32u, true, false, shadows);
+        bench(*device, "OpenGL", 32u, true, true, 8);
         gfx::deleteDevice(device);
         delete window;
     }
@@ -774,6 +1446,9 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         REQUIRE(device != nullptr);
         for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "Vulkan", side, false);
         for (std::uint32_t side : {32u, 64u}) bench(*device, "Vulkan", side, true);
+        bench(*device, "Vulkan", 32u, true, true);
+        for (int shadows : {0, 4, 8, 16}) bench(*device, "Vulkan", 32u, true, false, shadows);
+        bench(*device, "Vulkan", 32u, true, true, 8);
         gfx::deleteDevice(device);
     }
     {
@@ -783,6 +1458,9 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                     static_cast<gfx::Dx12Device*>(device)->deviceName());
         for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "DX12", side, false);
         for (std::uint32_t side : {32u, 64u}) bench(*device, "DX12", side, true);
+        bench(*device, "DX12", 32u, true, true);
+        for (int shadows : {0, 4, 8, 16}) bench(*device, "DX12", 32u, true, false, shadows);
+        bench(*device, "DX12", 32u, true, true, 8);
         gfx::deleteDevice(device);
     }
 }

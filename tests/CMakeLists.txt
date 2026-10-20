@@ -60,6 +60,7 @@ target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::do
 target_compile_definitions(f4_tests PRIVATE
     F4_UFBX_TEST_DATA_DIR="${ufbx_SOURCE_DIR}/data"
     F4_TINYUSDZ_TEST_DATA_DIR="${tinyusdz_SOURCE_DIR}/models"
+    F4_EFFECT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
 )
 f4_set_warnings(f4_tests)
 f4_set_float_precision(f4_tests)
