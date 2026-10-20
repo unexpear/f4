@@ -30,7 +30,12 @@ struct FrameStats {
     std::uint32_t pointLightsVisible = 0;
     std::uint32_t pointLightReferences = 0;
     std::uint32_t pointLightReferencesDropped = 0;
+    // 0 when the GPU binned the lights (the per-cluster maximum stays on the
+    // GPU); see pointLightBinningDispatches.
     std::uint32_t maxPointLightsPerCluster = 0;
+    // Compute dispatches that binned the point lights this frame: 0 means the
+    // CPU binned them (PbrRenderSettings::gpuLightBinning).
+    std::uint32_t pointLightBinningDispatches = 0;
     // Point-light shadows: lights given an atlas slot this frame and the face
     // draws recorded for them.
     std::uint32_t pointShadowLights = 0;
@@ -84,6 +89,16 @@ struct PbrRenderSettings {
     // atlas slot while it stays selected. The cached image is identical to
     // the uncached one (false redraws every tile every frame).
     bool pointShadowCaching = true;
+
+    // Bin clustered point lights with a compute pass (OpenGL 4.3, Vulkan,
+    // DX12, WebGPU) instead of on the CPU. The CPU still culls the lights and
+    // computes each light's cluster box; the GPU builds the per-cluster light
+    // lists, producing the same buffer contents as the CPU path. render()
+    // falls back to the CPU on Metal, the null device, grids of 65536+ tiles
+    // per axis, or when the compute pipeline cannot be created; record()
+    // called on its own always bins on the CPU. false forces the CPU path
+    // (the reference).
+    bool gpuLightBinning = true;
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -142,6 +157,9 @@ public:
     [[nodiscard]] auto pointLightWords() const -> std::span<const std::uint32_t> {
         return {pointLightWords_.data(), pointLightWords_.size()};
     }
+    // Storage buffer the last frame's PBR pass read the point lights from
+    // (GPU-filled when FrameStats::pointLightBinningDispatches != 0).
+    [[nodiscard]] auto pointLightBuffer() const -> gfx::BufferHandle { return framePointLights_; }
     [[nodiscard]] auto graph() -> gfx::RenderGraph& { return graph_; }
 
 private:
@@ -172,6 +190,10 @@ private:
     [[nodiscard]] auto preparePointLights(const Camera& camera, float aspect)
         -> gfx::BufferHandle;
     [[nodiscard]] auto preparePointShadows(const Camera& camera) -> gfx::GfxError;
+    [[nodiscard]] auto ensureLightBinning() -> bool;
+    [[nodiscard]] auto preparePointLightsGpu(const Camera& camera, float aspect) -> bool;
+    void recordLightBinning(gfx::CommandBuffer& cb);
+    void writePointShadowWords(std::uint32_t matrixOffset);
     [[nodiscard]] auto ensurePointShadowAtlas(std::uint32_t rows) -> gfx::GfxError;
     void releasePointShadowAtlas();
     [[nodiscard]] auto ensureBloomResources(gfx::Extent extent) -> gfx::GfxError;
@@ -204,6 +226,17 @@ private:
     bool pointLightsGathered_ = false;
     containers::Array<std::uint32_t> pointLightWords_;
     gfx::BufferHandle framePointLights_{};
+    // GPU light binning: per-frame output buffers the compute pass fills, its
+    // shader/pipeline/parameters, and this frame's prepared input.
+    DynamicBufferRing pointLightGpuBuffers_;
+    ConstantRing lightBinningConstants_;
+    gfx::ShaderHandle lightBinningShader_{};
+    gfx::PipelineHandle lightBinningPipeline_{};
+    bool lightBinningUnavailable_ = false;
+    bool framePointLightsReady_ = false; // render() already prepared them on the GPU path
+    gfx::BufferHandle framePointLightInput_{};
+    ClusteredLightGpuParams frameBinning_{};
+    ClusteredLightStats frameLightStats_{};
     gfx::TextureHandle whiteTex_{};
     gfx::TextureHandle neutralNormalTex_{};
     gfx::TextureHandle blackTex_{};

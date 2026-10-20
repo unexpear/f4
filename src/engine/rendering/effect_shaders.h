@@ -8,7 +8,8 @@
 namespace f4::engine {
 
 // Renderer-owned effect shaders that sit beside the PBR material shaders:
-// the point-light shadow face pass and the HDR bloom post chain. Paths come
+// the point-light shadow face pass, the HDR bloom post chain and the
+// clustered-light binning compute pass. Paths come
 // from per-backend compile definitions (SPIR-V/DXIL/metallib/GLSL files) or,
 // on WebGPU, from the generated WGSL header.
 enum class EffectShader {
@@ -16,6 +17,8 @@ enum class EffectShader {
     PointShadowFragment,
     BloomVertex,
     BloomFragment,
+    // Compute; absent on Metal (the renderer then bins lights on the CPU).
+    LightBinningCompute,
 };
 
 [[nodiscard]] auto loadEffectShader(gfx::IDevice& device, EffectShader shader)

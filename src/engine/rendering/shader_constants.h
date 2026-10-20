@@ -120,8 +120,15 @@ public:
 
     [[nodiscard]] auto alloc(gfx::IDevice& device, std::span<const std::byte> data)
         -> Slot;
+    // Like alloc() but leaves the contents undefined, for buffers the GPU
+    // fills itself (compute output).
+    [[nodiscard]] auto allocUninitialized(gfx::IDevice& device, std::uint32_t sizeBytes)
+        -> Slot;
 
 private:
+    [[nodiscard]] auto acquire(gfx::IDevice& device, std::span<const std::byte> data,
+                               std::uint32_t sizeBytes) -> Slot;
+
     struct Record {
         gfx::BufferHandle handle{};
         std::uint32_t capacityBytes = 0;

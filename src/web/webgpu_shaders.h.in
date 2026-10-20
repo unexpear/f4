@@ -42,6 +42,10 @@ inline constexpr char kBloomFragmentWgsl[] = R"F4WGSL(
 @F4_BLOOM_WEBGPU_FRAGMENT_WGSL@
 )F4WGSL";
 
+inline constexpr char kLightBinningComputeWgsl[] = R"F4WGSL(
+@F4_LIGHT_BINNING_WEBGPU_COMPUTE_WGSL@
+)F4WGSL";
+
 inline constexpr char kValidationPbrVertexWgsl[] = R"F4WGSL(
 @F4_VALIDATION_PBR_WEBGPU_VERTEX_WGSL@
 )F4WGSL";

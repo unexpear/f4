@@ -13,7 +13,42 @@ namespace f4::engine {
 
 namespace {
 
+[[nodiscard]] auto lightBinningSource(gfx::Backend backend) -> const char* {
+    switch (backend) {
+    case gfx::Backend::OpenGL:
+#if defined(F4_LIGHT_BINNING_OPENGL_COMPUTE)
+        return F4_LIGHT_BINNING_OPENGL_COMPUTE;
+#else
+        return nullptr;
+#endif
+    case gfx::Backend::Vulkan:
+#if defined(F4_LIGHT_BINNING_VULKAN_COMPUTE)
+        return F4_LIGHT_BINNING_VULKAN_COMPUTE;
+#else
+        return nullptr;
+#endif
+    case gfx::Backend::DirectX12:
+#if defined(F4_LIGHT_BINNING_DX12_COMPUTE)
+        return F4_LIGHT_BINNING_DX12_COMPUTE;
+#else
+        return nullptr;
+#endif
+    case gfx::Backend::WebGPU:
+#if defined(F4_WEBGPU_SHADER_HEADER)
+        return web::kLightBinningComputeWgsl;
+#else
+        return nullptr;
+#endif
+    case gfx::Backend::Metal:
+        return nullptr;
+    case gfx::Backend::Null:
+        return "";
+    }
+    return nullptr;
+}
+
 [[nodiscard]] auto effectSource(gfx::Backend backend, EffectShader shader) -> const char* {
+    if (shader == EffectShader::LightBinningCompute) return lightBinningSource(backend);
     const auto pick = [shader](const char* pointVertex, const char* pointFragment,
                                const char* bloomVertex, const char* bloomFragment) {
         switch (shader) {
@@ -21,6 +56,7 @@ namespace {
         case EffectShader::PointShadowFragment: return pointFragment;
         case EffectShader::BloomVertex: return bloomVertex;
         case EffectShader::BloomFragment: return bloomFragment;
+        case EffectShader::LightBinningCompute: return static_cast<const char*>(nullptr);
         }
         return static_cast<const char*>(nullptr);
     };
@@ -74,6 +110,7 @@ auto loadEffectShader(gfx::IDevice& device, EffectShader shader)
     desc.stage = shader == EffectShader::PointShadowVertex || shader == EffectShader::BloomVertex
                      ? gfx::ShaderStage::Vertex
                      : gfx::ShaderStage::Fragment;
+    if (shader == EffectShader::LightBinningCompute) desc.stage = gfx::ShaderStage::Compute;
     const gfx::Backend backend = device.backend();
     const char* source = effectSource(backend, shader);
     if (source == nullptr) return gfx::GfxError::BackendUnavailable;

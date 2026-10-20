@@ -437,6 +437,15 @@ void Renderer::releaseInitializationResources() {
     sceneConstants_.destroy(device_);
     sceneInstances_.destroy(device_);
     pointLightBuffers_.destroy(device_);
+    pointLightGpuBuffers_.destroy(device_);
+    lightBinningConstants_.destroy(device_);
+    if (lightBinningPipeline_.isValid()) (void)device_.destroyPipeline(lightBinningPipeline_);
+    if (lightBinningShader_.isValid()) (void)device_.destroyShader(lightBinningShader_);
+    lightBinningPipeline_ = {};
+    lightBinningShader_ = {};
+    lightBinningUnavailable_ = false;
+    framePointLightsReady_ = false;
+    framePointLightInput_ = {};
     framePointLights_ = {};
     defaultEnvironmentMipCount_ = 1;
     inited_ = false;
@@ -711,8 +720,19 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
     const math::Frustum frustum = math::Frustum::fromViewProjection(camera->viewProj);
     sceneConstants_.beginFrame();
     sceneInstances_.beginFrame();
-    pointLightBuffers_.beginFrame();
-    framePointLights_ = preparePointLights(*camera, aspect);
+    if (framePointLightsReady_) {
+        // render() binned the lights on the GPU; its compute pass ran first.
+        framePointLightsReady_ = false;
+        stats_.pointLights = frameLightStats_.submitted;
+        stats_.pointLightsVisible = frameLightStats_.visible;
+        stats_.pointLightReferences = frameLightStats_.indexCount;
+        stats_.pointLightReferencesDropped = frameLightStats_.droppedIndices;
+        stats_.maxPointLightsPerCluster = 0;
+        stats_.pointLightBinningDispatches = 3;
+    } else {
+        pointLightBuffers_.beginFrame();
+        framePointLights_ = preparePointLights(*camera, aspect);
+    }
     if (!framePointLights_.isValid()) {
         recordError_ = gfx::GfxError::OutOfMemory;
         return;
@@ -1024,6 +1044,160 @@ auto Renderer::preparePointShadows(const Camera& camera) -> gfx::GfxError {
     return gfx::GfxError::None;
 }
 
+// Point-shadow header words and face matrices; the matrices go at
+// `matrixOffset` (the CPU path appends them, the GPU path reserves room after
+// the light records).
+void Renderer::writePointShadowWords(std::uint32_t matrixOffset) {
+    if (!framePointShadowsActive_ || frameShadowedLights_.isEmpty()) return;
+    const std::size_t matrixWords = frameShadowFaces_.size() * 16u;
+    if (pointLightWords_.size() < matrixOffset + matrixWords) {
+        pointLightWords_.resize(matrixOffset + matrixWords);
+    }
+    pointLightWords_[10] = matrixOffset;
+    pointLightWords_[11] = static_cast<std::uint32_t>(frameShadowedLights_.size());
+    pointLightWords_[12] = pointShadowRows_;
+    pointLightWords_[13] = floatWord(std::max(pbrSettings_.pointShadowBias, 0.0f));
+    pointLightWords_[14] = floatWord(2.0f / static_cast<float>(pointShadowTileSize_));
+    std::uint32_t* out = pointLightWords_.data() + matrixOffset;
+    for (const math::Mat4& face : frameShadowFaces_) {
+        for (std::uint32_t column = 0; column < 4; ++column) {
+            const math::Vec4& c = face.col[column];
+            *out++ = floatWord(c.x);
+            *out++ = floatWord(c.y);
+            *out++ = floatWord(c.z);
+            *out++ = floatWord(c.w);
+        }
+    }
+}
+
+namespace {
+
+struct LightBinningUbo {
+    std::uint32_t counts[4];  // pass, clusterCount, visible, copyWords
+    std::uint32_t offsets[4]; // rangeOffset, maxIndexCount, gridOffset, indexOffset
+    std::uint32_t grid[4];    // tilesX, tilesY, slices, 0
+};
+
+constexpr std::uint32_t kLightBinningGroupSize = 64;
+
+} // namespace
+
+auto Renderer::ensureLightBinning() -> bool {
+    if (lightBinningPipeline_.isValid()) return true;
+    if (lightBinningUnavailable_ || device_.backend() == gfx::Backend::Null) return false;
+    const auto unavailable = [this] {
+        if (lightBinningShader_.isValid()) (void)device_.destroyShader(lightBinningShader_);
+        lightBinningShader_ = {};
+        lightBinningConstants_.destroy(device_);
+        pointLightGpuBuffers_.destroy(device_);
+        lightBinningUnavailable_ = true;
+        return false;
+    };
+    auto shader = loadEffectShader(device_, EffectShader::LightBinningCompute);
+    if (!shader.hasValue()) return unavailable();
+    lightBinningShader_ = shader.value();
+    gfx::PipelineStateDesc desc;
+    desc.computeShader = lightBinningShader_;
+    gfx::BindGroup group;
+    group.bindPoint = 0;
+    const std::uint32_t compute = gfx::shaderStageBit(gfx::ShaderStage::Compute);
+    group.slots.push({0, gfx::BindingType::UniformBuffer, compute, 1});
+    group.slots.push({0, gfx::BindingType::StorageBuffer, compute, 1});
+    group.slots.push({1, gfx::BindingType::StorageBuffer, compute, 1});
+    desc.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+    auto pipeline = device_.createPipeline(desc);
+    if (!pipeline.hasValue()) return unavailable();
+    if (lightBinningConstants_.create(device_, sizeof(LightBinningUbo), 3) !=
+            gfx::GfxError::None ||
+        pointLightGpuBuffers_.create(
+            device_, gfx::BufferUsage::Storage | gfx::BufferUsage::TransferSrc) !=
+            gfx::GfxError::None) {
+        (void)device_.destroyPipeline(pipeline.value());
+        return unavailable();
+    }
+    lightBinningPipeline_ = pipeline.value();
+    return true;
+}
+
+auto Renderer::preparePointLightsGpu(const Camera& camera, float aspect) -> bool {
+    framePointLightsReady_ = false;
+    if (!pbrSettings_.gpuLightBinning || !pbrSettings_.pointLightsEnabled) return false;
+    const ClusterGridConfig& grid = pbrSettings_.pointLightClusters;
+    if (grid.tilesX > 0xffffu || grid.tilesY > 0xffffu || grid.slices > 0xffffu) return false;
+    if (!ensureLightBinning()) return false;
+    if (!pointLightsGathered_) {
+        gatherPointLights();
+        pointLightsGathered_ = true;
+    }
+    const std::uint32_t shadowWords =
+        framePointShadowsActive_ && !frameShadowedLights_.isEmpty()
+            ? static_cast<std::uint32_t>(frameShadowFaces_.size() * 16u)
+            : 0u;
+    const float safeAspect = aspect > 0.0f ? aspect : 1.0f;
+    frameLightStats_ = buildClusteredLightBinningInput(
+        std::span<const ClusteredLightInput>(pointLightInputs_.data(),
+                                             pointLightInputs_.size()),
+        cameraView(camera), cameraProj(camera, safeAspect), camera.nearPlane, camera.farPlane,
+        grid, shadowWords, pointLightWords_, frameBinning_);
+    // Nothing to bin: the CPU path writes the header-only buffer.
+    if (frameBinning_.visible == 0) return false;
+    pointLightsGathered_ = false;
+    if (shadowWords != 0) writePointShadowWords(frameBinning_.reservedOffset);
+
+    pointLightBuffers_.beginFrame();
+    pointLightGpuBuffers_.beginFrame();
+    const DynamicBufferRing::Slot input = pointLightBuffers_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(pointLightWords_.data()),
+                           pointLightWords_.size() * sizeof(std::uint32_t)));
+    const DynamicBufferRing::Slot output = pointLightGpuBuffers_.allocUninitialized(
+        device_, frameBinning_.totalWords * static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+    if (!input.valid || !output.valid) return false;
+    framePointLightInput_ = input.handle;
+    framePointLights_ = output.handle;
+    framePointLightsReady_ = true;
+    return true;
+}
+
+void Renderer::recordLightBinning(gfx::CommandBuffer& commandBuffer) {
+    const ClusteredLightGpuParams& p = frameBinning_;
+    lightBinningConstants_.beginFrame();
+    const auto groups = [](std::uint32_t threads) {
+        return (threads + kLightBinningGroupSize - 1u) / kLightBinningGroupSize;
+    };
+    const gfx::ResourceState written{gfx::PipelineStageMask::ComputeShader,
+                                     gfx::ResourceAccessMask::ShaderWrite};
+    for (std::uint32_t pass = 0; pass < 3; ++pass) {
+        LightBinningUbo constants{{pass, p.clusterCount, p.visible, p.copyWords},
+                                  {p.rangeOffset, p.maxIndexCount, p.gridOffset, p.indexOffset},
+                                  {p.tilesX, p.tilesY, p.slices, 0u}};
+        const auto slot = lightBinningConstants_.alloc(
+            device_, std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
+        if (!slot.valid) {
+            recordError_ = gfx::GfxError::OutOfMemory;
+            return;
+        }
+        commandBuffer.bindPipeline(lightBinningPipeline_);
+        lightBinningConstants_.bind(commandBuffer, slot);
+        commandBuffer.bindResource(0, gfx::BindingType::StorageBuffer, framePointLightInput_.index,
+                                   framePointLightInput_.generation);
+        commandBuffer.bindResource(1, gfx::BindingType::StorageBuffer, framePointLights_.index,
+                                   framePointLights_.generation);
+        const std::uint32_t groupCount =
+            pass == 0 ? groups(std::max(p.clusterCount, p.copyWords))
+                      : (pass == 1 ? 1u : groups(p.clusterCount));
+        commandBuffer.dispatch(groupCount);
+        if (pass < 2) {
+            commandBuffer.bufferBarrier(
+                framePointLights_, written,
+                {gfx::PipelineStageMask::ComputeShader,
+                 gfx::ResourceAccessMask::ShaderRead | gfx::ResourceAccessMask::ShaderWrite});
+        }
+    }
+    commandBuffer.bufferBarrier(
+        framePointLights_, written,
+        {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});
+}
+
 auto Renderer::preparePointLights(const Camera& camera, float aspect) -> gfx::BufferHandle {
     if (!pointLightsGathered_) gatherPointLights();
     pointLightsGathered_ = false;
@@ -1038,22 +1212,7 @@ auto Renderer::preparePointLights(const Camera& camera, float aspect) -> gfx::Bu
     stats_.pointLightReferences = lightStats.indexCount;
     stats_.pointLightReferencesDropped = lightStats.droppedIndices;
     stats_.maxPointLightsPerCluster = lightStats.maxLightsPerCluster;
-    if (framePointShadowsActive_ && !frameShadowedLights_.isEmpty()) {
-        pointLightWords_[10] = static_cast<std::uint32_t>(pointLightWords_.size());
-        pointLightWords_[11] = static_cast<std::uint32_t>(frameShadowedLights_.size());
-        pointLightWords_[12] = pointShadowRows_;
-        pointLightWords_[13] = floatWord(std::max(pbrSettings_.pointShadowBias, 0.0f));
-        pointLightWords_[14] = floatWord(2.0f / static_cast<float>(pointShadowTileSize_));
-        for (const math::Mat4& face : frameShadowFaces_) {
-            for (std::uint32_t column = 0; column < 4; ++column) {
-                const math::Vec4& c = face.col[column];
-                pointLightWords_.push(floatWord(c.x));
-                pointLightWords_.push(floatWord(c.y));
-                pointLightWords_.push(floatWord(c.z));
-                pointLightWords_.push(floatWord(c.w));
-            }
-        }
-    }
+    writePointShadowWords(static_cast<std::uint32_t>(pointLightWords_.size()));
     const DynamicBufferRing::Slot slot = pointLightBuffers_.alloc(
         device_, std::span(reinterpret_cast<const std::byte*>(pointLightWords_.data()),
                            pointLightWords_.size() * sizeof(std::uint32_t)));
@@ -1789,6 +1948,7 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         framePointShadowsActive_ = false;
         frameBloomActive_ = false;
         pointLightsGathered_ = false;
+        framePointLightsReady_ = false;
         recordColorFormat_ = gfx::TextureFormat::RGBA8_UNORM;
         return error;
     };
@@ -1800,6 +1960,16 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
             return finish(error);
         }
         bloomConstants_.beginFrame();
+    }
+
+    // GPU light binning runs first; record() then binds its output.
+    if (preparePointLightsGpu(*camera, aspect)) {
+        gfx::PassDesc binningPass;
+        binningPass.name = containers::String("light-binning");
+        binningPass.record = [this](gfx::CommandBuffer& commandBuffer) {
+            recordLightBinning(commandBuffer);
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(binningPass));
     }
 
     gfx::RenderGraph::ResourceId shadowImage = 0;

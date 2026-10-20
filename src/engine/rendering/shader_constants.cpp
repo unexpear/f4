@@ -129,15 +129,23 @@ auto DynamicBufferRing::bufferCount() const -> std::size_t {
 
 auto DynamicBufferRing::alloc(gfx::IDevice& device, std::span<const std::byte> data)
     -> Slot {
-    if (!valid() || device_ != &device || data.empty() ||
-        data.size() > std::numeric_limits<std::uint32_t>::max()) {
-        return {};
-    }
+    if (data.empty() || data.size() > std::numeric_limits<std::uint32_t>::max()) return {};
+    return acquire(device, data, static_cast<std::uint32_t>(data.size()));
+}
+
+auto DynamicBufferRing::allocUninitialized(gfx::IDevice& device, std::uint32_t sizeBytes)
+    -> Slot {
+    if (sizeBytes == 0) return {};
+    return acquire(device, {}, sizeBytes);
+}
+
+auto DynamicBufferRing::acquire(gfx::IDevice& device, std::span<const std::byte> data,
+                                std::uint32_t sizeBytes) -> Slot {
+    if (!valid() || device_ != &device) return {};
 
     auto& frameRecords = records_[currentFrame_];
     if (cursor_ == frameRecords.size()) frameRecords.push(Record{});
     Record& record = frameRecords[cursor_];
-    const std::uint32_t sizeBytes = static_cast<std::uint32_t>(data.size());
 
     if (record.capacityBytes < sizeBytes) {
         std::uint64_t target = std::max<std::uint64_t>(record.capacityBytes, 256u);
@@ -154,14 +162,16 @@ auto DynamicBufferRing::alloc(gfx::IDevice& device, std::span<const std::byte> d
         desc.usage = usage_;
         auto replacement = device.createBuffer(desc, {});
         if (!replacement.hasValue()) return {};
-        if (device.writeBuffer(replacement.value(), 0, data) != gfx::GfxError::None) {
+        if (!data.empty() &&
+            device.writeBuffer(replacement.value(), 0, data) != gfx::GfxError::None) {
             (void)device.destroyBuffer(replacement.value());
             return {};
         }
         if (record.handle.isValid()) (void)device.destroyBuffer(record.handle);
         record.handle = replacement.value();
         record.capacityBytes = static_cast<std::uint32_t>(target);
-    } else if (device.writeBuffer(record.handle, 0, data) != gfx::GfxError::None) {
+    } else if (!data.empty() &&
+               device.writeBuffer(record.handle, 0, data) != gfx::GfxError::None) {
         return {};
     }
 

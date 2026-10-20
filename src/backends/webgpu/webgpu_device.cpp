@@ -1339,9 +1339,16 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             }
             break;
         case CommandKind::BeginRenderPass: {
-            if (renderPass != nullptr || computePass != nullptr) {
+            if (renderPass != nullptr) {
                 error = GfxError::BadDescriptor;
                 break;
+            }
+            // Compute work recorded before this render pass (e.g. light
+            // binning) ends its compute pass here; WebGPU orders the two.
+            if (computePass != nullptr) {
+                wgpuComputePassEncoderEnd(computePass);
+                wgpuComputePassEncoderRelease(computePass);
+                computePass = nullptr;
             }
             WebGpuFramebuffer* framebuffer = impl_->framebuffers.get(command.framebuffer);
             if (framebuffer == nullptr) {
