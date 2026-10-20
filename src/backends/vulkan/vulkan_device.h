@@ -75,6 +75,9 @@ private:
     [[nodiscard]] auto initialize(platform::Window* window) -> bool;
     [[nodiscard]] auto ready() const -> bool;
     void collectRetired();
+    [[nodiscard]] auto copyDeviceLocalBuffer(BufferHandle handle, std::uint64_t offset,
+                                             std::span<const std::byte> upload,
+                                             std::span<std::byte> download) -> GfxError;
 
     struct Impl;
     Impl* impl_ = nullptr;

@@ -376,6 +376,9 @@ struct VkBufferRecord {
     GpuBuffer rec;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    // Device-local storage (GPU-written, e.g. compute output); host writes
+    // and reads go through a staging copy.
+    bool deviceLocal = false;
 };
 
 struct VkTextureRecord {
@@ -570,6 +573,21 @@ void destroyDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messeng
 void destroyBufferAllocation(VkDevice device, VkBuffer buffer, VkDeviceMemory memory) {
     if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, buffer, nullptr);
     if (memory != VK_NULL_HANDLE) vkFreeMemory(device, memory, nullptr);
+}
+
+// Makes every earlier GPU write available to the transfers that follow.
+void memoryBarrierBeforeTransfer(VkCommandBuffer commandBuffer) {
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
 }
 
 [[nodiscard]] auto beginOneTimeCommands(VkDevice device, VkCommandPool pool,
@@ -1174,11 +1192,39 @@ auto VulkanDevice::createBuffer(const BufferDesc& desc, std::span<const std::byt
     VkBufferRecord record;
     record.rec.sizeBytes = desc.sizeBytes;
     record.rec.usage = desc.usage;
-    const GfxError allocationError = createBufferAllocation(
-        impl_->physicalDevice, impl_->device, desc.sizeBytes, usage,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        &record.buffer, &record.memory);
+    // Storage buffers the CPU does not rewrite (compute output) live in
+    // device-local memory: GPU writes and shader reads then stay off the bus.
+    // Everything else stays host-visible and is written by mapping.
+    const bool gpuOwned = hasUsage(desc.usage, BufferUsage::Storage) &&
+                          !hasUsage(desc.usage, BufferUsage::HostWrite) &&
+                          !hasUsage(desc.usage, BufferUsage::Vertex) &&
+                          !hasUsage(desc.usage, BufferUsage::Index) &&
+                          !hasUsage(desc.usage, BufferUsage::Uniform);
+    GfxError allocationError = GfxError::BackendUnavailable;
+    if (gpuOwned) {
+        allocationError = createBufferAllocation(
+            impl_->physicalDevice, impl_->device, desc.sizeBytes,
+            usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &record.buffer, &record.memory);
+        record.deviceLocal = allocationError == GfxError::None;
+    }
+    if (!record.deviceLocal) {
+        allocationError = createBufferAllocation(
+            impl_->physicalDevice, impl_->device, desc.sizeBytes, usage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &record.buffer, &record.memory);
+    }
     if (allocationError != GfxError::None) return allocationError;
+    if (record.deviceLocal) {
+        const BufferHandle handle = impl_->buffers.create(std::move(record));
+        if (!handle.isValid() || initialData.empty()) return handle;
+        if (const GfxError error = writeBuffer(handle, 0, initialData);
+            error != GfxError::None) {
+            (void)destroyBuffer(handle);
+            return error;
+        }
+        return handle;
+    }
     if (!initialData.empty()) {
         void* mapped = nullptr;
         const VkResult mapResult = vkMapMemory(
@@ -1899,6 +1945,7 @@ auto VulkanDevice::writeBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (data.empty()) return GfxError::None;
+    if (record->deviceLocal) return copyDeviceLocalBuffer(handle, offset, data, {});
     void* mapped = nullptr;
     const VkResult result = vkMapMemory(
         impl_->device, record->memory, 0, VK_WHOLE_SIZE, 0, &mapped);
@@ -1906,6 +1953,70 @@ auto VulkanDevice::writeBuffer(BufferHandle handle, std::uint64_t offset,
     std::memcpy(static_cast<std::byte*>(mapped) + offset, data.data(), data.size());
     vkUnmapMemory(impl_->device, record->memory);
     return GfxError::None;
+}
+
+// Staged upload (`upload` non-empty) or readback (`download` non-empty) of a
+// device-local buffer range; waits for the device first and for the copy.
+auto VulkanDevice::copyDeviceLocalBuffer(BufferHandle handle, std::uint64_t offset,
+                                         std::span<const std::byte> upload,
+                                         std::span<std::byte> download) -> GfxError {
+    const bool reading = !download.empty();
+    const std::size_t size = reading ? download.size() : upload.size();
+    waitIdle();
+    VkBufferRecord* record = impl_->buffers.get(handle);
+    if (record == nullptr) return GfxError::StaleHandle;
+    const VkBuffer target = record->buffer;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    GfxError error = createBufferAllocation(
+        impl_->physicalDevice, impl_->device, size,
+        reading ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        &stagingBuffer, &stagingMemory);
+    if (error != GfxError::None) return error;
+    void* mapped = nullptr;
+    VkResult mapResult = VK_SUCCESS;
+    if (!reading) {
+        mapResult = vkMapMemory(impl_->device, stagingMemory, 0, size, 0, &mapped);
+        if (mapResult == VK_SUCCESS) {
+            std::memcpy(mapped, upload.data(), size);
+            vkUnmapMemory(impl_->device, stagingMemory);
+        }
+    }
+    if (mapResult != VK_SUCCESS) {
+        destroyBufferAllocation(impl_->device, stagingBuffer, stagingMemory);
+        return toGfxError(mapResult);
+    }
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    error = beginOneTimeCommands(impl_->device, impl_->commandPool, &commandBuffer);
+    if (error != GfxError::None) {
+        destroyBufferAllocation(impl_->device, stagingBuffer, stagingMemory);
+        return error;
+    }
+    memoryBarrierBeforeTransfer(commandBuffer);
+    VkBufferCopy copy{};
+    copy.size = size;
+    if (reading) {
+        copy.srcOffset = offset;
+        vkCmdCopyBuffer(commandBuffer, target, stagingBuffer, 1, &copy);
+    } else {
+        copy.dstOffset = offset;
+        vkCmdCopyBuffer(commandBuffer, stagingBuffer, target, 1, &copy);
+    }
+    memoryBarrierBeforeTransfer(commandBuffer);
+    error = endOneTimeCommands(impl_->device, impl_->commandPool, impl_->graphicsQueue,
+                               commandBuffer);
+    if (error == GfxError::None && reading) {
+        mapResult = vkMapMemory(impl_->device, stagingMemory, 0, size, 0, &mapped);
+        if (mapResult == VK_SUCCESS) {
+            std::memcpy(download.data(), mapped, size);
+            vkUnmapMemory(impl_->device, stagingMemory);
+        } else {
+            error = toGfxError(mapResult);
+        }
+    }
+    destroyBufferAllocation(impl_->device, stagingBuffer, stagingMemory);
+    return error;
 }
 
 auto VulkanDevice::readBuffer(BufferHandle handle, std::uint64_t offset,
@@ -1917,6 +2028,7 @@ auto VulkanDevice::readBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (destination.empty()) return GfxError::None;
+    if (record->deviceLocal) return copyDeviceLocalBuffer(handle, offset, {}, destination);
     waitIdle();
     void* mapped = nullptr;
     const VkResult result = vkMapMemory(
