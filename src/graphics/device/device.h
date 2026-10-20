@@ -75,6 +75,14 @@ public:
     // Clears per-frame draw, dispatch, instance, primitive, vertex, and batch
     // counters. Resource accounting is unaffected.
     virtual auto resetFrameStats() -> void = 0;
+
+    // GPU timestamps (gpu_timestamps.h). Devices without timer queries return
+    // false here and ignore WriteTimestamp commands.
+    [[nodiscard]] virtual auto supportsGpuTimestamps() const -> bool { return false; }
+    // Serial of the most recent submit that wrote timestamps (0 if none).
+    [[nodiscard]] virtual auto lastGpuTimestampSerial() const -> std::uint64_t { return 0; }
+    // Newest finished timestamp set, without waiting for the GPU.
+    virtual auto latestGpuTimestamps() -> GpuTimestampFrame { return {}; }
 };
 
 // Factory. The compiled-in backend (F4_GRAPHICS_BACKEND) decides the concrete

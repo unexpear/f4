@@ -6,6 +6,7 @@
 #include "core/containers/array.h"
 #include "core/ids/handle.h"
 
+#include "graphics/device/gpu_timestamps.h"
 #include "graphics/handle.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/types.h"
@@ -33,6 +34,7 @@ enum class CommandKind : std::uint8_t {
     Dispatch,
     BeginRenderPass,
     EndRenderPass,
+    WriteTimestamp,
 };
 
 enum class BarrierResourceType : std::uint8_t { Buffer, Texture };
@@ -76,6 +78,7 @@ struct Command {
     std::uint32_t groupCountX = 0;
     std::uint32_t groupCountY = 0;
     std::uint32_t groupCountZ = 0;
+    std::uint32_t timestampIndex = 0; // WriteTimestamp, < kMaxGpuTimestamps
 
     // Inline resource storage — zero heap allocation for ≤8 resources.
     static constexpr std::uint8_t kInlineCapacity = 8;
@@ -119,6 +122,12 @@ public:
                   std::uint32_t groupCountZ = 1);
     void beginRenderPass(FramebufferHandle framebuffer);
     void endRenderPass();
+    // GPU timestamp `index` (< kMaxGpuTimestamps), outside render passes. See
+    // graphics/device/gpu_timestamps.h; devices without timer queries ignore it.
+    void writeTimestamp(std::uint32_t index);
+    // Highest timestamp index + 1 and a bit mask of written indices (0/0 when
+    // the buffer writes none). Backends use it to size the query set.
+    void timestampUsage(std::uint32_t& count, std::uint32_t& written) const;
 
     // Test/observability surface — a recorded command log (NullDevice submits
     // a validated replay of this).

@@ -1831,6 +1831,9 @@ struct BinningFrame {
     std::vector<std::uint32_t> gpuWords;
     engine::FrameStats cpuStats{};
     engine::FrameStats gpuStats{};
+    Capture timed;                    // GPU binning with GPU timers on
+    engine::FrameStats timedStats{};
+    bool timestampsSupported = false;
 };
 
 [[nodiscard]] auto readLightBuffer(gfx::IDevice& device, gfx::BufferHandle buffer)
@@ -1879,6 +1882,15 @@ template <typename Reader>
         frame.gpu = target.render(world->renderer, world->camera, reader);
         frame.gpuStats = world->renderer.stats();
         frame.gpuWords = readLightBuffer(device, world->renderer.pointLightBuffer());
+        // GPU timers: a few frames so an earlier frame's queries have resolved
+        // (render() waits idle, so the previous frame is always finished).
+        frame.timestampsSupported = device.supportsGpuTimestamps();
+        world->renderer.pbrSettings().gpuTimers = true;
+        for (int i = 0; i < 3; ++i) {
+            frame.timed = target.render(world->renderer, world->camera, reader);
+        }
+        frame.timedStats = world->renderer.stats();
+        world->renderer.pbrSettings().gpuTimers = false;
         frames.push_back(static_cast<BinningFrame&&>(frame));
     }
     return frames;
@@ -1907,6 +1919,31 @@ void checkBinningFrames(const char* backend, const std::vector<BinningFrame>& fr
               frame.cpuStats.pointLightReferencesDropped);
         CHECK(diff.mismatchPixelCount == 0);
         CHECK(bufferDifferences == 0);
+
+        // GPU timers: per-pass times exist, cover the binning and main passes,
+        // and timing does not change the image.
+        const engine::FrameStats& timed = frame.timedStats;
+        CHECK(frame.timestampsSupported);
+        CHECK(timed.gpuTimingValid);
+        std::string passes;
+        double passSum = 0.0;
+        for (std::uint32_t i = 0; i < timed.gpuPassCount; ++i) {
+            char line[96];
+            std::snprintf(line, sizeof(line), " %s=%.4f", timed.gpuPasses[i].name,
+                          timed.gpuPasses[i].ms);
+            passes += line;
+            passSum += timed.gpuPasses[i].ms;
+        }
+        MESSAGE(std::string(backend) << " " << std::string(frame.scene) << " GPU ms: frame="
+                << timed.gpuFrameMs << " binning=" << timed.gpuLightBinningMs << " main="
+                << timed.gpuMainPassMs << " lag=" << timed.gpuTimingLag << " passes:" << passes);
+        CHECK(timed.gpuPassCount >= 2);
+        CHECK(timed.gpuLightBinningMs > 0.0);
+        CHECK(timed.gpuMainPassMs > 0.0);
+        CHECK(timed.gpuTimingLag >= 1);
+        CHECK(std::abs(passSum - timed.gpuFrameMs) < 1.0e-3);
+        CHECK(engine::compareShaderImagesRgba8(frame.gpu, frame.timed, 0).mismatchPixelCount ==
+              0);
     }
     CHECK(frames[1].cpuStats.pointLightReferencesDropped > 0);
     CHECK(frames[2].cpuStats.pointShadowLights > 0);
@@ -2044,7 +2081,16 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     if (mode != "1" && mode != "cache" && mode != "binning") return;
     bool verbose = true;
     bool benchGpuBinning = true;
+    bool benchGpuTimers = false;
     double lastCpuMs = 0.0; // CPU time inside render() per frame, last bench() call
+    // With benchGpuTimers: mean GPU ms per frame of the last bench() call.
+    double lastGpuFrameMs = 0.0, lastGpuBinningMs = 0.0, lastGpuMainMs = 0.0;
+    std::string lastGpuPasses;
+    // F4_BENCH_BACKEND=opengl|vulkan|dx12 limits the run to one backend.
+    const char* backendFilter = std::getenv("F4_BENCH_BACKEND");
+    const auto runBackend = [&](const char* name) {
+        return backendFilter == nullptr || std::string(backendFilter) == name;
+    };
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 30;
@@ -2110,6 +2156,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
             renderer.pbrSettings().pointShadowCaching = shadowCache;
             renderer.pbrSettings().gpuLightBinning = benchGpuBinning;
+            renderer.pbrSettings().gpuTimers = benchGpuTimers;
             const float aspect = static_cast<float>(width) / static_cast<float>(height);
             const gfx::Extent extent{width, height};
             for (int i = 0; i < warmup; ++i) {
@@ -2119,6 +2166,10 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             device.waitIdle();
             const auto start = std::chrono::steady_clock::now();
             double cpuMs = 0.0;
+            double gpuFrame = 0.0, gpuBinning = 0.0, gpuMain = 0.0;
+            std::vector<double> passSums;
+            std::vector<std::string> passNames;
+            int timed = 0;
             for (int i = 0; i < frames; ++i) {
                 const auto frameStart = std::chrono::steady_clock::now();
                 const gfx::GfxError error =
@@ -2127,6 +2178,29 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                              std::chrono::steady_clock::now() - frameStart)
                              .count();
                 REQUIRE(error == gfx::GfxError::None);
+                const engine::FrameStats frameStats = renderer.stats();
+                if (benchGpuTimers && frameStats.gpuTimingValid) {
+                    ++timed;
+                    gpuFrame += frameStats.gpuFrameMs;
+                    gpuBinning += frameStats.gpuLightBinningMs;
+                    gpuMain += frameStats.gpuMainPassMs;
+                    passSums.resize(frameStats.gpuPassCount, 0.0);
+                    passNames.resize(frameStats.gpuPassCount);
+                    for (std::uint32_t p = 0; p < frameStats.gpuPassCount; ++p) {
+                        passSums[p] += frameStats.gpuPasses[p].ms;
+                        passNames[p] = frameStats.gpuPasses[p].name;
+                    }
+                }
+            }
+            lastGpuFrameMs = timed > 0 ? gpuFrame / timed : 0.0;
+            lastGpuBinningMs = timed > 0 ? gpuBinning / timed : 0.0;
+            lastGpuMainMs = timed > 0 ? gpuMain / timed : 0.0;
+            lastGpuPasses.clear();
+            for (std::size_t p = 0; p < passSums.size() && timed > 0; ++p) {
+                char line[96];
+                std::snprintf(line, sizeof(line), " %s=%.3f", passNames[p].c_str(),
+                              passSums[p] / timed);
+                lastGpuPasses += line;
             }
             device.waitIdle();
             const auto end = std::chrono::steady_clock::now();
@@ -2176,10 +2250,24 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                 }
                 std::printf("[point-light bench] %s binning %s lights=%u: CPU binning %.3f "
                             "ms/frame (render() CPU %.3f), GPU binning %.3f ms/frame "
-                            "(render() CPU %.3f) (median of %d)\n",
+                            "(render() CPU %.3f) (median of %d; min %.3f / %.3f)\n",
                             backend, scaled ? "scaled" : "stress", side * side,
                             frame[0][rounds / 2], cpu[0][rounds / 2], frame[1][rounds / 2],
-                            cpu[1][rounds / 2], rounds);
+                            cpu[1][rounds / 2], rounds, frame[0].front(), frame[1].front());
+                // One extra run of each with GPU timers on (timestamps drain the
+                // GPU at pass boundaries, so these frame times are not compared).
+                benchGpuTimers = true;
+                for (const bool gpu : {false, true}) {
+                    benchGpuBinning = gpu;
+                    const double timedMs = bench(device, backend, side, scaled);
+                    std::printf("[point-light bench] %s binning %s lights=%u %s binning, GPU "
+                                "timers: frame %.3f ms, GPU frame %.3f ms, binning pass %.3f "
+                                "ms, main pass %.3f ms, passes:%s\n",
+                                backend, scaled ? "scaled" : "stress", side * side,
+                                gpu ? "GPU" : "CPU", timedMs, lastGpuFrameMs, lastGpuBinningMs,
+                                lastGpuMainMs, lastGpuPasses.c_str());
+                }
+                benchGpuTimers = false;
             }
         }
         benchGpuBinning = true;
@@ -2213,7 +2301,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         verbose = true;
     };
 
-    {
+    if (runBackend("opengl")) {
         auto windowResult = platform::Window::create({"Point light bench", 64, 64, false});
         REQUIRE(windowResult.hasValue());
         platform::Window* window = windowResult.value();
@@ -2239,7 +2327,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         gfx::deleteDevice(device);
         delete window;
     }
-    {
+    if (runBackend("vulkan")) {
         gfx::IDevice* device = gfx::createVulkanDevice();
         REQUIRE(device != nullptr);
         if (mode == "cache") {
@@ -2257,7 +2345,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         }
         gfx::deleteDevice(device);
     }
-    {
+    if (runBackend("dx12")) {
         gfx::IDevice* device = gfx::createDx12Device();
         REQUIRE(device != nullptr);
         std::printf("[point-light bench] DX12 adapter: %s\n",

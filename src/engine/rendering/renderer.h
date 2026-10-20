@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "core/containers/hashmap.h"
 #include "core/ecs/registry.h"
 #include "core/resources/mesh.h"
@@ -45,6 +47,24 @@ struct FrameStats {
     std::uint32_t pointShadowLightsRedrawn = 0;
     // Fullscreen bloom passes (prefilter, downsamples, upsamples, composite).
     std::uint32_t bloomPasses = 0;
+
+    // GPU timers (PbrRenderSettings::gpuTimers on a device with timestamp
+    // queries). Values come from the newest frame the GPU has finished, which
+    // is usually 1-2 render() calls old (gpuTimingLag). Each render-graph pass
+    // is timed from the end of the previous pass's work to the end of its own,
+    // barriers included; gpuFrameMs spans the whole graph.
+    static constexpr std::uint32_t kMaxGpuPasses = 31;
+    struct GpuPassTime {
+        char name[32]{};
+        double ms = 0.0;
+    };
+    std::uint32_t gpuPassCount = 0;
+    GpuPassTime gpuPasses[kMaxGpuPasses]{};
+    double gpuFrameMs = 0.0;
+    double gpuLightBinningMs = 0.0; // "light-binning" pass (0 when the CPU binned)
+    double gpuMainPassMs = 0.0;     // "main" pass (PBR shading)
+    std::uint32_t gpuTimingLag = 0;  // render() calls since the timed frame
+    bool gpuTimingValid = false;
 };
 
 struct PbrRenderSettings {
@@ -99,6 +119,10 @@ struct PbrRenderSettings {
     // called on its own always bins on the CPU. false forces the CPU path
     // (the reference).
     bool gpuLightBinning = true;
+    // Time every render-graph pass with GPU timestamp queries and report the
+    // results in FrameStats::gpu*. Off by default (each pass boundary then
+    // waits for the previous pass to drain).
+    bool gpuTimers = false;
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -212,6 +236,18 @@ private:
     Array<RenderBatch> batches_;
     Array<RenderInstance> instanceStaging_;
     FrameStats stats_{};
+    // GPU timer bookkeeping: pass names of recent timed submits by device
+    // serial, and the newest resolved timings (copied into stats_).
+    struct GpuTimerFrame {
+        std::uint64_t serial = 0;
+        std::uint64_t frame = 0;
+        std::uint32_t passCount = 0;
+        char names[FrameStats::kMaxGpuPasses][32]{};
+    };
+    std::array<GpuTimerFrame, 8> gpuTimerFrames_{};
+    FrameStats gpuTiming_{};
+    std::uint64_t renderFrameCount_ = 0;
+    void updateGpuTimers();
 
     // One UBO per queued draw prevents deferred command replay from observing
     // only the final model/tint upload.

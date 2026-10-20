@@ -62,6 +62,10 @@ public:
     [[nodiscard]] auto stats() const -> DeviceStats override;
     auto resetFrameStats() -> void override;
 
+    [[nodiscard]] auto supportsGpuTimestamps() const -> bool override { return true; }
+    [[nodiscard]] auto lastGpuTimestampSerial() const -> std::uint64_t override;
+    auto latestGpuTimestamps() -> GpuTimestampFrame override;
+
 private:
     friend auto createOpenGLDevice() -> IDevice*;
 

@@ -468,6 +468,13 @@ struct VulkanDevice::Impl {
     bool independentBlend = false;
     float maxSamplerAnisotropy = 1.0f;
     bool initialized = false;
+    // GPU timestamps: one pool of kGpuTimestampSets x kMaxGpuTimestamps
+    // queries, created on first use; each set is reset at the start of the
+    // command buffer that writes it.
+    bool timestampsSupported = false;
+    double timestampPeriodNs = 1.0;
+    VkQueryPool timestampPool = VK_NULL_HANDLE;
+    GpuTimestampRing timestamps;
     ValidationCounts validation;
     DeviceStats stats;
     ObjectStore<VkBufferRecord, GpuBufferTag> buffers;
@@ -888,6 +895,9 @@ VulkanDevice::~VulkanDevice() {
         if (impl_->commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(impl_->device, impl_->commandPool, nullptr);
         }
+        if (impl_->timestampPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(impl_->device, impl_->timestampPool, nullptr);
+        }
         for (VkFrameSlot& frame : impl_->frames) {
             if (frame.fence != VK_NULL_HANDLE) {
                 vkDestroyFence(impl_->device, frame.fence, nullptr);
@@ -1099,6 +1109,18 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
     impl_->depthClamp = selectedFeatures.depthClamp == VK_TRUE;
     impl_->independentBlend = selectedFeatures.independentBlend == VK_TRUE;
     impl_->maxSamplerAnisotropy = selectedProperties.limits.maxSamplerAnisotropy;
+    impl_->timestampPeriodNs = static_cast<double>(selectedProperties.limits.timestampPeriod);
+    {
+        std::uint32_t familyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(impl_->physicalDevice, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> families(familyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(impl_->physicalDevice, &familyCount,
+                                                 families.data());
+        impl_->timestampsSupported =
+            selectedProperties.limits.timestampPeriod > 0.0f &&
+            impl_->graphicsQueueFamily < familyCount &&
+            families[impl_->graphicsQueueFamily].timestampValidBits != 0;
+    }
 
     const float queuePriority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -2211,6 +2233,32 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     result = vkBeginCommandBuffer(vkCommands, &beginInfo);
     if (result != VK_SUCCESS) return toGfxError(result);
+    bool timestampsActive = false;
+    std::uint32_t timestampSet = 0;
+    {
+        std::uint32_t timestampCount = 0;
+        std::uint32_t timestampMask = 0;
+        commands.timestampUsage(timestampCount, timestampMask);
+        if (timestampCount != 0 && impl_->timestampsSupported) {
+            if (impl_->timestampPool == VK_NULL_HANDLE) {
+                VkQueryPoolCreateInfo poolInfo{};
+                poolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                poolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                poolInfo.queryCount = kGpuTimestampSets * kMaxGpuTimestamps;
+                if (vkCreateQueryPool(impl_->device, &poolInfo, nullptr,
+                                      &impl_->timestampPool) != VK_SUCCESS) {
+                    impl_->timestampPool = VK_NULL_HANDLE;
+                    impl_->timestampsSupported = false;
+                }
+            }
+            if (impl_->timestampPool != VK_NULL_HANDLE) {
+                timestampSet = impl_->timestamps.begin(timestampCount, timestampMask);
+                vkCmdResetQueryPool(vkCommands, impl_->timestampPool,
+                                    timestampSet * kMaxGpuTimestamps, kMaxGpuTimestamps);
+                timestampsActive = true;
+            }
+        }
+    }
 
     GfxError error = GfxError::None;
     for (const Command& command : commands.commands()) {
@@ -2507,6 +2555,15 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
             boundPipeline = nullptr;
             break;
         }
+        case CommandKind::WriteTimestamp:
+            if (rendering || command.timestampIndex >= kMaxGpuTimestamps) {
+                error = GfxError::BadDescriptor;
+            } else if (timestampsActive) {
+                vkCmdWriteTimestamp2(vkCommands, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                     impl_->timestampPool,
+                                     timestampSet * kMaxGpuTimestamps + command.timestampIndex);
+            }
+            break;
         case CommandKind::EndRenderPass:
             if (!rendering) {
                 error = GfxError::BadDescriptor;
@@ -2703,6 +2760,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     if (result != VK_SUCCESS) return toGfxError(result);
     frame.pending = true;
     frame.serial = ++impl_->lastSubmittedSerial;
+    if (timestampsActive) impl_->timestamps.sets[timestampSet].fenceValue = frame.serial;
     impl_->frameIndex = (impl_->frameIndex + 1) % kFramesInFlight;
     if (submissionSwapchain != nullptr) {
         const VkSemaphore renderComplete =
@@ -2725,6 +2783,51 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     impl_->stats.primitives += delta.primitives;
     impl_->stats.vertices += delta.vertices;
     return GfxError::None;
+}
+
+auto VulkanDevice::supportsGpuTimestamps() const -> bool {
+    return impl_ != nullptr && impl_->timestampsSupported;
+}
+
+auto VulkanDevice::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_ != nullptr ? impl_->timestamps.lastSerial : 0;
+}
+
+auto VulkanDevice::latestGpuTimestamps() -> GpuTimestampFrame {
+    if (impl_ == nullptr || impl_->timestampPool == VK_NULL_HANDLE) return {};
+    return impl_->timestamps.poll([&](std::uint32_t set, const GpuTimestampRing::Set& info,
+                                      std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+        // Only trust the queries once the submission's fence signalled: until
+        // the GPU runs the in-buffer reset, a reused set still reports the
+        // previous submission's (available) values.
+        if (info.fenceValue == 0) return false;
+        if (info.fenceValue > impl_->completedSerial) {
+            bool finished = false;
+            for (VkFrameSlot& slot : impl_->frames) {
+                if (slot.pending && slot.serial == info.fenceValue &&
+                    vkGetFenceStatus(impl_->device, slot.fence) == VK_SUCCESS) {
+                    finished = true;
+                }
+            }
+            if (!finished) return false;
+        }
+        std::array<std::uint64_t, kMaxGpuTimestamps * 2> values{};
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            if ((info.written & (1u << i)) == 0) continue;
+            const VkResult result = vkGetQueryPoolResults(
+                impl_->device, impl_->timestampPool, set * kMaxGpuTimestamps + i, 1,
+                sizeof(std::uint64_t) * 2, &values[i * 2], sizeof(std::uint64_t) * 2,
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if ((result != VK_SUCCESS && result != VK_NOT_READY) || values[i * 2 + 1] == 0) {
+                return false;
+            }
+        }
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            ns[i] = static_cast<std::uint64_t>(static_cast<double>(values[i * 2]) *
+                                               impl_->timestampPeriodNs);
+        }
+        return true;
+    });
 }
 
 auto VulkanDevice::waitIdle() -> void {

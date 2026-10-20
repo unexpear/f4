@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -2084,7 +2085,22 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     recordColorFormat_ =
         bloom ? gfx::TextureFormat::RGBA16_FLOAT : gfx::TextureFormat::RGBA8_UNORM;
     gfx::CommandBuffer commandBuffer;
+    graph_.setGpuTimestamps(pbrSettings_.gpuTimers && device_.supportsGpuTimestamps());
     const gfx::GfxError submitError = graph_.execute(device_, commandBuffer);
+    ++renderFrameCount_;
+    if (submitError == gfx::GfxError::None && graph_.gpuTimestampsWritten()) {
+        const std::uint64_t serial = device_.lastGpuTimestampSerial();
+        GpuTimerFrame& timed = gpuTimerFrames_[serial % gpuTimerFrames_.size()];
+        timed.serial = serial;
+        timed.frame = renderFrameCount_;
+        timed.passCount = static_cast<std::uint32_t>(
+            std::min<std::size_t>(graph_.passCount(), FrameStats::kMaxGpuPasses));
+        for (std::uint32_t i = 0; i < timed.passCount; ++i) {
+            std::snprintf(timed.names[i], sizeof(timed.names[i]), "%s",
+                          graph_.pass(i).name.c_str());
+        }
+    }
+    if (pbrSettings_.gpuTimers) updateGpuTimers();
     std::uint32_t activeShadowLights = 0;
     if (framePointShadowsActive_) {
         const bool drawn = submitError == gfx::GfxError::None &&
@@ -2108,7 +2124,50 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     stats_.pointShadowLightsRedrawn =
         framePointShadowsActive_ && framePointShadowsDirty_ ? pointShadowRedrawn_ : 0u;
     stats_.bloomPasses = bloomPasses_;
+    stats_.gpuTimingValid = gpuTiming_.gpuTimingValid;
+    stats_.gpuPassCount = gpuTiming_.gpuPassCount;
+    for (std::uint32_t i = 0; i < gpuTiming_.gpuPassCount; ++i) {
+        stats_.gpuPasses[i] = gpuTiming_.gpuPasses[i];
+    }
+    stats_.gpuFrameMs = gpuTiming_.gpuFrameMs;
+    stats_.gpuLightBinningMs = gpuTiming_.gpuLightBinningMs;
+    stats_.gpuMainPassMs = gpuTiming_.gpuMainPassMs;
+    stats_.gpuTimingLag = gpuTiming_.gpuTimingValid
+                              ? static_cast<std::uint32_t>(renderFrameCount_ -
+                                                           gpuTiming_.gpuTimingLag)
+                              : 0u;
     return finish(submitError != gfx::GfxError::None ? submitError : recordError_);
+}
+
+void Renderer::updateGpuTimers() {
+    const gfx::GpuTimestampFrame frame = device_.latestGpuTimestamps();
+    if (frame.serial == 0) return;
+    const GpuTimerFrame& timed = gpuTimerFrames_[frame.serial % gpuTimerFrames_.size()];
+    if (timed.serial != frame.serial || timed.passCount == 0 ||
+        frame.count < timed.passCount + 1) {
+        return;
+    }
+    FrameStats result;
+    result.gpuTimingValid = true;
+    result.gpuPassCount = timed.passCount;
+    const auto ms = [&](std::uint32_t from, std::uint32_t to) {
+        return frame.ns[to] >= frame.ns[from]
+                   ? static_cast<double>(frame.ns[to] - frame.ns[from]) * 1.0e-6
+                   : 0.0;
+    };
+    for (std::uint32_t i = 0; i < timed.passCount; ++i) {
+        std::memcpy(result.gpuPasses[i].name, timed.names[i], sizeof(timed.names[i]));
+        result.gpuPasses[i].ms = ms(i, i + 1);
+        if (std::strcmp(timed.names[i], "light-binning") == 0) {
+            result.gpuLightBinningMs += result.gpuPasses[i].ms;
+        } else if (std::strcmp(timed.names[i], "main") == 0) {
+            result.gpuMainPassMs += result.gpuPasses[i].ms;
+        }
+    }
+    result.gpuFrameMs = ms(0, timed.passCount);
+    // Stored as the timed frame number; render() turns it into a lag.
+    result.gpuTimingLag = static_cast<std::uint32_t>(timed.frame);
+    gpuTiming_ = result;
 }
 
 } // namespace f4::engine

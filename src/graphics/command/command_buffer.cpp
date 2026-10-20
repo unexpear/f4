@@ -169,4 +169,25 @@ void CommandBuffer::endRenderPass() {
     pushCommand(std::move(cmd));
 }
 
+void CommandBuffer::writeTimestamp(std::uint32_t index) {
+    F4_ASSERT(index < kMaxGpuTimestamps, "timestamp index out of range");
+    Command cmd;
+    cmd.kind = CommandKind::WriteTimestamp;
+    cmd.timestampIndex = index;
+    pushCommand(std::move(cmd));
+}
+
+void CommandBuffer::timestampUsage(std::uint32_t& count, std::uint32_t& written) const {
+    count = 0;
+    written = 0;
+    for (const Command& command : commands_) {
+        if (command.kind != CommandKind::WriteTimestamp ||
+            command.timestampIndex >= kMaxGpuTimestamps) {
+            continue;
+        }
+        written |= 1u << command.timestampIndex;
+        if (command.timestampIndex + 1 > count) count = command.timestampIndex + 1;
+    }
+}
+
 } // namespace f4::gfx

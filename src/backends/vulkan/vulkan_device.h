@@ -52,6 +52,10 @@ public:
     [[nodiscard]] auto stats() const -> DeviceStats override;
     auto resetFrameStats() -> void override;
 
+    [[nodiscard]] auto supportsGpuTimestamps() const -> bool override;
+    [[nodiscard]] auto lastGpuTimestampSerial() const -> std::uint64_t override;
+    auto latestGpuTimestamps() -> GpuTimestampFrame override;
+
     [[nodiscard]] auto deviceName() const -> const char*;
     [[nodiscard]] auto apiVersion() const -> std::uint32_t;
     [[nodiscard]] auto graphicsQueueFamily() const -> std::uint32_t;

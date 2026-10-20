@@ -313,6 +313,12 @@ auto NullDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::EndRenderPass:
             renderPassActive = false;
             break;
+        case CommandKind::WriteTimestamp:
+            // Validated like a real device; NullDevice has no GPU clock.
+            if (renderPassActive || cmd.timestampIndex >= kMaxGpuTimestamps) {
+                err = GfxError::BadDescriptor;
+            }
+            break;
         case CommandKind::BindPipeline:
             if (!impl_->pipelines.contains(cmd.pipeline)) {
                 err = GfxError::InvalidHandle;

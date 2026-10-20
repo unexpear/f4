@@ -79,6 +79,12 @@ public:
     // supplied CommandBuffer is begun, ended, and submitted by the graph.
     [[nodiscard]] auto execute(IDevice& dev, CommandBuffer& cb) -> GfxError;
 
+    // When on (and the graph has fewer than kMaxGpuTimestamps passes),
+    // execute() writes GPU timestamp i before pass i's barriers and timestamp
+    // passCount() after the last pass, so pass i takes ts[i+1] - ts[i].
+    void setGpuTimestamps(bool enabled) { gpuTimestamps_ = enabled; }
+    [[nodiscard]] auto gpuTimestampsWritten() const -> bool { return timestampsWritten_; }
+
     // Materializes all declared resources (createTexture/createBuffer/createFramebuffer).
     // Persistent handles are reused; missing transient handles are recreated.
     [[nodiscard]] auto realize(IDevice& dev) -> GfxError;
@@ -103,6 +109,8 @@ private:
     Array<ResourceState> states_;
     Array<std::uint8_t> owned_;
     IDevice* owner_ = nullptr;
+    bool gpuTimestamps_ = false;
+    bool timestampsWritten_ = false;
 };
 
 } // namespace f4::gfx

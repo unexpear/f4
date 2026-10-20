@@ -340,6 +340,13 @@ struct OpenGLDevice::Impl {
     GLint maxTextureUnits_ = 0;
     GLuint glProgram_ = 0;
     GLuint glVao_ = 0;
+
+    // GPU timestamps: kGpuTimestampSets x kMaxGpuTimestamps query objects
+    // (GL_TIMESTAMP via glQueryCounter), created on first use.
+    std::vector<GLuint> timestampQueries_;
+    GpuTimestampRing timestamps_;
+    std::uint32_t timestampSet_ = 0;
+    bool timestampsActive_ = false;
 };
 
 OpenGLDevice::OpenGLDevice() : impl_(new Impl()) {
@@ -356,6 +363,10 @@ OpenGLDevice::OpenGLDevice() : impl_(new Impl()) {
 OpenGLDevice::~OpenGLDevice() {
     // Destroy any live GL objects so a caller deleting the device mid-stream
     // won't leak GPU objects.
+    if (!impl_->timestampQueries_.empty()) {
+        glDeleteQueries(static_cast<GLsizei>(impl_->timestampQueries_.size()),
+                        impl_->timestampQueries_.data());
+    }
     impl_->buffers.forEach([](GlBuffer* b) { glDeleteBuffers(1, &b->id); });
     impl_->textures.forEach([](GlTexture* t) { glDeleteTextures(1, &t->id); });
     impl_->samplers.forEach([](GlSampler* s) { glDeleteSamplers(1, &s->id); });
@@ -890,6 +901,21 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
     impl_->boundPipeline_ = nullptr;
     impl_->boundIndexBuffer_ = 0;
     impl_->boundFramebuffer_ = nullptr;
+    impl_->timestampsActive_ = false;
+    {
+        std::uint32_t timestampCount = 0;
+        std::uint32_t timestampMask = 0;
+        cb.timestampUsage(timestampCount, timestampMask);
+        if (timestampCount != 0) {
+            if (impl_->timestampQueries_.empty()) {
+                impl_->timestampQueries_.resize(kGpuTimestampSets * kMaxGpuTimestamps);
+                glGenQueries(static_cast<GLsizei>(impl_->timestampQueries_.size()),
+                             impl_->timestampQueries_.data());
+            }
+            impl_->timestampSet_ = impl_->timestamps_.begin(timestampCount, timestampMask);
+            impl_->timestampsActive_ = true;
+        }
+    }
 
     for (const Command& command : cb.commands()) {
         switch (command.kind) {
@@ -984,6 +1010,15 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             impl_->boundFramebuffer_ = nullptr;
             break;
         }
+        case CommandKind::WriteTimestamp:
+            if (impl_->renderPassActive_ || command.timestampIndex >= kMaxGpuTimestamps) {
+                impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                return GfxError::BadDescriptor;
+            }
+            glQueryCounter(impl_->timestampQueries_[impl_->timestampSet_ * kMaxGpuTimestamps +
+                                                    command.timestampIndex],
+                           GL_TIMESTAMP);
+            break;
         case CommandKind::BindPipeline: {
             GlPipeline* p = impl_->pipelines.get(command.pipeline);
             if (p == nullptr) {
@@ -1337,6 +1372,31 @@ auto OpenGLDevice::stats() const -> DeviceStats {
 }
 
 auto OpenGLDevice::resetFrameStats() -> void { impl_->stats_ = DeviceStats{}; }
+
+auto OpenGLDevice::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_->timestamps_.lastSerial;
+}
+
+auto OpenGLDevice::latestGpuTimestamps() -> GpuTimestampFrame {
+    return impl_->timestamps_.poll([&](std::uint32_t set, const GpuTimestampRing::Set& info,
+                                       std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            if ((info.written & (1u << i)) == 0) continue;
+            GLuint available = 0;
+            glGetQueryObjectuiv(impl_->timestampQueries_[set * kMaxGpuTimestamps + i],
+                                GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == 0) return false;
+        }
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            if ((info.written & (1u << i)) == 0) continue;
+            GLuint64 value = 0;
+            glGetQueryObjectui64v(impl_->timestampQueries_[set * kMaxGpuTimestamps + i],
+                                  GL_QUERY_RESULT, &value);
+            ns[i] = value;
+        }
+        return true;
+    });
+}
 
 auto createOpenGLDevice() -> IDevice* {
     GLint major = 0;

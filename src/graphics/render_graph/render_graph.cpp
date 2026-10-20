@@ -301,7 +301,12 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
     }
     cb.begin();
     Array<ResourceState> nextStates = states_;
+    timestampsWritten_ = gpuTimestamps_ && !passes_.isEmpty() &&
+                         passes_.size() < kMaxGpuTimestamps;
+    std::uint32_t passIndex = 0;
     for (const PassDesc& p : passes_) {
+        if (timestampsWritten_) cb.writeTimestamp(passIndex);
+        ++passIndex;
         for (const PassResourceAccess& access : p.accesses) {
             const ResourceId id = access.resource;
             if (nextStates[id] == access.state) continue;
@@ -329,6 +334,7 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
             cb.endRenderPass();
         }
     }
+    if (timestampsWritten_) cb.writeTimestamp(passIndex);
     cb.end();
     const GfxError submitError = dev.submit(cb);
     if (submitError == GfxError::None) states_ = static_cast<Array<ResourceState>&&>(nextStates);

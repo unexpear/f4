@@ -372,6 +372,14 @@ struct Dx12Device::Impl {
     ObjectStore<DxSwapchainRecord, GpuSwapchainTag> swapchains;
     SwapchainHandle activeSwapchain{};
     std::vector<RetiredObject> retired;
+    // GPU timestamps: a kGpuTimestampSets x kMaxGpuTimestamps query heap and a
+    // readback buffer the submit resolves its set into; a set is ready once
+    // its submission fence completes.
+    ComPtr<ID3D12QueryHeap> timestampHeap;
+    ComPtr<ID3D12Resource> timestampReadback;
+    double timestampTickNs = 0.0;
+    bool timestampsFailed = false;
+    GpuTimestampRing timestamps;
 
     auto waitFor(std::uint64_t value) -> HRESULT {
         if (value == 0 || fence->GetCompletedValue() >= value) {
@@ -1483,6 +1491,15 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     if (SUCCEEDED(result)) result = impl_->commands->Reset(frame.allocator.get(), nullptr);
     if (FAILED(result)) return toGfxError(result);
     ID3D12GraphicsCommandList* list = impl_->commands.get();
+    bool timestampsActive = false;
+    std::uint32_t timestampSet = 0;
+    std::uint32_t timestampCount = 0;
+    std::uint32_t timestampMask = 0;
+    commandBuffer.timestampUsage(timestampCount, timestampMask);
+    if (timestampCount != 0 && ensureTimestamps()) {
+        timestampSet = impl_->timestamps.begin(timestampCount, timestampMask);
+        timestampsActive = true;
+    }
     std::array<ID3D12DescriptorHeap*, 2> shaderHeaps{};
     UINT shaderHeapCount = 0;
     if (frame.resources) shaderHeaps[shaderHeapCount++] = frame.resources.get();
@@ -1790,6 +1807,14 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             boundPipeline = nullptr;
             break;
         }
+        case CommandKind::WriteTimestamp:
+            if (rendering || command.timestampIndex >= kMaxGpuTimestamps) {
+                error = GfxError::BadDescriptor;
+            } else if (timestampsActive) {
+                list->EndQuery(impl_->timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                               timestampSet * kMaxGpuTimestamps + command.timestampIndex);
+            }
+            break;
         case CommandKind::EndRenderPass:
             if (!rendering) {
                 error = GfxError::BadDescriptor;
@@ -1958,6 +1983,23 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         if (error != GfxError::None) break;
     }
     if (rendering && error == GfxError::None) error = GfxError::BadDescriptor;
+    if (timestampsActive && error == GfxError::None) {
+        // Resolve each contiguous run of written indices into the readback.
+        std::uint32_t index = 0;
+        while (index < timestampCount) {
+            if ((timestampMask & (1u << index)) == 0) {
+                ++index;
+                continue;
+            }
+            std::uint32_t end = index;
+            while (end < timestampCount && (timestampMask & (1u << end)) != 0) ++end;
+            const UINT first = timestampSet * kMaxGpuTimestamps + index;
+            list->ResolveQueryData(impl_->timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, first,
+                                   end - index, impl_->timestampReadback.get(),
+                                   static_cast<UINT64>(first) * sizeof(std::uint64_t));
+            index = end;
+        }
+    }
     result = list->Close();
     if (error != GfxError::None) {
         rollbackStates();
@@ -1985,6 +2027,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     frame.fenceValue = ++impl_->lastSubmittedFence;
     result = impl_->queue->Signal(impl_->fence.get(), frame.fenceValue);
     if (FAILED(result)) return toGfxError(result);
+    if (timestampsActive) impl_->timestamps.sets[timestampSet].fenceValue = frame.fenceValue;
     impl_->frameIndex = (impl_->frameIndex + 1) % kFramesInFlight;
     if (FAILED(presentResult)) return toGfxError(presentResult);
     impl_->stats.drawCalls += delta.drawCalls;
@@ -1995,6 +2038,64 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     impl_->stats.primitives += delta.primitives;
     impl_->stats.vertices += delta.vertices;
     return GfxError::None;
+}
+
+auto Dx12Device::ensureTimestamps() -> bool {
+    if (impl_->timestampHeap) return true;
+    if (impl_->timestampsFailed) return false;
+    impl_->timestampsFailed = true;
+    UINT64 frequency = 0;
+    if (FAILED(impl_->queue->GetTimestampFrequency(&frequency)) || frequency == 0) return false;
+    D3D12_QUERY_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heapDesc.Count = kGpuTimestampSets * kMaxGpuTimestamps;
+    ComPtr<ID3D12QueryHeap> heap;
+    if (FAILED(impl_->device->CreateQueryHeap(&heapDesc, IID_ID3D12QueryHeap, heap.putVoid()))) {
+        return false;
+    }
+    const D3D12_HEAP_PROPERTIES properties = heapProperties(D3D12_HEAP_TYPE_READBACK);
+    const D3D12_RESOURCE_DESC desc =
+        bufferResourceDesc(sizeof(std::uint64_t) * kGpuTimestampSets * kMaxGpuTimestamps);
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(impl_->device->CreateCommittedResource(
+            &properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_ID3D12Resource, readback.putVoid()))) {
+        return false;
+    }
+    impl_->timestampHeap = static_cast<ComPtr<ID3D12QueryHeap>&&>(heap);
+    impl_->timestampReadback = static_cast<ComPtr<ID3D12Resource>&&>(readback);
+    impl_->timestampTickNs = 1.0e9 / static_cast<double>(frequency);
+    impl_->timestampsFailed = false;
+    return true;
+}
+
+auto Dx12Device::supportsGpuTimestamps() const -> bool {
+    return impl_ != nullptr && impl_->queue && !impl_->timestampsFailed;
+}
+
+auto Dx12Device::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_ != nullptr ? impl_->timestamps.lastSerial : 0;
+}
+
+auto Dx12Device::latestGpuTimestamps() -> GpuTimestampFrame {
+    if (impl_ == nullptr || !impl_->timestampReadback) return {};
+    const std::uint64_t completed = impl_->fence->GetCompletedValue();
+    return impl_->timestamps.poll([&](std::uint32_t set, const GpuTimestampRing::Set& info,
+                                      std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+        if (info.fenceValue == 0 || completed < info.fenceValue) return false;
+        const D3D12_RANGE range{set * kMaxGpuTimestamps * sizeof(std::uint64_t),
+                                (set + 1) * kMaxGpuTimestamps * sizeof(std::uint64_t)};
+        void* mapped = nullptr;
+        if (FAILED(impl_->timestampReadback->Map(0, &range, &mapped))) return false;
+        const auto* ticks = static_cast<const std::uint64_t*>(mapped) + set * kMaxGpuTimestamps;
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            ns[i] = static_cast<std::uint64_t>(static_cast<double>(ticks[i]) *
+                                               impl_->timestampTickNs);
+        }
+        const D3D12_RANGE written{0, 0};
+        impl_->timestampReadback->Unmap(0, &written);
+        return true;
+    });
 }
 
 auto Dx12Device::readTexture(TextureHandle handle, std::uint32_t mipLevel,

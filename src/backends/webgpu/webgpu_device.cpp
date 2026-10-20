@@ -1448,6 +1448,13 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             }
             break;
         }
+        case CommandKind::WriteTimestamp:
+            // No timer queries on WebGPU yet (timestamp-query is optional and
+            // only writes at pass boundaries); validate and ignore.
+            if (renderPass != nullptr || command.timestampIndex >= kMaxGpuTimestamps) {
+                error = GfxError::BadDescriptor;
+            }
+            break;
         case CommandKind::EndRenderPass:
             if (renderPass == nullptr) error = GfxError::BadDescriptor;
             else {

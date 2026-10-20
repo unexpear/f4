@@ -1048,6 +1048,12 @@ auto MetalDevice::submit(CommandBuffer& commandBuffer) -> GfxError {
                 boundResources.clear();
                 break;
             }
+            case CommandKind::WriteTimestamp:
+                // Timer queries are not wired on Metal (unverified backend).
+                if (render != nil || command.timestampIndex >= kMaxGpuTimestamps) {
+                    error = GfxError::BadDescriptor;
+                }
+                break;
             case CommandKind::EndRenderPass:
                 if (render == nil) error = GfxError::BadDescriptor;
                 else {
