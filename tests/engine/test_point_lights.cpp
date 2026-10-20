@@ -2227,7 +2227,9 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     // CPU vs GPU binning on the plain night scene, 1024 and 4096 lights, both
     // range models; interleaved rounds, median frame and render() CPU time.
     const auto binningRows = [&](gfx::IDevice& device, const char* backend) {
-        constexpr int rounds = 5;
+        // F4_BENCH_ROUNDS overrides the round count (odd numbers keep a true median).
+        const char* roundsEnv = std::getenv("F4_BENCH_ROUNDS");
+        const int rounds = roundsEnv != nullptr ? std::max(1, std::atoi(roundsEnv)) : 5;
         verbose = false;
         for (const bool scaled : {false, true}) {
             for (const std::uint32_t side : {32u, 64u}) {
