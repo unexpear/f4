@@ -23,8 +23,8 @@ namespace f4::engine {
 //   words[2]  clusters Y             words[6]  first light-index word
 //   words[3]  clusters Z (slices)    words[7]  total light-index count
 //   words[8]  slice scale (f32 bits) words[9]  slice bias (f32 bits)
-//   words[10..15] reserved (zero)
-//   light record (8 words): position.xyz, range, radiance.rgb, 0
+//   words[10..14] point-light shadows (see point_shadows.h), words[15] zero
+//   light record (8 words): position.xyz, range, radiance.rgb, shadow slot + 1
 //   cluster record (2 words): first index word, index count
 //   light index list: one light number per word
 //
@@ -61,6 +61,8 @@ struct ClusteredLightInput {
     math::Vec3 position{};
     math::Vec3 radiance{}; // color * intensity, linear
     float range = 0.0f;
+    // 0 = unshadowed, otherwise the point-shadow atlas slot + 1.
+    std::uint32_t shadowSlot = 0;
 };
 
 struct ClusteredLightStats {

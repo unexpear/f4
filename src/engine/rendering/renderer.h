@@ -7,6 +7,7 @@
 #include "core/resources/texture.h"
 #include "engine/cameras/camera.h"
 #include "engine/lighting/clustered_lights.h"
+#include "engine/lighting/point_shadows.h"
 #include "engine/rendering/gpu_mesh.h"
 #include "engine/rendering/material.h"
 #include "engine/rendering/mesh_renderer.h"
@@ -30,6 +31,12 @@ struct FrameStats {
     std::uint32_t pointLightReferences = 0;
     std::uint32_t pointLightReferencesDropped = 0;
     std::uint32_t maxPointLightsPerCluster = 0;
+    // Point-light shadows: lights given an atlas slot this frame and the face
+    // draws recorded for them.
+    std::uint32_t pointShadowLights = 0;
+    std::uint32_t pointShadowDraws = 0;
+    // Fullscreen bloom passes (prefilter, downsamples, upsamples, composite).
+    std::uint32_t bloomPasses = 0;
 };
 
 struct PbrRenderSettings {
@@ -46,6 +53,26 @@ struct PbrRenderSettings {
     bool batchingEnabled = true;
     bool pointLightsEnabled = true;
     ClusterGridConfig pointLightClusters{};
+
+    // HDR bloom. Off by default so existing frames stay byte-identical. When
+    // on, the PBR pass writes linear HDR (exposure applied) into an
+    // RGBA16_FLOAT target; a threshold + downsample/upsample chain blurs the
+    // bright parts and a composite adds bloom * intensity before the same ACES
+    // + sRGB encode. render() then needs the target extent.
+    bool bloomEnabled = false;
+    float bloomThreshold = 1.0f;   // exposed linear brightness where bloom starts
+    float bloomKnee = 0.5f;        // soft-threshold width
+    float bloomIntensity = 0.6f;   // composite weight of the summed blur levels
+    std::uint32_t bloomLevels = 5; // half-resolution steps, 1..8
+    math::Vec4 bloomClearColor{0.0f, 0.0f, 0.0f, 1.0f}; // linear HDR background
+
+    // Point-light shadows: up to `pointShadowBudget` lights flagged
+    // PointLight::castShadows (brightest/closest first) render cube shadows
+    // into one atlas; the rest stay unshadowed. See point_shadows.h.
+    bool pointShadowsEnabled = true;
+    std::uint32_t pointShadowBudget = 8;     // 0..16
+    std::uint32_t pointShadowTileSize = 256; // texels per cube face
+    float pointShadowBias = 0.02f;           // in units of the light's range
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -91,7 +118,9 @@ public:
     // declares a single "main" pass in the RenderGraph that writes to `fb`,
     // and executes it. Caller owns fb (window framebuffer) and swap.
     // `cameraEntity` must have a Camera component (orbit).
-    [[nodiscard]] auto render(gfx::FramebufferHandle fb, ecs::Entity cameraEntity, float aspect) -> gfx::GfxError;
+    // `extent` is the size of `fb`; it is only required with bloom enabled.
+    [[nodiscard]] auto render(gfx::FramebufferHandle fb, ecs::Entity cameraEntity, float aspect,
+                              gfx::Extent extent = {}) -> gfx::GfxError;
 
     // Records draws for the current queue into `cb` assuming `cb` is already
     // inside a `beginRenderPass(fb)` block. Useful for single-pass HUD composition.
@@ -123,8 +152,16 @@ private:
     };
 
     void recordShadow(gfx::CommandBuffer& cb);
+    void recordPointShadows(gfx::CommandBuffer& cb);
+    void gatherPointLights();
     [[nodiscard]] auto preparePointLights(const Camera& camera, float aspect)
         -> gfx::BufferHandle;
+    [[nodiscard]] auto preparePointShadows(const Camera& camera) -> gfx::GfxError;
+    [[nodiscard]] auto ensurePointShadowAtlas(std::uint32_t rows) -> gfx::GfxError;
+    void releasePointShadowAtlas();
+    [[nodiscard]] auto ensureBloomResources(gfx::Extent extent) -> gfx::GfxError;
+    void releaseBloomTargets();
+    void declareBloomPasses(std::uint32_t hdrImage, std::uint32_t target, gfx::Extent extent);
     void releaseInitializationResources();
     [[nodiscard]] auto resolveTexture(resources::TextureHandle texture,
                                       gfx::TextureHandle fallback) const
@@ -147,6 +184,8 @@ private:
     // Read-only storage buffer per frame holding the clustered point lights.
     DynamicBufferRing pointLightBuffers_;
     containers::Array<ClusteredLightInput> pointLightInputs_;
+    containers::Array<std::uint8_t> pointLightCastsShadow_;
+    bool pointLightsGathered_ = false;
     containers::Array<std::uint32_t> pointLightWords_;
     gfx::BufferHandle framePointLights_{};
     gfx::TextureHandle whiteTex_{};
@@ -171,6 +210,63 @@ private:
     math::Mat4 frameLightViewProj_ = math::Mat4::identity();
     bool frameShadowsActive_ = false;
     gfx::GfxError recordError_ = gfx::GfxError::None;
+
+    // Point-light shadow atlas and this frame's selection.
+    struct ShadowedPointLight {
+        math::Vec3 position{};
+        float range = 0.0f;
+    };
+    ConstantRing pointShadowConstants_;
+    // Shadow casters this frame, grouped into one instanced draw per
+    // (light, face, mesh/material) with the models in an instance stream.
+    struct PointShadowCaster {
+        resources::MeshHandle mesh{};
+        resources::MaterialHandle material{};
+        std::uint32_t subMesh = 0;
+        math::Mat4 model = math::Mat4::identity();
+        math::AABB bounds{};
+        bool cullable = false;
+    };
+    containers::Array<PointShadowCaster> pointShadowCasters_;
+    containers::Array<RenderInstance> pointShadowInstanceStaging_;
+    DynamicBufferRing pointShadowInstanceBuffers_;
+    containers::Array<PointShadowCandidate> shadowCandidates_;
+    containers::Array<std::uint32_t> shadowCandidateSources_;
+    containers::Array<std::uint32_t> shadowSelection_;
+    containers::Array<ShadowedPointLight> frameShadowedLights_;
+    containers::Array<math::Mat4> frameShadowFaces_;
+    gfx::TextureHandle pointShadowColorTex_{};
+    gfx::TextureHandle pointShadowDepthTex_{};
+    gfx::FramebufferHandle pointShadowFramebuffer_{};
+    std::uint32_t pointShadowTileSize_ = 0;
+    std::uint32_t pointShadowRows_ = 0;
+    std::uint32_t pointShadowDraws_ = 0;
+    bool framePointShadowsActive_ = false;
+
+    // HDR bloom chain.
+    struct BloomTarget {
+        gfx::TextureHandle texture{};
+        gfx::FramebufferHandle framebuffer{};
+        gfx::Extent extent{};
+    };
+    ConstantRing bloomConstants_;
+    containers::Array<BloomTarget> bloomDown_;
+    containers::Array<BloomTarget> bloomUp_;
+    gfx::TextureHandle hdrColorTex_{};
+    gfx::TextureHandle hdrDepthTex_{};
+    gfx::FramebufferHandle hdrFramebuffer_{};
+    gfx::Extent bloomExtent_{};
+    std::uint32_t bloomLevelCount_ = 0;
+    math::Vec4 hdrClearColor_{0.0f, 0.0f, 0.0f, 1.0f};
+    gfx::ShaderHandle bloomVs_{};
+    gfx::ShaderHandle bloomFs_{};
+    gfx::PipelineHandle bloomHdrPipeline_{};
+    gfx::PipelineHandle bloomCompositePipeline_{};
+    gfx::BufferHandle bloomTriangle_{};
+    gfx::SamplerHandle bloomSampler_{};
+    std::uint32_t bloomPasses_ = 0;
+    bool frameBloomActive_ = false;
+    gfx::TextureFormat recordColorFormat_ = gfx::TextureFormat::RGBA8_UNORM;
 
     bool inited_ = false;
 };

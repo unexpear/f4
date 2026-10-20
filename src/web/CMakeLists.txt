@@ -14,6 +14,14 @@ set(F4_SHADOW_WEBGPU_VERTEX
     "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/shadow_webgpu.vert.wgsl")
 set(F4_SHADOW_WEBGPU_FRAGMENT
     "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/shadow_webgpu.frag.wgsl")
+set(F4_POINT_SHADOW_WEBGPU_VERTEX
+    "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/point_shadow_webgpu.vert.wgsl")
+set(F4_POINT_SHADOW_WEBGPU_FRAGMENT
+    "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/point_shadow_webgpu.frag.wgsl")
+set(F4_BLOOM_WEBGPU_VERTEX
+    "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/post_bloom_webgpu.vert.wgsl")
+set(F4_BLOOM_WEBGPU_FRAGMENT
+    "${PROJECT_SOURCE_DIR}/src/engine/rendering/shaders/post_bloom_webgpu.frag.wgsl")
 set(F4_VALIDATION_PBR_WEBGPU_VERTEX
     "${PROJECT_SOURCE_DIR}/src/demos/shaders/validation_pbr_webgpu.vert.wgsl")
 set(F4_VALIDATION_PBR_WEBGPU_FRAGMENT
@@ -51,6 +59,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${F4_PBR_WEBGPU_FRAGMENT}"
     "${F4_SHADOW_WEBGPU_VERTEX}"
     "${F4_SHADOW_WEBGPU_FRAGMENT}"
+    "${F4_POINT_SHADOW_WEBGPU_VERTEX}"
+    "${F4_POINT_SHADOW_WEBGPU_FRAGMENT}"
+    "${F4_BLOOM_WEBGPU_VERTEX}"
+    "${F4_BLOOM_WEBGPU_FRAGMENT}"
     "${F4_VALIDATION_PBR_WEBGPU_VERTEX}"
     "${F4_VALIDATION_PBR_WEBGPU_FRAGMENT}"
     "${F4_VALIDATION_FULLSCREEN_WEBGPU_VERTEX}"
@@ -72,6 +84,10 @@ file(READ "${F4_PBR_WEBGPU_INSTANCED_VERTEX}" F4_PBR_WEBGPU_INSTANCED_VERTEX_WGS
 file(READ "${F4_PBR_WEBGPU_FRAGMENT}" F4_PBR_WEBGPU_FRAGMENT_WGSL)
 file(READ "${F4_SHADOW_WEBGPU_VERTEX}" F4_SHADOW_WEBGPU_VERTEX_WGSL)
 file(READ "${F4_SHADOW_WEBGPU_FRAGMENT}" F4_SHADOW_WEBGPU_FRAGMENT_WGSL)
+file(READ "${F4_POINT_SHADOW_WEBGPU_VERTEX}" F4_POINT_SHADOW_WEBGPU_VERTEX_WGSL)
+file(READ "${F4_POINT_SHADOW_WEBGPU_FRAGMENT}" F4_POINT_SHADOW_WEBGPU_FRAGMENT_WGSL)
+file(READ "${F4_BLOOM_WEBGPU_VERTEX}" F4_BLOOM_WEBGPU_VERTEX_WGSL)
+file(READ "${F4_BLOOM_WEBGPU_FRAGMENT}" F4_BLOOM_WEBGPU_FRAGMENT_WGSL)
 file(READ "${F4_VALIDATION_PBR_WEBGPU_VERTEX}" F4_VALIDATION_PBR_WEBGPU_VERTEX_WGSL)
 file(READ "${F4_VALIDATION_PBR_WEBGPU_FRAGMENT}" F4_VALIDATION_PBR_WEBGPU_FRAGMENT_WGSL)
 file(READ "${F4_VALIDATION_FULLSCREEN_WEBGPU_VERTEX}" F4_VALIDATION_FULLSCREEN_WEBGPU_VERTEX_WGSL)
@@ -100,6 +116,8 @@ add_executable(f4_webgpu_app
     ../demos/demo_render_validation.cpp
     ../demos/demo_terrain.cpp
     ../engine/lighting/clustered_lights.cpp
+    ../engine/lighting/point_shadows.cpp
+    ../engine/rendering/effect_shaders.cpp
     ../engine/rendering/gpu_mesh.cpp
     ../engine/rendering/material.cpp
     ../engine/rendering/render_queue.cpp
@@ -127,6 +145,9 @@ target_link_options(f4_webgpu_app PRIVATE
     "--use-port=emdawnwebgpu:cpp_bindings=false"
     "--use-port=sdl2"
     "-sASYNCIFY=1"
+    # Renderer validation waits on GPU readbacks from deep (unoptimized in
+    # debug) call stacks; the default 4 KiB unwind buffer is too small.
+    "-sASYNCIFY_STACK_SIZE=65536"
     "-sALLOW_MEMORY_GROWTH=1"
     "-sENVIRONMENT=web"
     "--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/webgpu_shell.html")

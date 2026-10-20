@@ -182,7 +182,7 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
         record[4] = floatBits(std::max(light.radiance.x, 0.0f));
         record[5] = floatBits(std::max(light.radiance.y, 0.0f));
         record[6] = floatBits(std::max(light.radiance.z, 0.0f));
-        record[7] = 0;
+        record[7] = light.shadowSlot;
     }
 
     std::uint32_t cursor = indexOffset;

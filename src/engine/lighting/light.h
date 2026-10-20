@@ -17,12 +17,15 @@ struct DirectionalLight {
 // the entity's WorldMatrix when it has one. Radiance is color * intensity with
 // windowed inverse-square falloff that reaches exactly zero at `range`:
 //   window(d) = clamp(1 - (d / range)^4, 0, 1)^2,  attenuation = window / (d^2 + 1)
-// Point lights do not cast shadows.
+// `castShadows` makes the light a candidate for the renderer's small
+// point-shadow budget (PbrRenderSettings::pointShadowBudget); the brightest,
+// closest flagged lights get cube shadows, the rest stay unshadowed.
 struct PointLight {
     math::Vec3 position{0.f, 0.f, 0.f};
     math::Vec3 color{1.f, 1.f, 1.f};
     float intensity = 1.f;
     float range = 10.f;
+    bool castShadows = false;
 };
 
 } // namespace f4::engine

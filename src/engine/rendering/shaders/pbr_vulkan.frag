@@ -33,6 +33,9 @@ layout(set = 0, binding = 26) uniform sampler uSmp6;
 layout(set = 0, binding = 31, std430) readonly buffer PointLightData {
     uint pointLightWords[];
 };
+// Point-shadow atlas, slot 8: bindings 8 * 4 + 1 = 33 and 8 * 4 + 2 = 34.
+layout(set = 0, binding = 33) uniform texture2D uTex8;
+layout(set = 0, binding = 34) uniform sampler uSmp8;
 
 layout(location = 0) in vec3 vWorldPosition;
 layout(location = 1) in vec3 vWorldNormal;
@@ -128,6 +131,48 @@ float pointLightFloat(uint word) {
     return uintBitsToFloat(pointLightWords[word]);
 }
 
+// Point-light shadows: see engine/lighting/point_shadows.h for the atlas and
+// the clustered-buffer words this reads.
+vec4 pointLightVec4(uint word) {
+    return vec4(pointLightFloat(word), pointLightFloat(word + 1u),
+                pointLightFloat(word + 2u), pointLightFloat(word + 3u));
+}
+
+float pointShadowVisibility(uint shadowSlot, vec3 worldPosition, vec3 toFragment,
+                            float normalizedDistance, float nDotL) {
+    uint matrixBase = pointLightWords[10];
+    if (matrixBase == 0u) return 1.0;
+    vec3 a = abs(toFragment);
+    uint face = a.x >= a.y && a.x >= a.z ? (toFragment.x >= 0.0 ? 0u : 1u)
+              : (a.y >= a.z ? (toFragment.y >= 0.0 ? 2u : 3u)
+                            : (toFragment.z >= 0.0 ? 4u : 5u));
+    uint base = matrixBase + ((shadowSlot - 1u) * 6u + face) * 16u;
+    vec4 clip = pointLightVec4(base) * worldPosition.x +
+                pointLightVec4(base + 4u) * worldPosition.y +
+                pointLightVec4(base + 8u) * worldPosition.z + pointLightVec4(base + 12u);
+    if (clip.w <= 0.0) return 1.0;
+    vec2 local = clip.xy / clip.w;
+    float rows = float(pointLightWords[12]);
+    float texel = pointLightFloat(14u);
+    float limit = 1.0 - 1.5 * texel;
+    float bias = pointLightFloat(13u) * (1.0 + 2.0 * (1.0 - nDotL));
+    float column = float(face);
+    float row = float(shadowSlot - 1u);
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 tap = clamp(local + vec2(float(x), float(y)) * texel, vec2(-limit),
+                             vec2(limit));
+            vec2 atlas = vec2((tap.x + 1.0 + 2.0 * column) / 6.0 - 1.0,
+                              (tap.y + 1.0 + 2.0 * row) / rows - 1.0);
+            vec2 uv = vec2(atlas.x * 0.5 + 0.5, 0.5 - atlas.y * 0.5);
+            float stored = textureLod(sampler2D(uTex8, uSmp8), uv, 0.0).r;
+            visibility += normalizedDistance - bias <= stored ? 1.0 : 0.0;
+        }
+    }
+    return visibility / 9.0;
+}
+
 // Clustered point lights: see engine/lighting/clustered_lights.h for the word
 // layout and the shared cluster lookup.
 vec3 pointLightsDirect(vec3 n, vec3 v, vec3 baseColor, float metallic, float roughness,
@@ -166,6 +211,12 @@ vec3 pointLightsDirect(vec3 n, vec3 v, vec3 baseColor, float metallic, float rou
         vec3 l = lightDistance > 1.0e-5 ? toLight / lightDistance : n;
         float nDotL = max(dot(n, l), 0.0);
         if (nDotL <= 0.0) continue;
+        uint shadowSlot = pointLightWords[record + 7u];
+        float shadow = shadowSlot != 0u
+                           ? pointShadowVisibility(shadowSlot, vWorldPosition, -toLight,
+                                                   lightDistance / range, nDotL)
+                           : 1.0;
+        if (shadow <= 0.0) continue;
         vec3 radiance = vec3(pointLightFloat(record + 4u), pointLightFloat(record + 5u),
                              pointLightFloat(record + 6u));
         vec3 h = normalize(v + l);
@@ -180,7 +231,7 @@ vec3 pointLightsDirect(vec3 n, vec3 v, vec3 baseColor, float metallic, float rou
         float ratio = distanceSq / rangeSq;
         float window = clamp(1.0 - ratio * ratio, 0.0, 1.0);
         float attenuation = window * window / (distanceSq + 1.0);
-        sum += (diffuse + specular) * radiance * (attenuation * nDotL);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL * shadow);
     }
     return sum;
 }
@@ -257,5 +308,9 @@ void main() {
         color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao * ambientFlags.x +
                 emissive;
     }
-    outColor = vec4(linearToSrgb(acesToneMap(color * cameraExposure.w)), base.a);
+    vec3 exposed = color * cameraExposure.w;
+    // ambientFlags.z: write linear HDR for the bloom chain, which tone maps at
+    // composite time; otherwise tone map + encode here exactly as before.
+    outColor = ambientFlags.z > 0.5 ? vec4(exposed, base.a)
+                                    : vec4(linearToSrgb(acesToneMap(exposed)), base.a);
 }

@@ -29,6 +29,9 @@ Texture2D<float> shadowTexture : register(t6, space0);
 SamplerState shadowSampler : register(s6, space0);
 // Storage slot 7 is a raw SRV after the seven PBR textures (t0..t6).
 ByteAddressBuffer pointLightWords : register(t7, space0);
+// Point-shadow atlas at slot 8, past the clustered light SRV.
+Texture2D<float> pointShadowTexture : register(t8, space0);
+SamplerState pointShadowSampler : register(s8, space0);
 
 static const float PI = 3.14159265358979323846;
 
@@ -187,6 +190,55 @@ float pointLightFloat(uint word) {
     return asfloat(pointLightWords.Load(word * 4u));
 }
 
+// Point-light shadows: see engine/lighting/point_shadows.h for the atlas and
+// the clustered-buffer words this reads.
+float4 pointLightVec4(uint word) {
+    return float4(pointLightFloat(word), pointLightFloat(word + 1u),
+                  pointLightFloat(word + 2u), pointLightFloat(word + 3u));
+}
+
+float pointShadowVisibility(uint shadowSlot, float3 worldPosition, float3 toFragment,
+                            float normalizedDistance, float nDotL) {
+    const uint matrixBase = pointLightWord(10u);
+    if (matrixBase == 0u) return 1.0;
+    const float3 a = abs(toFragment);
+    uint face;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = toFragment.x >= 0.0 ? 0u : 1u;
+    } else if (a.y >= a.z) {
+        face = toFragment.y >= 0.0 ? 2u : 3u;
+    } else {
+        face = toFragment.z >= 0.0 ? 4u : 5u;
+    }
+    const uint base = matrixBase + ((shadowSlot - 1u) * 6u + face) * 16u;
+    const float4 clip = pointLightVec4(base) * worldPosition.x +
+                        pointLightVec4(base + 4u) * worldPosition.y +
+                        pointLightVec4(base + 8u) * worldPosition.z +
+                        pointLightVec4(base + 12u);
+    if (clip.w <= 0.0) return 1.0;
+    const float2 local = clip.xy / clip.w;
+    const float rows = (float)pointLightWord(12u);
+    const float texel = pointLightFloat(14u);
+    const float limit = 1.0 - 1.5 * texel;
+    const float bias = pointLightFloat(13u) * (1.0 + 2.0 * (1.0 - nDotL));
+    const float column = (float)face;
+    const float row = (float)(shadowSlot - 1u);
+    float visibility = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; ++y) {
+        [unroll]
+        for (int x = -1; x <= 1; ++x) {
+            const float2 tap = clamp(local + float2(x, y) * texel, -limit, limit);
+            const float2 atlas = float2((tap.x + 1.0 + 2.0 * column) / 6.0 - 1.0,
+                                        (tap.y + 1.0 + 2.0 * row) / rows - 1.0);
+            const float2 uv = float2(atlas.x * 0.5 + 0.5, 0.5 - atlas.y * 0.5);
+            const float stored = pointShadowTexture.SampleLevel(pointShadowSampler, uv, 0.0);
+            visibility += normalizedDistance - bias <= stored ? 1.0 : 0.0;
+        }
+    }
+    return visibility / 9.0;
+}
+
 // Clustered point lights: see engine/lighting/clustered_lights.h for the word
 // layout and the shared cluster lookup.
 float3 pointLightsDirect(float3 worldPosition, float3 n, float3 v, float3 baseColor,
@@ -226,6 +278,12 @@ float3 pointLightsDirect(float3 worldPosition, float3 n, float3 v, float3 baseCo
         const float3 l = lightDistance > 1.0e-5 ? toLight / lightDistance : n;
         const float nDotL = max(dot(n, l), 0.0);
         if (nDotL <= 0.0) continue;
+        const uint shadowSlot = pointLightWord(record + 7u);
+        const float shadow = shadowSlot != 0u
+                                 ? pointShadowVisibility(shadowSlot, worldPosition, -toLight,
+                                                         lightDistance / range, nDotL)
+                                 : 1.0;
+        if (shadow <= 0.0) continue;
         const float3 radiance = float3(pointLightFloat(record + 4u),
                                        pointLightFloat(record + 5u),
                                        pointLightFloat(record + 6u));
@@ -241,7 +299,7 @@ float3 pointLightsDirect(float3 worldPosition, float3 n, float3 v, float3 baseCo
         const float ratio = distanceSq / rangeSq;
         const float window = saturate(1.0 - ratio * ratio);
         const float attenuation = window * window / (distanceSq + 1.0);
-        sum += (diffuse + specular) * radiance * (attenuation * nDotL);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL * shadow);
     }
     return sum;
 }
@@ -322,5 +380,9 @@ float4 PSMain(VertexOutput input, bool frontFacing : SV_IsFrontFace) : SV_Target
         color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao * ambientFlags.x +
                 emissive;
     }
-    return float4(linearToSrgb(acesToneMap(color * cameraExposure.w)), base.a);
+    const float3 exposed = color * cameraExposure.w;
+    // ambientFlags.z: write linear HDR for the bloom chain, which tone maps at
+    // composite time; otherwise tone map + encode here exactly as before.
+    if (ambientFlags.z > 0.5) return float4(exposed, base.a);
+    return float4(linearToSrgb(acesToneMap(exposed)), base.a);
 }

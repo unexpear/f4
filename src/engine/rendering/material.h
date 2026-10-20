@@ -73,6 +73,9 @@ struct StandardMaterialDesc {
 struct MaterialPipelineVariant {
     std::uint64_t vertexLayoutHash = 0;
     gfx::VertexInputLayout vertexInput;
+    // Colour target format: RGBA8 for the tone-mapped pass, RGBA16_FLOAT when
+    // the PBR pass writes linear HDR for bloom.
+    gfx::TextureFormat colorFormat = gfx::TextureFormat::RGBA8_UNORM;
     gfx::PipelineHandle pipeline{};
 };
 
@@ -120,15 +123,25 @@ public:
     // layout. Renderer uses the mesh-aware overload below.
     auto ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle h) -> gfx::GfxError;
     auto ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle h,
-                        const gfx::VertexInputLayout& vertexInput) -> gfx::GfxError;
+                        const gfx::VertexInputLayout& vertexInput,
+                        gfx::TextureFormat colorFormat = gfx::TextureFormat::RGBA8_UNORM)
+        -> gfx::GfxError;
     [[nodiscard]] auto pipelineFor(resources::MaterialHandle h,
-                                   const gfx::VertexInputLayout& vertexInput) const
+                                   const gfx::VertexInputLayout& vertexInput,
+                                   gfx::TextureFormat colorFormat =
+                                       gfx::TextureFormat::RGBA8_UNORM) const
         -> gfx::PipelineHandle;
 
     // Shadow pipelines share one shader pair and vary only by mesh layout.
     auto ensureShadowPipeline(gfx::IDevice& dev,
                               const gfx::VertexInputLayout& vertexInput) -> gfx::GfxError;
     [[nodiscard]] auto shadowPipelineFor(const gfx::VertexInputLayout& vertexInput) const
+        -> gfx::PipelineHandle;
+    // Point-light shadow faces (see engine/lighting/point_shadows.h): same
+    // position/UV inputs as the sun shadow, distance-to-light output.
+    auto ensurePointShadowPipeline(gfx::IDevice& dev,
+                                   const gfx::VertexInputLayout& vertexInput) -> gfx::GfxError;
+    [[nodiscard]] auto pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput) const
         -> gfx::PipelineHandle;
 
     auto destroy(resources::MaterialHandle h, gfx::IDevice& dev) -> gfx::GfxError;
@@ -152,6 +165,9 @@ private:
     gfx::ShaderHandle shadowVs_{};
     gfx::ShaderHandle shadowFs_{};
     Array<MaterialPipelineVariant> shadowVariants_;
+    gfx::ShaderHandle pointShadowVs_{};
+    gfx::ShaderHandle pointShadowFs_{};
+    Array<MaterialPipelineVariant> pointShadowVariants_;
 };
 
 } // namespace f4::engine
