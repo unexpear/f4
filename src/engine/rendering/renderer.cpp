@@ -2000,6 +2000,21 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     }
     // With every shadowed light cached the atlas pass is skipped entirely and
     // the main pass samples last frame's tiles.
+    if (framePointShadowsActive_ && framePointShadowsDirty_ && !framePointShadowsFullClear_) {
+        // A partial redraw loads the cached tiles. Start from the state last
+        // frame left the atlas in (sampled by the main pass) so the barrier
+        // into the atlas pass orders after those reads and keeps the texels.
+        gfx::PassDesc keepPass;
+        keepPass.name = containers::String("point-shadow-atlas-keep");
+        keepPass.reads.push(pointShadowImage);
+        keepPass.accesses.push({
+            pointShadowImage,
+            {gfx::PipelineStageMask::FragmentShader,
+             gfx::ResourceAccessMask::ShaderRead,
+             gfx::TextureLayout::ShaderRead},
+        });
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(keepPass));
+    }
     if (framePointShadowsActive_ && framePointShadowsDirty_) {
         const auto atlasTarget = graph_.importFramebuffer(
             containers::String("point-shadow-target"),
@@ -2011,7 +2026,9 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         atlasPass.accesses.push({
             pointShadowImage,
             {gfx::PipelineStageMask::ColorAttachment,
-             gfx::ResourceAccessMask::ColorWrite,
+             framePointShadowsFullClear_
+                 ? gfx::ResourceAccessMask::ColorWrite
+                 : gfx::ResourceAccessMask::ColorRead | gfx::ResourceAccessMask::ColorWrite,
              gfx::TextureLayout::ColorAttachment},
         });
         atlasPass.record = [this](gfx::CommandBuffer& commandBuffer) {

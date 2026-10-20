@@ -560,6 +560,9 @@ auto MaterialCache::ensurePointShadowPipeline(gfx::IDevice& dev,
     pipeline.depthStencil.depthWriteEnable = !tileReset;
     pipeline.depthStencil.depthCompare =
         tileReset ? gfx::CompareOp::Always : gfx::CompareOp::Less;
+    // The reset variant neither tests nor writes depth but still renders into
+    // the atlas framebuffer, which carries the depth attachment.
+    pipeline.depthStencil.depthAttachmentEnable = true;
     pipeline.depthStencil.format = gfx::TextureFormat::Depth32F;
     gfx::ColorAttachmentState color;
     color.format = gfx::TextureFormat::R16_FLOAT;
