@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -653,6 +655,108 @@ TEST_CASE("Point-light shadows: the renderer assigns atlas slots and writes face
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
 }
 
+TEST_CASE("Point-light shadows: atlas slots stay with their light across frames") {
+    constexpr std::uint64_t kFree = engine::kPointShadowFreeSlot;
+    containers::Array<std::uint64_t> owners;
+    owners.resize(4);
+    std::fill(owners.begin(), owners.end(), kFree);
+    containers::Array<std::uint32_t> slots;
+
+    const std::vector<std::uint64_t> first = {10, 20, 30};
+    engine::assignStablePointShadowSlots(first, owners, slots);
+    REQUIRE(slots.size() == 3);
+    CHECK(slots[0] == 0);
+    CHECK(slots[1] == 1);
+    CHECK(slots[2] == 2);
+    CHECK(owners[3] == kFree);
+
+    // 20 drops out, 40 is new and ranked first: 10 and 30 keep their slots,
+    // 40 takes the lowest free one.
+    const std::vector<std::uint64_t> second = {40, 30, 10};
+    engine::assignStablePointShadowSlots(second, owners, slots);
+    CHECK(slots[0] == 1);
+    CHECK(slots[1] == 2);
+    CHECK(slots[2] == 0);
+    CHECK(owners[0] == 10);
+    CHECK(owners[1] == 40);
+    CHECK(owners[2] == 30);
+    CHECK(owners[3] == kFree);
+
+    // Everything leaves: every slot is freed.
+    engine::assignStablePointShadowSlots({}, owners, slots);
+    CHECK(slots.size() == 0);
+    for (const std::uint64_t owner : owners) CHECK(owner == kFree);
+}
+
+TEST_CASE("Point-light shadows: unchanged lights and casters reuse their tiles") {
+    gfx::NullDevice device;
+    ecs::Registry registry(4096);
+    engine::Renderer renderer(registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    NightSceneOptions options;
+    options.lightsPerSide = 4;
+    options.extent = 6.0f;
+    options.range = 4.0f;
+    options.castShadows = true;
+    options.shadowBudget = 3;
+    options.pillarsPerSide = 4;
+    const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
+    gfx::FramebufferDesc framebufferDesc;
+    framebufferDesc.extent = {64, 64};
+    framebufferDesc.attachments.push(gfx::AttachmentDesc{});
+    auto framebuffer = device.createFramebuffer(framebufferDesc);
+    REQUIRE(framebuffer.hasValue());
+    const auto render = [&] {
+        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, 1.0f) == gfx::GfxError::None);
+        return renderer.stats();
+    };
+
+    const engine::FrameStats first = render();
+    CHECK(first.pointShadowLights == 3);
+    CHECK(first.pointShadowLightsRedrawn == 3);
+    CHECK(first.pointShadowDraws > 0);
+    const std::vector<std::uint32_t> firstWords(renderer.pointLightWords().begin(),
+                                                renderer.pointLightWords().end());
+
+    const engine::FrameStats second = render();
+    CHECK(second.pointShadowLights == 3);
+    CHECK(second.pointShadowLightsRedrawn == 0);
+    CHECK(second.pointShadowDraws == 0);
+    // Same slots, same matrices: the light buffer is unchanged.
+    const std::vector<std::uint32_t> secondWords(renderer.pointLightWords().begin(),
+                                                 renderer.pointLightWords().end());
+    CHECK(firstWords == secondWords);
+
+    // A caster moves: only lights whose sphere reaches it (before or after)
+    // are redrawn.
+    ecs::Entity pillar{};
+    for (auto [entity, meshRenderer] : ecs::View<engine::MeshRenderer>(registry)) {
+        if (meshRenderer.castShadows) pillar = entity;
+    }
+    REQUIRE(registry.get<ecs::WorldMatrix>(pillar) != nullptr);
+    registry.get<ecs::WorldMatrix>(pillar)->matrix.col[3].y += 0.1f;
+    const engine::FrameStats moved = render();
+    CHECK(moved.pointShadowLightsRedrawn > 0);
+    CHECK(moved.pointShadowLightsRedrawn < 3);
+    const engine::FrameStats settled = render();
+    CHECK(settled.pointShadowLightsRedrawn == 0);
+
+    // An uncached frame leaves nothing valid to reuse.
+    renderer.pbrSettings().pointShadowCaching = false;
+    const engine::FrameStats uncached = render();
+    CHECK(uncached.pointShadowLightsRedrawn == 3);
+    renderer.pbrSettings().pointShadowCaching = true;
+    const engine::FrameStats recached = render();
+    CHECK(recached.pointShadowLightsRedrawn == 3); // nothing valid after an uncached frame
+    CHECK(render().pointShadowLightsRedrawn == 0);
+
+    // A new tile size rebuilds the atlas and every slot.
+    renderer.pbrSettings().pointShadowTileSize = 128;
+    CHECK(render().pointShadowLightsRedrawn == 3);
+    CHECK(render().pointShadowLightsRedrawn == 0);
+    CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
+}
+
 TEST_CASE("Bloom: the renderer requires an extent and declares the full mip chain") {
     gfx::NullDevice device;
     ecs::Registry registry(4096);
@@ -1254,6 +1358,303 @@ void writeFixture(const std::string& path, const Capture& bytes) {
 
 } // namespace
 
+namespace {
+
+// Offscreen colour + depth target shared by the multi-frame tests below.
+struct NightTarget {
+    gfx::IDevice& device;
+    std::uint32_t width;
+    std::uint32_t height;
+    gfx::TextureHandle color{};
+    gfx::TextureHandle depth{};
+    gfx::FramebufferHandle framebuffer{};
+
+    NightTarget(gfx::IDevice& owner, std::uint32_t w, std::uint32_t h)
+        : device(owner), width(w), height(h) {
+        gfx::TextureDesc colorDesc;
+        colorDesc.width = width;
+        colorDesc.height = height;
+        colorDesc.hasOptimizedClear = true;
+        colorDesc.optimizedClear.color[3] = 1.0f;
+        auto colorResult = device.createTexture(colorDesc);
+        REQUIRE(colorResult.hasValue());
+        color = colorResult.value();
+        gfx::TextureDesc depthDesc;
+        depthDesc.width = width;
+        depthDesc.height = height;
+        depthDesc.format = gfx::TextureFormat::Depth32F;
+        depthDesc.hasOptimizedClear = true;
+        depthDesc.optimizedClear.depth = 1.0f;
+        auto depthResult = device.createTexture(depthDesc);
+        REQUIRE(depthResult.hasValue());
+        depth = depthResult.value();
+        gfx::FramebufferDesc desc;
+        desc.extent = {width, height};
+        gfx::AttachmentDesc colorAttachment;
+        colorAttachment.texture = color;
+        colorAttachment.clearOnLoad = true;
+        colorAttachment.clear.color[3] = 1.0f;
+        desc.attachments.push(colorAttachment);
+        gfx::AttachmentDesc depthAttachment;
+        depthAttachment.type = gfx::AttachmentType::Depth;
+        depthAttachment.texture = depth;
+        depthAttachment.clearOnLoad = true;
+        desc.attachments.push(depthAttachment);
+        auto framebufferResult = device.createFramebuffer(desc);
+        REQUIRE(framebufferResult.hasValue());
+        framebuffer = framebufferResult.value();
+    }
+    ~NightTarget() {
+        device.waitIdle();
+        (void)device.destroyFramebuffer(framebuffer);
+        (void)device.destroyTexture(depth);
+        (void)device.destroyTexture(color);
+    }
+    NightTarget(const NightTarget&) = delete;
+    NightTarget& operator=(const NightTarget&) = delete;
+
+    template <typename Reader>
+    [[nodiscard]] auto render(engine::Renderer& renderer, ecs::Entity camera, Reader& reader)
+        -> Capture {
+        REQUIRE(renderer.render(framebuffer, camera,
+                                static_cast<float>(width) / static_cast<float>(height),
+                                gfx::Extent{width, height}) == gfx::GfxError::None);
+        device.waitIdle();
+        Capture pixels(static_cast<std::size_t>(width) * height * 4u, 0);
+        REQUIRE(reader(color, std::as_writable_bytes(std::span(pixels))) == gfx::GfxError::None);
+        if (device.backend() == gfx::Backend::OpenGL) {
+            const std::size_t row = static_cast<std::size_t>(width) * 4u;
+            for (std::uint32_t y = 0; y < height / 2; ++y) {
+                std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
+                                 pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
+                                 pixels.begin() +
+                                     static_cast<std::ptrdiff_t>((height - 1 - y) * row));
+            }
+        }
+        return pixels;
+    }
+};
+
+// One night scene rendered by its own renderer; the cache test keeps two of
+// them in lock step, one with the shadow cache and one without.
+struct NightWorld {
+    ecs::Registry registry{4096};
+    engine::Renderer renderer;
+    ecs::Entity camera{};
+    std::vector<ecs::Entity> lights;
+    std::vector<ecs::Entity> casters;
+
+    NightWorld(gfx::IDevice& device, const NightSceneOptions& options) : renderer(registry, device) {
+        REQUIRE(renderer.init() == gfx::GfxError::None);
+        camera = buildNightScene(renderer, registry, options);
+        for (auto [entity, light] : ecs::View<engine::PointLight>(registry)) {
+            (void)light;
+            lights.push_back(entity);
+        }
+        for (auto [entity, meshRenderer] : ecs::View<engine::MeshRenderer>(registry)) {
+            if (meshRenderer.castShadows) casters.push_back(entity);
+        }
+    }
+};
+
+struct CacheFrame {
+    const char* step;
+    Capture cached;
+    Capture uncached;
+    engine::FrameStats cachedStats{};
+    engine::FrameStats uncachedStats{};
+};
+
+[[nodiscard]] auto shadowCacheOptions() -> NightSceneOptions {
+    NightSceneOptions options = shadowSceneOptions();
+    options.castShadows = true;
+    options.shadowBudget = 4; // 16 flagged lights compete for 4 slots
+    return options;
+}
+
+struct SequenceFrame {
+    const char* step;
+    Capture pixels;
+    engine::FrameStats stats{};
+};
+
+// Renders the same scripted sequence (static frames, a caster moving, a
+// light moving, the camera moving so the shadowed selection changes, every
+// caster moving) with the shadow cache on or off. Runs one renderer at a
+// time: each renderer's constant rings take ~600 of a device's 1024 buffer
+// slots, so two cannot coexist on one device.
+template <typename Reader>
+[[nodiscard]] auto captureShadowSequence(gfx::IDevice& device, Reader& reader, bool caching)
+    -> std::vector<SequenceFrame> {
+    const NightSceneOptions options = shadowCacheOptions();
+    NightTarget target(device, kEffectWidth, kEffectHeight);
+    auto worldPointer = std::make_unique<NightWorld>(device, options);
+    NightWorld& world = *worldPointer;
+    world.renderer.pbrSettings().pointShadowCaching = caching;
+
+    // The light closest to the camera's view of the scene centre is always
+    // among the shadowed ones (the selection prefers bright, near lights);
+    // then a caster near that light.
+    std::size_t nearLight = 0;
+    float nearest = std::numeric_limits<float>::max();
+    for (std::size_t i = 0; i < world.lights.size(); ++i) {
+        const math::Vec3 p = world.registry.get<engine::PointLight>(world.lights[i])->position;
+        const float d = math::length(p - math::Vec3(0.0f, 7.0f, 11.0f));
+        if (d < nearest) {
+            nearest = d;
+            nearLight = i;
+        }
+    }
+    const math::Vec3 nearPosition =
+        world.registry.get<engine::PointLight>(world.lights[nearLight])->position;
+    std::size_t nearCaster = 0;
+    nearest = std::numeric_limits<float>::max();
+    for (std::size_t i = 0; i < world.casters.size(); ++i) {
+        const math::Vec3 p =
+            world.registry.get<ecs::WorldMatrix>(world.casters[i])->matrix.col[3].xyz();
+        const float d = math::length(p - nearPosition);
+        if (d < nearest) {
+            nearest = d;
+            nearCaster = i;
+        }
+    }
+
+    std::vector<SequenceFrame> frames;
+    const auto frame = [&](const char* step) {
+        SequenceFrame result;
+        result.step = step;
+        result.pixels = target.render(world.renderer, world.camera, reader);
+        result.stats = world.renderer.stats();
+        frames.push_back(static_cast<SequenceFrame&&>(result));
+    };
+    frame("first frame");
+    frame("static");
+    world.registry.get<ecs::WorldMatrix>(world.casters[nearCaster])->matrix.col[3].x += 0.35f;
+    frame("one caster moved");
+    frame("static after caster move");
+    world.registry.get<engine::PointLight>(world.lights[nearLight])->position.x += 0.25f;
+    frame("one light moved");
+    world.registry.get<engine::Camera>(world.camera)->eye.x += 4.0f;
+    frame("camera moved (selection changes)");
+    frame("static after camera move");
+    for (const ecs::Entity caster : world.casters) {
+        world.registry.get<ecs::WorldMatrix>(caster)->matrix.col[3].z -= 0.2f;
+    }
+    frame("every caster moved");
+    worldPointer.reset();
+    return frames;
+}
+
+template <typename Reader>
+[[nodiscard]] auto captureShadowCacheSequence(gfx::IDevice& device, Reader&& reader)
+    -> std::vector<CacheFrame> {
+    const auto cached = captureShadowSequence(device, reader, true);
+    const auto uncached = captureShadowSequence(device, reader, false);
+    REQUIRE(cached.size() == uncached.size());
+    std::vector<CacheFrame> frames;
+    for (std::size_t i = 0; i < cached.size(); ++i) {
+        CacheFrame frame;
+        frame.step = cached[i].step;
+        frame.cached = cached[i].pixels;
+        frame.uncached = uncached[i].pixels;
+        frame.cachedStats = cached[i].stats;
+        frame.uncachedStats = uncached[i].stats;
+        frames.push_back(static_cast<CacheFrame&&>(frame));
+    }
+    return frames;
+}
+
+void checkShadowCacheFrames(const char* backend, const std::vector<CacheFrame>& frames) {
+    REQUIRE(frames.size() == 8);
+    for (const CacheFrame& frame : frames) {
+        const auto diff = engine::compareShaderImagesRgba8(frame.cached, frame.uncached, 0);
+        MESSAGE(std::string(backend) << " " << std::string(frame.step) << ": shadowed="
+                << frame.cachedStats.pointShadowLights
+                << " redrawn cached/uncached=" << frame.cachedStats.pointShadowLightsRedrawn
+                << "/" << frame.uncachedStats.pointShadowLightsRedrawn
+                << " draws cached/uncached=" << frame.cachedStats.pointShadowDraws << "/"
+                << frame.uncachedStats.pointShadowDraws
+                << " mismatches=" << diff.mismatchPixelCount);
+        CHECK(frame.cached == frame.uncached);
+        CHECK(frame.cachedStats.pointShadowLights == 4);
+        CHECK(frame.uncachedStats.pointShadowLightsRedrawn ==
+              frame.uncachedStats.pointShadowLights);
+    }
+    const auto redrawn = [&](std::size_t index) {
+        return frames[index].cachedStats.pointShadowLightsRedrawn;
+    };
+    CHECK(redrawn(0) == 4);
+    CHECK(redrawn(1) == 0);
+    CHECK(frames[1].cachedStats.pointShadowDraws == 0);
+    CHECK(redrawn(2) > 0); // the moved caster's lights
+    CHECK(redrawn(2) < 4); // ... and not the others: partial (tile reset) path
+    CHECK(redrawn(3) == 0);
+    CHECK(redrawn(4) > 0);
+    CHECK(redrawn(4) < 4);
+    CHECK(redrawn(5) > 0);
+    CHECK(redrawn(6) == 0);
+    CHECK(redrawn(7) == 4);
+}
+
+} // namespace
+
+TEST_CASE("Point-light shadow cache: cached frames equal uncached frames on OpenGL, Vulkan, "
+          "and DX12") {
+    auto windowResult =
+        platform::Window::create({"Point shadow cache", kEffectWidth, kEffectHeight, false});
+    REQUIRE(windowResult.hasValue());
+    platform::Window* window = windowResult.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    gfx::IDevice* openGlBase = gfx::createOpenGLDevice();
+    REQUIRE(openGlBase != nullptr);
+    const auto gl = captureShadowCacheSequence(
+        *openGlBase, [](gfx::TextureHandle, std::span<std::byte> out) {
+            glReadPixels(0, 0, static_cast<GLsizei>(kEffectWidth),
+                         static_cast<GLsizei>(kEffectHeight), GL_RGBA, GL_UNSIGNED_BYTE,
+                         out.data());
+            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+        });
+    gfx::deleteDevice(openGlBase);
+    delete window;
+    checkShadowCacheFrames("OpenGL", gl);
+
+    gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
+    REQUIRE(vulkanBase != nullptr);
+    auto* vulkan = static_cast<gfx::VulkanDevice*>(vulkanBase);
+    const auto vk = captureShadowCacheSequence(
+        *vulkan, [vulkan](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return vulkan->readTexture(texture, 0, out);
+        });
+    CHECK(vulkan->validationWarningCount() == 0);
+    CHECK(vulkan->validationErrorCount() == 0);
+    gfx::deleteDevice(vulkanBase);
+    checkShadowCacheFrames("Vulkan", vk);
+
+    gfx::IDevice* dx12Base = gfx::createDx12Device();
+    REQUIRE(dx12Base != nullptr);
+    auto* dx12 = static_cast<gfx::Dx12Device*>(dx12Base);
+    const auto dx = captureShadowCacheSequence(
+        *dx12, [dx12](gfx::TextureHandle texture, std::span<std::byte> out) {
+            return dx12->readTexture(texture, 0, out);
+        });
+    CHECK(dx12->validationWarningCount() == 0);
+    CHECK(dx12->validationErrorCount() == 0);
+    gfx::deleteDevice(dx12Base);
+    checkShadowCacheFrames("DX12", dx);
+
+    for (std::size_t i = 0; i < gl.size(); ++i) {
+        checkEffectParity(std::string("shadow cache ") + gl[i].step + " GL/VK", gl[i].cached,
+                          vk[i].cached);
+        checkEffectParity(std::string("shadow cache ") + gl[i].step + " GL/DX", gl[i].cached,
+                          dx[i].cached);
+    }
+    maybeWriteCapture("shadow_cache_caster_moved_opengl", gl[2].cached, kEffectWidth,
+                      kEffectHeight);
+    maybeWriteCapture("shadow_cache_camera_moved_opengl", gl[5].cached, kEffectWidth,
+                      kEffectHeight);
+}
+
 TEST_CASE("Bloom and point-light shadows: WebGPU validation frames match the locked references") {
     auto windowResult = platform::Window::create(
         {"Effect references", kWebFrameExtent, kWebFrameExtent, false});
@@ -1324,7 +1725,12 @@ TEST_CASE("Bloom and point-light shadows: WebGPU validation frames match the loc
 
 TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BENCH=1)") {
     const char* enabled = std::getenv("F4_POINT_LIGHT_BENCH");
-    if (enabled == nullptr || enabled[0] != '1') return;
+    if (enabled == nullptr) return;
+    // "1": every row once. "cache": shadow-cache rows only, cached and
+    // uncached interleaved over several rounds, reporting the median.
+    const std::string mode = enabled;
+    if (mode != "1" && mode != "cache") return;
+    bool verbose = true;
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 30;
@@ -1338,7 +1744,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     // 32x32 grid), N > 0 also shadows the N best-ranked lights.
     const auto bench = [&](gfx::IDevice& device, const char* backend,
                            std::uint32_t lightsPerSide, bool scaledRange, bool bloom = false,
-                           int shadows = -1) {
+                           int shadows = -1, bool shadowCache = true) -> double {
+        double ms = 0.0;
         gfx::TextureDesc colorDesc;
         colorDesc.width = width;
         colorDesc.height = height;
@@ -1387,6 +1794,7 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                 options.shadowBudget = static_cast<std::uint32_t>(shadows);
             }
             const ecs::Entity cameraEntity = buildNightScene(renderer, registry, options);
+            renderer.pbrSettings().pointShadowCaching = shadowCache;
             const float aspect = static_cast<float>(width) / static_cast<float>(height);
             const gfx::Extent extent{width, height};
             for (int i = 0; i < warmup; ++i) {
@@ -1401,26 +1809,54 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             }
             device.waitIdle();
             const auto end = std::chrono::steady_clock::now();
-            const double ms =
-                std::chrono::duration<double, std::milli>(end - start).count() / frames;
+            ms = std::chrono::duration<double, std::milli>(end - start).count() / frames;
             const engine::FrameStats stats = renderer.stats();
             char variant[64];
-            std::snprintf(variant, sizeof(variant), "%s%s%s", scaledRange ? "scaled" : "stress",
-                          bloom ? "+bloom" : "",
-                          shadows < 0 ? "" : shadows == 0 ? "+pillars" : "+pillars+shadows");
-            std::printf("[point-light bench] %s %s %ux%u lights=%u range=%.2f visible=%u "
+            std::snprintf(variant, sizeof(variant), "%s%s%s%s",
+                          scaledRange ? "scaled" : "stress", bloom ? "+bloom" : "",
+                          shadows < 0 ? "" : shadows == 0 ? "+pillars" : "+pillars+shadows",
+                          shadows > 0 && !shadowCache ? "(uncached)" : "");
+            if (verbose) std::printf("[point-light bench] %s %s %ux%u lights=%u range=%.2f visible=%u "
                         "refs=%u max/cluster=%u draws=%u shadowed=%u shadowDraws=%u "
-                        "bloomPasses=%u: %.3f ms/frame\n",
+                        "redrawn=%u bloomPasses=%u: %.3f ms/frame\n",
                         backend, variant, width, height,
                         stats.pointLights, static_cast<double>(options.range),
                         stats.pointLightsVisible,
                         stats.pointLightReferences, stats.maxPointLightsPerCluster,
                         stats.draws, stats.pointShadowLights, stats.pointShadowDraws,
-                        stats.bloomPasses, ms);
+                        stats.pointShadowLightsRedrawn, stats.bloomPasses, ms);
         }
         CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
         CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
         CHECK(device.destroyTexture(color.value()) == gfx::GfxError::None);
+        return ms;
+    };
+    // Static night scene with 32x32 pillars: cached vs uncached point shadows,
+    // interleaved so clock drift hits both alike; median of the rounds.
+    const auto cacheRows = [&](gfx::IDevice& device, const char* backend) {
+        constexpr int rounds = 7;
+        verbose = false;
+        for (int shadows : {4, 8, 16}) {
+            std::vector<double> cached, uncached;
+            for (int round = 0; round < rounds; ++round) {
+                // Alternate which variant runs first so ordering bias cancels.
+                if (round % 2 == 0) {
+                    cached.push_back(bench(device, backend, 32u, true, false, shadows, true));
+                    uncached.push_back(bench(device, backend, 32u, true, false, shadows, false));
+                } else {
+                    uncached.push_back(bench(device, backend, 32u, true, false, shadows, false));
+                    cached.push_back(bench(device, backend, 32u, true, false, shadows, true));
+                }
+            }
+            std::sort(cached.begin(), cached.end());
+            std::sort(uncached.begin(), uncached.end());
+            std::printf("[point-light bench] %s shadow cache lights=1024 pillars=1024 "
+                        "shadowed=%d: cached %.3f ms/frame, uncached %.3f ms/frame "
+                        "(median of %d; min %.3f / %.3f)\n",
+                        backend, shadows, cached[rounds / 2], uncached[rounds / 2], rounds,
+                        cached.front(), uncached.front());
+        }
+        verbose = true;
     };
 
     {
@@ -1433,22 +1869,34 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         REQUIRE(device != nullptr);
         std::printf("[point-light bench] OpenGL renderer: %s\n",
                     reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
-        for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "OpenGL", side, false);
-        for (std::uint32_t side : {32u, 64u}) bench(*device, "OpenGL", side, true);
-        bench(*device, "OpenGL", 32u, true, true);
-        for (int shadows : {0, 4, 8, 16}) bench(*device, "OpenGL", 32u, true, false, shadows);
-        bench(*device, "OpenGL", 32u, true, true, 8);
+        if (mode == "cache") {
+            cacheRows(*device, "OpenGL");
+        } else {
+            for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "OpenGL", side, false);
+            for (std::uint32_t side : {32u, 64u}) bench(*device, "OpenGL", side, true);
+            bench(*device, "OpenGL", 32u, true, true);
+            for (int shadows : {0, 4, 8, 16}) bench(*device, "OpenGL", 32u, true, false, shadows);
+            for (int shadows : {4, 8, 16})
+                bench(*device, "OpenGL", 32u, true, false, shadows, false);
+            bench(*device, "OpenGL", 32u, true, true, 8);
+        }
         gfx::deleteDevice(device);
         delete window;
     }
     {
         gfx::IDevice* device = gfx::createVulkanDevice();
         REQUIRE(device != nullptr);
-        for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "Vulkan", side, false);
-        for (std::uint32_t side : {32u, 64u}) bench(*device, "Vulkan", side, true);
-        bench(*device, "Vulkan", 32u, true, true);
-        for (int shadows : {0, 4, 8, 16}) bench(*device, "Vulkan", 32u, true, false, shadows);
-        bench(*device, "Vulkan", 32u, true, true, 8);
+        if (mode == "cache") {
+            cacheRows(*device, "Vulkan");
+        } else {
+            for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "Vulkan", side, false);
+            for (std::uint32_t side : {32u, 64u}) bench(*device, "Vulkan", side, true);
+            bench(*device, "Vulkan", 32u, true, true);
+            for (int shadows : {0, 4, 8, 16}) bench(*device, "Vulkan", 32u, true, false, shadows);
+            for (int shadows : {4, 8, 16})
+                bench(*device, "Vulkan", 32u, true, false, shadows, false);
+            bench(*device, "Vulkan", 32u, true, true, 8);
+        }
         gfx::deleteDevice(device);
     }
     {
@@ -1456,11 +1904,17 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         REQUIRE(device != nullptr);
         std::printf("[point-light bench] DX12 adapter: %s\n",
                     static_cast<gfx::Dx12Device*>(device)->deviceName());
-        for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "DX12", side, false);
-        for (std::uint32_t side : {32u, 64u}) bench(*device, "DX12", side, true);
-        bench(*device, "DX12", 32u, true, true);
-        for (int shadows : {0, 4, 8, 16}) bench(*device, "DX12", 32u, true, false, shadows);
-        bench(*device, "DX12", 32u, true, true, 8);
+        if (mode == "cache") {
+            cacheRows(*device, "DX12");
+        } else {
+            for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "DX12", side, false);
+            for (std::uint32_t side : {32u, 64u}) bench(*device, "DX12", side, true);
+            bench(*device, "DX12", 32u, true, true);
+            for (int shadows : {0, 4, 8, 16}) bench(*device, "DX12", 32u, true, false, shadows);
+            for (int shadows : {4, 8, 16})
+                bench(*device, "DX12", 32u, true, false, shadows, false);
+            bench(*device, "DX12", 32u, true, true, 8);
+        }
         gfx::deleteDevice(device);
     }
 }

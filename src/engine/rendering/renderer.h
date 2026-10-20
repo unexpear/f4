@@ -35,6 +35,9 @@ struct FrameStats {
     // draws recorded for them.
     std::uint32_t pointShadowLights = 0;
     std::uint32_t pointShadowDraws = 0;
+    // Shadowed lights whose six tiles were re-rendered this frame; the rest
+    // reused last frame's tiles (see PbrRenderSettings::pointShadowCaching).
+    std::uint32_t pointShadowLightsRedrawn = 0;
     // Fullscreen bloom passes (prefilter, downsamples, upsamples, composite).
     std::uint32_t bloomPasses = 0;
 };
@@ -73,6 +76,14 @@ struct PbrRenderSettings {
     std::uint32_t pointShadowBudget = 8;     // 0..16
     std::uint32_t pointShadowTileSize = 256; // texels per cube face
     float pointShadowBias = 0.02f;           // in units of the light's range
+    // Reuse a shadowed light's six tiles when neither the light nor any
+    // caster within its range changed since the frame that drew them. Each
+    // frame the renderer builds a signature per light from its position,
+    // range and tile size and, for every caster inside its sphere, the mesh,
+    // material (alpha inputs), submesh and world matrix; a light keeps its
+    // atlas slot while it stays selected. The cached image is identical to
+    // the uncached one (false redraws every tile every frame).
+    bool pointShadowCaching = true;
 };
 
 // Renderer: owns GPU representations (GpuMesh, Material pipelines, UBO, fallback
@@ -153,6 +164,10 @@ private:
 
     void recordShadow(gfx::CommandBuffer& cb);
     void recordPointShadows(gfx::CommandBuffer& cb);
+    void gatherPointShadowCasters();
+    [[nodiscard]] auto pointShadowSignature(const math::Vec3& position, float range) const
+        -> std::uint64_t;
+    [[nodiscard]] auto ensurePointShadowResetMesh() -> gfx::GfxError;
     void gatherPointLights();
     [[nodiscard]] auto preparePointLights(const Camera& camera, float aspect)
         -> gfx::BufferHandle;
@@ -185,6 +200,7 @@ private:
     DynamicBufferRing pointLightBuffers_;
     containers::Array<ClusteredLightInput> pointLightInputs_;
     containers::Array<std::uint8_t> pointLightCastsShadow_;
+    containers::Array<std::uint64_t> pointLightKeys_; // entity index << 32 | generation
     bool pointLightsGathered_ = false;
     containers::Array<std::uint32_t> pointLightWords_;
     gfx::BufferHandle framePointLights_{};
@@ -212,10 +228,21 @@ private:
     gfx::GfxError recordError_ = gfx::GfxError::None;
 
     // Point-light shadow atlas and this frame's selection.
+    // Indexed by atlas slot; inactive slots hold no light this frame.
     struct ShadowedPointLight {
         math::Vec3 position{};
         float range = 0.0f;
+        bool active = false;
+        bool dirty = false;
+        std::uint64_t signature = 0;
     };
+    // Per atlas slot: which light owns it and the signature its tiles were
+    // drawn with (valid only after a successful submit).
+    containers::Array<std::uint64_t> pointShadowSlotOwners_;
+    containers::Array<std::uint64_t> pointShadowSlotSignatures_;
+    containers::Array<std::uint8_t> pointShadowSlotValid_;
+    containers::Array<std::uint32_t> shadowSlots_;
+    containers::Array<std::uint64_t> shadowSlotKeys_;
     ConstantRing pointShadowConstants_;
     // Shadow casters this frame, grouped into one instanced draw per
     // (light, face, mesh/material) with the models in an instance stream.
@@ -237,11 +264,16 @@ private:
     containers::Array<math::Mat4> frameShadowFaces_;
     gfx::TextureHandle pointShadowColorTex_{};
     gfx::TextureHandle pointShadowDepthTex_{};
-    gfx::FramebufferHandle pointShadowFramebuffer_{};
+    gfx::FramebufferHandle pointShadowFramebuffer_{};     // clears colour + depth
+    gfx::FramebufferHandle pointShadowLoadFramebuffer_{}; // keeps colour, clears depth
+    resources::MeshHandle pointShadowResetMesh_{};
     std::uint32_t pointShadowTileSize_ = 0;
     std::uint32_t pointShadowRows_ = 0;
     std::uint32_t pointShadowDraws_ = 0;
+    std::uint32_t pointShadowRedrawn_ = 0;
     bool framePointShadowsActive_ = false;
+    bool framePointShadowsDirty_ = false;    // at least one slot is re-rendered
+    bool framePointShadowsFullClear_ = true; // every active slot is re-rendered
 
     // HDR bloom chain.
     struct BloomTarget {

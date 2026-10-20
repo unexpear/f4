@@ -73,6 +73,40 @@ constexpr std::uint32_t kBloomMaxLevels = 8;
     return bits;
 }
 
+[[nodiscard]] auto pointShadowGroupKey(resources::MeshHandle mesh,
+                                       resources::MaterialHandle material,
+                                       std::uint32_t subMesh) -> std::array<std::uint64_t, 3> {
+    return {(static_cast<std::uint64_t>(mesh.index) << 32) | mesh.generation,
+            (static_cast<std::uint64_t>(material.index) << 32) | material.generation, subMesh};
+}
+
+// FNV-1a over the exact bits of everything a shadow tile depends on.
+struct SignatureHash {
+    std::uint64_t value = 0xcbf29ce484222325ull;
+    void add(std::uint32_t word) {
+        for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+            value ^= (word >> shift) & 0xffu;
+            value *= 0x100000001b3ull;
+        }
+    }
+    void add(float number) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &number, sizeof(bits));
+        add(bits);
+    }
+    void add(const math::Vec3& v) {
+        add(v.x);
+        add(v.y);
+        add(v.z);
+    }
+    void add(const math::Vec4& v) {
+        add(v.x);
+        add(v.y);
+        add(v.z);
+        add(v.w);
+    }
+};
+
 [[nodiscard]] auto sphereTouchesBox(const math::Vec3& center, float radius,
                                     const math::AABB& box) -> bool {
     const math::Vec3 closest(std::clamp(center.x, box.min.x, box.max.x),
@@ -857,6 +891,7 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
 void Renderer::gatherPointLights() {
     pointLightInputs_.clear();
     pointLightCastsShadow_.clear();
+    pointLightKeys_.clear();
     if (!pbrSettings_.pointLightsEnabled) return;
     for (auto [entity, light] : ecs::View<PointLight>(registry_)) {
         ClusteredLightInput input;
@@ -869,16 +904,24 @@ void Renderer::gatherPointLights() {
         input.range = light.range;
         pointLightInputs_.push(input);
         pointLightCastsShadow_.push(light.castShadows ? 1u : 0u);
+        pointLightKeys_.push((static_cast<std::uint64_t>(entity.index) << 32) |
+                             entity.generation);
     }
 }
 
 auto Renderer::preparePointShadows(const Camera& camera) -> gfx::GfxError {
     framePointShadowsActive_ = false;
+    framePointShadowsDirty_ = false;
+    framePointShadowsFullClear_ = true;
     frameShadowedLights_.clear();
     frameShadowFaces_.clear();
     pointLightsGathered_ = false;
+    const auto invalidateCache = [this] {
+        std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(), std::uint8_t{0});
+    };
     const std::uint32_t budget = std::min(pbrSettings_.pointShadowBudget, kPointShadowMaxBudget);
     if (!pbrSettings_.pointLightsEnabled || !pbrSettings_.pointShadowsEnabled || budget == 0) {
+        invalidateCache();
         return gfx::GfxError::None;
     }
     gatherPointLights();
@@ -892,7 +935,10 @@ auto Renderer::preparePointShadows(const Camera& camera) -> gfx::GfxError {
             break;
         }
     }
-    if (!anyCaster) return gfx::GfxError::None;
+    if (!anyCaster) {
+        invalidateCache();
+        return gfx::GfxError::None;
+    }
 
     const math::Frustum frustum = math::Frustum::fromViewProjection(camera.viewProj);
     shadowCandidates_.clear();
@@ -912,18 +958,67 @@ auto Renderer::preparePointShadows(const Camera& camera) -> gfx::GfxError {
         std::span<const PointShadowCandidate>(shadowCandidates_.data(),
                                               shadowCandidates_.size()),
         camera.eye, budget, shadowSelection_);
-    if (shadowSelection_.isEmpty()) return gfx::GfxError::None;
+    if (shadowSelection_.isEmpty()) {
+        invalidateCache();
+        return gfx::GfxError::None;
+    }
     if (const auto error = ensurePointShadowAtlas(budget); error != gfx::GfxError::None) {
         return error;
     }
-    for (std::size_t slot = 0; slot < shadowSelection_.size(); ++slot) {
-        ClusteredLightInput& light =
-            pointLightInputs_[shadowCandidateSources_[shadowSelection_[slot]]];
-        light.shadowSlot = static_cast<std::uint32_t>(slot) + 1u;
-        frameShadowedLights_.push({light.position, light.range});
-        for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
-            frameShadowFaces_.push(pointShadowFaceViewProj(light.position, light.range, face));
+    if (const auto error = ensurePointShadowResetMesh(); error != gfx::GfxError::None) {
+        return error;
+    }
+
+    // Stable slots: a light keeps its atlas row while it stays selected.
+    shadowSlotKeys_.clear();
+    for (const std::uint32_t candidate : shadowSelection_) {
+        shadowSlotKeys_.push(pointLightKeys_[shadowCandidateSources_[candidate]]);
+    }
+    const containers::Array<std::uint64_t> previousOwners = pointShadowSlotOwners_;
+    assignStablePointShadowSlots(
+        std::span<const std::uint64_t>(shadowSlotKeys_.data(), shadowSlotKeys_.size()),
+        pointShadowSlotOwners_, shadowSlots_);
+    for (std::size_t slot = 0; slot < pointShadowSlotOwners_.size(); ++slot) {
+        if (pointShadowSlotOwners_[slot] != previousOwners[slot] ||
+            pointShadowSlotOwners_[slot] == kPointShadowFreeSlot) {
+            pointShadowSlotValid_[slot] = 0;
         }
+    }
+    std::uint32_t slotCount = 0;
+    for (const std::uint32_t slot : shadowSlots_) {
+        if (slot < budget) slotCount = std::max(slotCount, slot + 1u);
+    }
+    frameShadowedLights_.resize(slotCount);
+    std::fill(frameShadowedLights_.begin(), frameShadowedLights_.end(), ShadowedPointLight{});
+    frameShadowFaces_.resize(static_cast<std::size_t>(slotCount) * kPointShadowFaces);
+    std::fill(frameShadowFaces_.begin(), frameShadowFaces_.end(), math::Mat4::identity());
+    for (std::size_t i = 0; i < shadowSelection_.size(); ++i) {
+        const std::uint32_t slot = shadowSlots_[i];
+        if (slot >= slotCount) continue;
+        ClusteredLightInput& light =
+            pointLightInputs_[shadowCandidateSources_[shadowSelection_[i]]];
+        light.shadowSlot = slot + 1u;
+        ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+        shadowed.position = light.position;
+        shadowed.range = light.range;
+        shadowed.active = true;
+        for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+            frameShadowFaces_[slot * kPointShadowFaces + face] =
+                pointShadowFaceViewProj(light.position, light.range, face);
+        }
+    }
+
+    // Dirty tracking: a slot is redrawn unless its signature (light + every
+    // caster inside its sphere) matches the one its tiles were drawn with.
+    gatherPointShadowCasters();
+    for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
+        ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+        if (!shadowed.active) continue;
+        shadowed.signature = pointShadowSignature(shadowed.position, shadowed.range);
+        shadowed.dirty = !pbrSettings_.pointShadowCaching || pointShadowSlotValid_[slot] == 0 ||
+                         pointShadowSlotSignatures_[slot] != shadowed.signature;
+        framePointShadowsDirty_ = framePointShadowsDirty_ || shadowed.dirty;
+        framePointShadowsFullClear_ = framePointShadowsFullClear_ && shadowed.dirty;
     }
     framePointShadowsActive_ = true;
     return gfx::GfxError::None;
@@ -1008,17 +1103,13 @@ void Renderer::recordShadow(gfx::CommandBuffer& commandBuffer) {
     }
 }
 
-void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
-    pointShadowConstants_.beginFrame();
-    pointShadowInstanceBuffers_.beginFrame();
-    pointShadowDraws_ = 0;
-    const auto rows = pointShadowRows_;
-
+void Renderer::gatherPointShadowCasters() {
     // Casters grouped by (mesh, material, submesh) so each group is one
     // instanced draw per light face, like the main pass.
     pointShadowCasters_.clear();
     for (auto [entity, renderer, world] :
          ecs::View<MeshRenderer, ecs::WorldMatrix>(registry_)) {
+        (void)entity;
         if (!renderer.castShadows) continue;
         const auto* entry = meshMap_.find(renderer.mesh);
         const StandardMaterial* material = materials_.get(renderer.material);
@@ -1034,34 +1125,170 @@ void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
         }
         pointShadowCasters_.push(caster);
     }
-    const auto groupKey = [](const PointShadowCaster& caster) {
-        return std::array<std::uint64_t, 3>{
-            (static_cast<std::uint64_t>(caster.mesh.index) << 32) | caster.mesh.generation,
-            (static_cast<std::uint64_t>(caster.material.index) << 32) |
-                caster.material.generation,
-            caster.subMesh};
-    };
     std::stable_sort(pointShadowCasters_.begin(), pointShadowCasters_.end(),
-                     [&](const PointShadowCaster& a, const PointShadowCaster& b) {
-                         return groupKey(a) < groupKey(b);
+                     [](const PointShadowCaster& a, const PointShadowCaster& b) {
+                         return pointShadowGroupKey(a.mesh, a.material, a.subMesh) <
+                                pointShadowGroupKey(b.mesh, b.material, b.subMesh);
                      });
+}
+
+auto Renderer::pointShadowSignature(const math::Vec3& position, float range) const
+    -> std::uint64_t {
+    SignatureHash hash;
+    hash.add(position);
+    hash.add(range);
+    hash.add(pointShadowTileSize_);
+    hash.add(pointShadowRows_);
+    for (const PointShadowCaster& caster : pointShadowCasters_) {
+        if (caster.cullable && !sphereTouchesBox(position, range, caster.bounds)) continue;
+        hash.add(caster.mesh.index);
+        hash.add(caster.mesh.generation);
+        hash.add(caster.material.index);
+        hash.add(caster.material.generation);
+        hash.add(caster.subMesh);
+        hash.add(caster.cullable ? 1u : 0u);
+        for (const math::Vec4& column : caster.model.col) hash.add(column);
+        if (const StandardMaterial* material = materials_.get(caster.material)) {
+            // Everything the shadow shader reads from the material.
+            hash.add(material->desc.tint.w);
+            hash.add(material->desc.alphaCutoff);
+            hash.add(static_cast<std::uint32_t>(material->desc.alphaMode));
+            const gfx::TextureHandle albedo = resolveTexture(material->desc.albedo, whiteTex_);
+            hash.add(albedo.index);
+            hash.add(albedo.generation);
+        }
+    }
+    return hash.value;
+}
+
+auto Renderer::ensurePointShadowResetMesh() -> gfx::GfxError {
+    if (pointShadowResetMesh_.isValid() && meshMap_.find(pointShadowResetMesh_) != nullptr) {
+        return gfx::GfxError::None;
+    }
+    // One triangle covering clip space at z = 0.5 with the identity face
+    // matrix; with the light at the origin and a huge 1/range every fragment
+    // stores clamp(|p| * 1e4) = 1.0, the same value the atlas clear writes.
+    struct ResetVertex {
+        float position[3];
+        float uv[2];
+    };
+    static constexpr ResetVertex kVertices[3] = {
+        {{-1.0f, -1.0f, 0.5f}, {0.0f, 0.0f}},
+        {{3.0f, -1.0f, 0.5f}, {2.0f, 0.0f}},
+        {{-1.0f, 3.0f, 0.5f}, {0.0f, 2.0f}},
+    };
+    static constexpr std::uint16_t kIndices[3] = {0, 1, 2};
+    resources::Mesh mesh;
+    resources::VertexStream stream;
+    stream.strideBytes = sizeof(ResetVertex);
+    stream.data.resize(sizeof(kVertices));
+    std::memcpy(stream.data.data(), kVertices, sizeof(kVertices));
+    mesh.streams.push(static_cast<resources::VertexStream&&>(stream));
+    mesh.attributes.push({resources::VertexSemantic::Position, resources::VertexFormat::F32_3, 0,
+                          0});
+    mesh.attributes.push({resources::VertexSemantic::TexCoord0, resources::VertexFormat::F32_2,
+                          0, 12});
+    mesh.indexFormat = resources::IndexFormat::U16;
+    mesh.indices.resize(sizeof(kIndices));
+    std::memcpy(mesh.indices.data(), kIndices, sizeof(kIndices));
+    mesh.submeshes.push({0, 3});
+    pointShadowResetMesh_ = createMesh(mesh);
+    return pointShadowResetMesh_.isValid() ? gfx::GfxError::None : gfx::GfxError::OutOfMemory;
+}
+
+void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
+    pointShadowConstants_.beginFrame();
+    pointShadowInstanceBuffers_.beginFrame();
+    pointShadowDraws_ = 0;
+    pointShadowRedrawn_ = 0;
+    const auto rows = pointShadowRows_;
+    const std::uint32_t tile = pointShadowTileSize_;
+    // Stored rows of a slot's tiles: the PBR shader reads slot `s` at atlas
+    // NDC rows (see pointShadowTileTransform), which is stored row block `s`
+    // on OpenGL and `rows - 1 - s` elsewhere.
+    const auto selectTile = [&](std::size_t slot, std::uint32_t face) {
+        const std::uint32_t rowBlock = device_.backend() == gfx::Backend::OpenGL
+                                           ? static_cast<std::uint32_t>(slot)
+                                           : rows - 1u - static_cast<std::uint32_t>(slot);
+        commandBuffer.setViewport(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
+        commandBuffer.setScissor(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
+    };
+
+    // Tile reset for partial redraws: the pass keeps the cached colour, so a
+    // dirty slot first rewrites its six tiles to 1.0 (depth is cleared for
+    // the whole atlas every pass, exactly as in the full-clear path).
+    gfx::PipelineHandle resetPipeline{};
+    const MeshEntry* resetEntry = nullptr;
+    DynamicBufferRing::Slot resetInstance{};
+    ConstantRing::Slot resetConstants{};
+    if (!framePointShadowsFullClear_) {
+        resetEntry = meshMap_.find(pointShadowResetMesh_);
+        if (resetEntry == nullptr) {
+            recordError_ = gfx::GfxError::InvalidHandle;
+            return;
+        }
+        if (const auto error = materials_.ensurePointShadowPipeline(
+                device_, resetEntry->instancedLayout, true);
+            error != gfx::GfxError::None) {
+            recordError_ = error;
+            return;
+        }
+        resetPipeline = materials_.pointShadowPipelineFor(resetEntry->instancedLayout, true);
+        RenderInstance identity{};
+        identity.model = math::Mat4::identity();
+        resetInstance = pointShadowInstanceBuffers_.alloc(
+            device_, std::span(reinterpret_cast<const std::byte*>(&identity), sizeof(identity)));
+        PointShadowUbo constants;
+        constants.faceViewProj = math::Mat4::identity();
+        constants.reserved = math::Mat4::identity();
+        constants.lightPositionInvRange = math::Vec4(0.0f, 0.0f, 0.0f, 1.0e4f);
+        constants.tileTransform = math::Vec4(1.0f, 1.0f, 0.0f, 0.0f);
+        constants.alphaParams = math::Vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        resetConstants = pointShadowConstants_.alloc(
+            device_,
+            std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
+        if (!resetPipeline.isValid() || !resetInstance.valid || !resetConstants.valid) {
+            recordError_ = gfx::GfxError::OutOfMemory;
+            return;
+        }
+    }
 
     std::array<math::Frustum, kPointShadowFaces> faceFrusta{};
     std::array<bool, kPointShadowFaces> faceUsed{};
     for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
         const ShadowedPointLight& light = frameShadowedLights_[slot];
+        if (!light.active || !light.dirty) continue;
+        ++pointShadowRedrawn_;
+        if (resetEntry != nullptr) {
+            for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+                selectTile(slot, face);
+                commandBuffer.bindPipeline(resetPipeline);
+                pointShadowConstants_.bind(commandBuffer, resetConstants);
+                commandBuffer.bindResource(0, gfx::BindingType::Texture, whiteTex_.index,
+                                           whiteTex_.generation);
+                commandBuffer.bindResource(0, gfx::BindingType::Sampler,
+                                           surfaceSampler_.index, surfaceSampler_.generation);
+                bindMesh(commandBuffer, resetEntry->gpu);
+                commandBuffer.bindVertexBuffer(resetEntry->instanceBinding,
+                                               resetInstance.handle, kRenderInstanceStride);
+                drawMesh(commandBuffer, resetEntry->mesh, resetEntry->gpu, 0, 1);
+            }
+        }
         for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
             faceFrusta[face] = math::Frustum::fromViewProjection(
                 frameShadowFaces_[slot * kPointShadowFaces + face]);
         }
         std::size_t first = 0;
         while (first < pointShadowCasters_.size()) {
+            const PointShadowCaster& head = pointShadowCasters_[first];
+            const auto headKey = pointShadowGroupKey(head.mesh, head.material, head.subMesh);
             std::size_t last = first + 1;
             while (last < pointShadowCasters_.size() &&
-                   groupKey(pointShadowCasters_[last]) == groupKey(pointShadowCasters_[first])) {
+                   pointShadowGroupKey(pointShadowCasters_[last].mesh,
+                                       pointShadowCasters_[last].material,
+                                       pointShadowCasters_[last].subMesh) == headKey) {
                 ++last;
             }
-            const PointShadowCaster& head = pointShadowCasters_[first];
             const std::size_t groupBegin = first;
             first = last;
 
@@ -1129,16 +1356,7 @@ void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
                     recordError_ = gfx::GfxError::OutOfMemory;
                     continue;
                 }
-                // Stored rows of this tile: the PBR shader reads slot `s` at
-                // atlas NDC rows (see pointShadowTileTransform), which is
-                // stored row block `s` on OpenGL and `rows - 1 - s` elsewhere.
-                const std::uint32_t tile = pointShadowTileSize_;
-                const std::uint32_t rowBlock =
-                    device_.backend() == gfx::Backend::OpenGL
-                        ? static_cast<std::uint32_t>(slot)
-                        : rows - 1u - static_cast<std::uint32_t>(slot);
-                commandBuffer.setViewport(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
-                commandBuffer.setScissor(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
+                selectTile(slot, face);
                 commandBuffer.bindPipeline(pipeline);
                 pointShadowConstants_.bind(commandBuffer, constantSlot);
                 commandBuffer.bindResource(0, gfx::BindingType::Texture, albedo.index,
@@ -1157,11 +1375,18 @@ void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
 }
 
 void Renderer::releasePointShadowAtlas() {
-    if (pointShadowFramebuffer_.isValid() || pointShadowColorTex_.isValid() ||
-        pointShadowDepthTex_.isValid()) {
+    if (pointShadowFramebuffer_.isValid() || pointShadowLoadFramebuffer_.isValid() ||
+        pointShadowColorTex_.isValid() || pointShadowDepthTex_.isValid()) {
         device_.waitIdle();
     }
     if (pointShadowFramebuffer_.isValid()) (void)device_.destroyFramebuffer(pointShadowFramebuffer_);
+    if (pointShadowLoadFramebuffer_.isValid()) {
+        (void)device_.destroyFramebuffer(pointShadowLoadFramebuffer_);
+    }
+    pointShadowLoadFramebuffer_ = {};
+    pointShadowSlotOwners_.clear();
+    pointShadowSlotSignatures_.clear();
+    pointShadowSlotValid_.clear();
     if (pointShadowColorTex_.isValid()) (void)device_.destroyTexture(pointShadowColorTex_);
     if (pointShadowDepthTex_.isValid()) (void)device_.destroyTexture(pointShadowDepthTex_);
     pointShadowFramebuffer_ = {};
@@ -1213,8 +1438,23 @@ auto Renderer::ensurePointShadowAtlas(std::uint32_t rows) -> gfx::GfxError {
         return framebuffer.error();
     }
     pointShadowFramebuffer_ = framebuffer.value();
+    // Same attachments, but the colour is loaded so cached tiles survive.
+    desc.attachments[0].clearOnLoad = false;
+    auto loadFramebuffer = device_.createFramebuffer(desc);
+    if (!loadFramebuffer.hasValue()) {
+        releasePointShadowAtlas();
+        return loadFramebuffer.error();
+    }
+    pointShadowLoadFramebuffer_ = loadFramebuffer.value();
     pointShadowTileSize_ = tile;
     pointShadowRows_ = rows;
+    pointShadowSlotOwners_.resize(rows);
+    std::fill(pointShadowSlotOwners_.begin(), pointShadowSlotOwners_.end(),
+              kPointShadowFreeSlot);
+    pointShadowSlotSignatures_.resize(rows);
+    std::fill(pointShadowSlotSignatures_.begin(), pointShadowSlotSignatures_.end(), 0ull);
+    pointShadowSlotValid_.resize(rows);
+    std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(), std::uint8_t{0});
     return gfx::GfxError::None;
 }
 
@@ -1542,6 +1782,7 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     }
     recordError_ = gfx::GfxError::None;
     pointShadowDraws_ = 0;
+    pointShadowRedrawn_ = 0;
     bloomPasses_ = 0;
     const auto finish = [this](gfx::GfxError error) {
         frameShadowsActive_ = false;
@@ -1586,8 +1827,13 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     if (framePointShadowsActive_) {
         pointShadowImage = graph_.importTexture(containers::String("point-shadow-atlas"),
                                                 pointShadowColorTex_);
+    }
+    // With every shadowed light cached the atlas pass is skipped entirely and
+    // the main pass samples last frame's tiles.
+    if (framePointShadowsActive_ && framePointShadowsDirty_) {
         const auto atlasTarget = graph_.importFramebuffer(
-            containers::String("point-shadow-target"), pointShadowFramebuffer_);
+            containers::String("point-shadow-target"),
+            framePointShadowsFullClear_ ? pointShadowFramebuffer_ : pointShadowLoadFramebuffer_);
         gfx::PassDesc atlasPass;
         atlasPass.name = containers::String("point-shadows");
         atlasPass.writes.push(atlasTarget);
@@ -1652,9 +1898,28 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         bloom ? gfx::TextureFormat::RGBA16_FLOAT : gfx::TextureFormat::RGBA8_UNORM;
     gfx::CommandBuffer commandBuffer;
     const gfx::GfxError submitError = graph_.execute(device_, commandBuffer);
-    stats_.pointShadowLights =
-        framePointShadowsActive_ ? static_cast<std::uint32_t>(frameShadowedLights_.size()) : 0u;
+    std::uint32_t activeShadowLights = 0;
+    if (framePointShadowsActive_) {
+        const bool drawn = submitError == gfx::GfxError::None &&
+                           recordError_ == gfx::GfxError::None;
+        for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
+            const ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+            if (!shadowed.active) continue;
+            ++activeShadowLights;
+            if (!shadowed.dirty) continue;
+            pointShadowSlotSignatures_[slot] = shadowed.signature;
+            pointShadowSlotValid_[slot] =
+                static_cast<std::uint8_t>(drawn && pbrSettings_.pointShadowCaching ? 1u : 0u);
+        }
+        if (!drawn) {
+            std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(),
+                      std::uint8_t{0});
+        }
+    }
+    stats_.pointShadowLights = activeShadowLights;
     stats_.pointShadowDraws = pointShadowDraws_;
+    stats_.pointShadowLightsRedrawn =
+        framePointShadowsActive_ && framePointShadowsDirty_ ? pointShadowRedrawn_ : 0u;
     stats_.bloomPasses = bloomPasses_;
     return finish(submitError != gfx::GfxError::None ? submitError : recordError_);
 }
