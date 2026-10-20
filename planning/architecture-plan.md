@@ -752,9 +752,67 @@ Completed delivery and acceptance gates:
   `RenderGraph::setGpuTimestamps` writes a timestamp before each pass and one
   after the last. `PbrRenderSettings::gpuTimers` (off by default) fills
   `FrameStats::gpuPasses[]` (name, ms), `gpuFrameMs`, `gpuLightBinningMs`,
-  `gpuMainPassMs`, and `gpuTimingLag`. WebGPU and Metal validate and ignore the
-  command. WebGPU timestamp-query is optional and only writes at pass
-  boundaries, so it is not wired yet.
+  `gpuMainPassMs`, and `gpuTimingLag`. Metal validates and ignores the
+  command. WebGPU support came later (next item).
+- ✅ WebGPU GPU timers (2026-10-20, commits 21ba949, 25bb9d2, 2156f8c).
+  - The device requests the optional `timestamp-query` feature when the
+    adapter offers it. WebGPU only writes timestamps at pass boundaries
+    (`timestampWrites`), so each RHI timestamp goes on the end of the pass
+    just before it, which is when that work finished. With no pass before
+    it, it goes on the start of the next pass. With no pass at all, it goes
+    on an empty compute pass.
+  - A timestamp also ends the open compute pass, so graph passes stay
+    separate native passes. Only when timers are on; otherwise encoding is
+    unchanged.
+  - One query set holds 4 ring sets of 64 queries: 32 RHI indices plus 32
+    scratch indices for pass ends that no RHI timestamp maps to.
+  - Each timed submit resolves its set into a resolve buffer and copies it
+    to that set's MapRead buffer. It then calls `mapAsync` in
+    `AllowProcessEvents` mode. `latestGpuTimestamps()` calls
+    `wgpuInstanceProcessEvents` and reads whichever sets have mapped, so it
+    never waits; results are 1-2 frames old. Values are already nanoseconds.
+  - If a set's map is still in flight when its turn comes again, that
+    submit goes untimed but still takes a serial.
+  - Without the feature, timers report unavailable: the new
+    `FrameStats::gpuTimersAvailable` is false, `gpuTimingValid` stays false,
+    and every GPU ms field is 0. The device logs this once, to the browser
+    console rather than stderr. The renderer also clears its cached timing
+    whenever timers are off or unsupported, so a stale timing never shows.
+  - The Chromium smoke turns timers on for the point-light frame. The image
+    must be byte-identical. If the adapter has `timestamp-query`, the
+    binning and main passes must come back timed: above 0, below the frame
+    time, frame under 50 ms, lag at least 1, passes summing to the frame.
+    Otherwise the result must say "unavailable". The harness adds only
+    `--enable-webgpu-developer-features`, which turns off Chrome's 100 us
+    timestamp quantization.
+  - Verified with real timestamps:
+    - Intel Iris Xe (the headless default): binning 0.092 ms, main 0.058 ms
+    - RTX 3070 Ti: binning 0.015 ms, main 0.011 ms
+    - Fallback: a temporary local build with the feature disabled reported
+      "unavailable" with no browser errors.
+- ✅ WebGPU point-light bench (`F4_WEBGPU_BENCH=<rounds>` with the smoke
+  harness, which opens the page as `?bench=<rounds>` and adds
+  `--force_high_performance_gpu`; without that flag Edge hands WebGPU the
+  Intel iGPU).
+  - Same night scene as the native bench: 1280x720, release wasm, CPU and GPU
+    binning alternating, frame time = 120 frames ending in `waitIdle`.
+  - GPU pass times come from one timed run per variant that drains every
+    third frame.
+  - RTX 3070 Ti, 9 rounds:
+
+  | Scene | CPU / GPU binning frame ms | render() CPU ms | binning pass | main pass (CPU / GPU binning) |
+  |---|---|---|---|---|
+  | stress 1,024 | 1.66 / 1.13 | 1.64 / 0.50 | 0.046 | 0.84 / 0.92 |
+  | stress 4,096 | 6.17 / 6.47 | 5.69 / 2.87 | 0.088 | 4.95 / 5.88 |
+  | scaled 1,024 | 1.20 / 0.89 | 1.18 / 0.50 | 0.045 | 0.57 / 0.59 |
+  | scaled 4,096 | 2.28 / 1.71 | 2.25 / 1.69 | 0.045 | 1.07 / 1.15 |
+
+  GPU binning wins 3 of 4 scenes by 25-32%. With CPU binning, WebGPU frames
+  are mostly CPU-bound: `render()` takes 1.2-5.7 ms of CPU time, against
+  0.5-2.9 ms with GPU binning. Stress 4,096 is within noise: +5% in this
+  run, but -11%, -3%, and -3% in three earlier runs. In all three timed runs that measured both variants, though, its
+  main pass read about 1 ms slower after GPU binning (4.9 to 5.9 ms). The
+  native backends do not show this, and the cause is not known yet.
 - ✅ Where the binning time went, measured with the timers
   (`F4_POINT_LIGHT_BENCH=binning`). The old 3-dispatch kernel cost 0.22-0.42
   ms of GPU time at 1,024 lights and 0.72-1.62 ms at 4,096. Each of the 3,456
@@ -801,8 +859,14 @@ Completed delivery and acceptance gates:
 - Still open:
   - Metal has every shader and binding written but was not compiled or run
     (no Apple hardware). It bins on the CPU and has no timer queries.
-  - WebGPU has GPU binning but no timer queries, and its tiny smoke scene
-    cannot measure frame time.
+  - WebGPU stress 4,096: the main pass runs about 1 ms slower after GPU
+    binning than after CPU binning (see above). Candidates are Dawn's
+    barrier between the compute write and the fragment read, or the buffer's
+    placement.
+  - WebGPU timers need frame pacing. The renderer keeps 8 timed frames, so
+    if the GPU falls more than about 8 submits behind (an unthrottled loop
+    that never presents), results stop matching their frames. rAF-paced
+    apps and the bench stay within 3.
   - In GPU-bound scenes near the index cap, the binning pass's index writes
     (0.15 ms) are not hidden. Async compute or overlapping the pass with the
     shadow passes could hide them.
