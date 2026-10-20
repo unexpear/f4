@@ -205,6 +205,11 @@ async function run() {
 
     try {
         const extraFlags = (process.env.F4_WEBGPU_BROWSER_FLAGS ?? "").split(/\s+/).filter(Boolean);
+        // The bench runs on the discrete GPU (hybrid laptops otherwise hand the
+        // browser the integrated one); the smoke keeps the browser's default.
+        if (Number.parseInt(process.env.F4_WEBGPU_BENCH ?? "0", 10) > 0) {
+            extraFlags.push("--force_high_performance_gpu");
+        }
         child = spawn(
             browser,
             [
@@ -245,6 +250,13 @@ async function run() {
         const benchRounds = Number.parseInt(process.env.F4_WEBGPU_BENCH ?? "0", 10) || 0;
         if (benchRounds > 0) {
             await devTools.call("Page.navigate", { url: `${url}?bench=${benchRounds}` });
+            await delay(500);
+            const adapterInfo = await evaluateJsonAsync(devTools, `(async () => {
+                const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+                const info = adapter?.info ?? {};
+                return [info.vendor, info.architecture, info.device, info.description].join(" / ");
+            })()`);
+            console.log(`[webgpu bench] adapter: ${adapterInfo}`);
             const benchDeadline = Date.now() + 900000;
             let bench;
             while (Date.now() < benchDeadline) {

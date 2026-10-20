@@ -1137,8 +1137,8 @@ auto validateRendererFrame() -> bool {
 // "stress" (fixed 2.5 m range) and "scaled" (range follows the grid spacing).
 // CPU and GPU binning alternate per round; frame time is the wall time of 120
 // frames ending in waitIdle, so it measures throughput like the native bench.
-// A last run per variant turns GPU timers on and yields after every frame so
-// mapAsync can deliver the timestamps.
+// A last run per variant turns GPU timers on and drains every third frame so
+// mapAsync can deliver the timestamps; each timed frame is averaged once.
 
 constexpr std::array<std::array<float, 3>, 8> kNightPalette{{
     {1.0f, 0.55f, 0.18f}, {0.25f, 0.55f, 1.0f}, {1.0f, 0.18f, 0.32f}, {0.25f, 1.0f, 0.45f},
@@ -1184,7 +1184,7 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 20;
-    const int frames = timers ? 60 : 120;
+    const int frames = timers ? 240 : 120;
     BenchRun run;
     TextureHandle color;
     TextureHandle depth;
@@ -1303,6 +1303,7 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
                      GfxError::None;
             }
             gApp.device->waitIdle();
+            int lastTimedFrame = -1000;
             const double start = emscripten_get_now();
             for (int i = 0; i < frames && ok; ++i) {
                 const double frameStart = emscripten_get_now();
@@ -1310,9 +1311,16 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
                      GfxError::None;
                 run.cpuMs += emscripten_get_now() - frameStart;
                 if (timers) {
-                    gApp.device->waitIdle(); // yields, so the timestamp map completes
+                    // Drain every third frame: that yields so mapAsync can
+                    // deliver timestamps and keeps the GPU at most three frames
+                    // behind (like the native frame fences; an unthrottled queue
+                    // outruns the timestamp rings), while the frames in between
+                    // keep the GPU busy (a waitIdle per frame lets clocks drop).
+                    if (i % 3 == 2) gApp.device->waitIdle();
                     const f4::engine::FrameStats& stats = renderer.stats();
-                    if (stats.gpuTimingValid) {
+                    const int timedFrame = i - static_cast<int>(stats.gpuTimingLag);
+                    if (stats.gpuTimingValid && timedFrame != lastTimedFrame) {
+                        lastTimedFrame = timedFrame;
                         ++run.timedFrames;
                         run.gpuFrameMs += stats.gpuFrameMs;
                         run.gpuBinningMs += stats.gpuLightBinningMs;
