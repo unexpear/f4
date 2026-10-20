@@ -253,27 +253,82 @@ auto buildClusteredLightBinningInput(std::span<const ClusteredLightInput> lights
     const std::uint32_t visible = static_cast<std::uint32_t>(ranges.size());
     stats.visible = visible;
 
-    // Every reference a light contributes is one cell of its cluster box, so
-    // the total (and the cut to maxIndexCount) is known without binning.
-    std::uint64_t references = 0;
+    // Per-cluster counts without visiting clusters per light: add each box to
+    // a 3D difference array (+/-1 at its 8 corners), then prefix-sum the
+    // three axes. Then cap in cluster order exactly like the CPU binning.
+    const std::uint32_t strideX = tilesX + 1u;
+    const std::uint32_t strideY = (tilesY + 1u) * strideX;
+    containers::Array<std::int32_t> diff;
+    diff.resize(static_cast<std::size_t>(strideY) * (slices + 1u));
+    std::fill(diff.begin(), diff.end(), 0);
     for (const LightRange& range : ranges) {
-        references += static_cast<std::uint64_t>(range.x1 - range.x0 + 1u) *
-                      (range.y1 - range.y0 + 1u) * (range.z1 - range.z0 + 1u);
+        const std::uint32_t xs[2] = {range.x0, range.x1 + 1u};
+        const std::uint32_t ys[2] = {range.y0 * strideX, (range.y1 + 1u) * strideX};
+        const std::uint32_t zs[2] = {range.z0 * strideY, (range.z1 + 1u) * strideY};
+        for (std::uint32_t corner = 0; corner < 8u; ++corner) {
+            const std::uint32_t ix = corner & 1u;
+            const std::uint32_t iy = (corner >> 1) & 1u;
+            const std::uint32_t iz = corner >> 2;
+            diff[xs[ix] + ys[iy] + zs[iz]] += ((ix + iy + iz) & 1u) != 0 ? -1 : 1;
+        }
     }
-    const std::uint32_t totalIndices = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(references, config.maxIndexCount));
-    stats.indexCount = totalIndices;
-    stats.droppedIndices = static_cast<std::uint32_t>(references - totalIndices);
+    for (std::uint32_t z = 0; z < slices; ++z) {
+        for (std::uint32_t y = 0; y < tilesY; ++y) {
+            std::int32_t* row = diff.data() + z * strideY + y * strideX;
+            for (std::uint32_t x = 1; x < tilesX; ++x) row[x] += row[x - 1];
+        }
+    }
+    for (std::uint32_t z = 0; z < slices; ++z) {
+        for (std::uint32_t y = 1; y < tilesY; ++y) {
+            std::int32_t* row = diff.data() + z * strideY + y * strideX;
+            const std::int32_t* above = row - strideX;
+            for (std::uint32_t x = 0; x < tilesX; ++x) row[x] += above[x];
+        }
+    }
+    for (std::uint32_t z = 1; z < slices; ++z) {
+        for (std::uint32_t y = 0; y < tilesY; ++y) {
+            std::int32_t* row = diff.data() + z * strideY + y * strideX;
+            const std::int32_t* below = row - strideY;
+            for (std::uint32_t x = 0; x < tilesX; ++x) row[x] += below[x];
+        }
+    }
 
     const std::uint32_t lightOffset = kPointLightHeaderWords;
     const std::uint32_t reservedOffset = lightOffset + visible * kPointLightRecordWords;
     const std::uint32_t gridOffset = reservedOffset + reservedWords;
     const std::uint32_t indexOffset = gridOffset + clusterCount * kPointLightClusterWords;
-    const std::uint32_t rangeOffset = gridOffset;
+    const std::uint32_t maskOffset = indexOffset;
+    const std::uint32_t maskWords = (visible + 31u) / 32u;
+    const std::uint32_t maskRows = tilesX + tilesY + slices;
 
     words.clear();
-    words.resize(static_cast<std::size_t>(rangeOffset) + visible * kPointLightGpuRangeWords);
+    words.resize(static_cast<std::size_t>(maskOffset) +
+                 static_cast<std::size_t>(maskRows) * maskWords);
     std::fill(words.begin(), words.end(), 0u);
+
+    std::uint32_t totalIndices = 0;
+    std::uint64_t references = 0;
+    for (std::uint32_t z = 0; z < slices; ++z) {
+        for (std::uint32_t y = 0; y < tilesY; ++y) {
+            const std::int32_t* row = diff.data() + z * strideY + y * strideX;
+            for (std::uint32_t x = 0; x < tilesX; ++x) {
+                const std::uint32_t count = static_cast<std::uint32_t>(row[x]);
+                references += count;
+                const std::uint32_t allowed =
+                    std::min(count, config.maxIndexCount - totalIndices);
+                const std::uint32_t cluster = (z * tilesY + y) * tilesX + x;
+                std::uint32_t* record =
+                    words.data() + gridOffset + cluster * kPointLightClusterWords;
+                record[0] = indexOffset + totalIndices;
+                record[1] = allowed;
+                totalIndices += allowed;
+                stats.maxLightsPerCluster = std::max(stats.maxLightsPerCluster, allowed);
+            }
+        }
+    }
+    stats.indexCount = totalIndices;
+    stats.droppedIndices = static_cast<std::uint32_t>(references - totalIndices);
+
     words[0] = visible;
     words[1] = tilesX;
     words[2] = tilesY;
@@ -285,12 +340,18 @@ auto buildClusteredLightBinningInput(std::span<const ClusteredLightInput> lights
     words[8] = floatBits(sliceParams.scale);
     words[9] = floatBits(sliceParams.bias);
     writeLightRecords(lights, ranges, words.data() + lightOffset);
+    std::uint32_t* masks = words.data() + maskOffset;
     for (std::uint32_t lightIndex = 0; lightIndex < visible; ++lightIndex) {
         const LightRange& range = ranges[lightIndex];
-        std::uint32_t* box = words.data() + rangeOffset + lightIndex * kPointLightGpuRangeWords;
-        box[0] = range.x0 | (range.x1 << 16);
-        box[1] = range.y0 | (range.y1 << 16);
-        box[2] = range.z0 | (range.z1 << 16);
+        const std::uint32_t word = lightIndex >> 5;
+        const std::uint32_t bit = 1u << (lightIndex & 31u);
+        for (std::uint32_t x = range.x0; x <= range.x1; ++x) masks[x * maskWords + word] |= bit;
+        for (std::uint32_t y = range.y0; y <= range.y1; ++y) {
+            masks[(tilesX + y) * maskWords + word] |= bit;
+        }
+        for (std::uint32_t z = range.z0; z <= range.z1; ++z) {
+            masks[(tilesX + tilesY + z) * maskWords + word] |= bit;
+        }
     }
 
     params.tilesX = tilesX;
@@ -298,8 +359,9 @@ auto buildClusteredLightBinningInput(std::span<const ClusteredLightInput> lights
     params.slices = slices;
     params.clusterCount = clusterCount;
     params.visible = visible;
-    params.copyWords = gridOffset;
-    params.rangeOffset = rangeOffset;
+    params.copyWords = indexOffset;
+    params.maskOffset = maskOffset;
+    params.maskWords = maskWords;
     params.maxIndexCount = config.maxIndexCount;
     params.gridOffset = gridOffset;
     params.indexOffset = indexOffset;

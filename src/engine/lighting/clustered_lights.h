@@ -94,21 +94,24 @@ auto buildClusteredLightBuffer(std::span<const ClusteredLightInput> lights,
                                containers::Array<std::uint32_t>& words)
     -> ClusteredLightStats;
 
-// GPU binning (light_binning.comp and its HLSL/WGSL ports). The CPU still
-// culls the lights and computes every visible light's cluster box (the same
-// code as buildClusteredLightBuffer), then uploads:
+// GPU binning (light_binning.comp and its HLSL/WGSL ports). The CPU culls the
+// lights and computes every visible light's cluster box (the same code as
+// buildClusteredLightBuffer). It counts each cluster's lights from the boxes
+// with a 3D difference array (O(lights + clusters), no per-cluster loop) and
+// caps the counts to maxIndexCount in cluster order, then uploads:
 //   words[0, copyWords)   the finished output prefix: header, light records,
-//                         and `reservedWords` zeroed words after the records
-//                         (the renderer puts point-shadow matrices there)
-//   words[rangeOffset...] per visible light, 3 words: x0 | x1 << 16,
-//                         y0 | y1 << 16, z0 | z1 << 16
-// The compute passes copy the prefix and write the cluster records and light
-// lists, giving a buffer of `totalWords` words that matches the CPU layout:
-// the same header offsets, records and per-cluster lists in ascending light
-// order. Only the grid moves past the reserved words, which the header
-// offsets already describe. Requires tilesX, tilesY and slices < 65536.
-inline constexpr std::uint32_t kPointLightGpuRangeWords = 3;
-
+//                         `reservedWords` zeroed words after the records (the
+//                         renderer puts point-shadow matrices there), and the
+//                         cluster records (list offset, count)
+//   words[maskOffset...]  per-axis light masks, maskWords words per row:
+//                         tilesX column rows, then tilesY row rows, then
+//                         slices depth rows. Bit i of a row is set when
+//                         visible light i's box covers that column/row/slice.
+// One compute dispatch copies the prefix and writes every cluster's list by
+// ANDing its column, row, and slice masks, lowest bit first. The result
+// matches the CPU layout: the same header offsets, records, and per-cluster
+// lists in ascending light order. Only the grid moves past the reserved words,
+// which the header offsets already describe.
 struct ClusteredLightGpuParams {
     std::uint32_t tilesX = 0;
     std::uint32_t tilesY = 0;
@@ -116,7 +119,8 @@ struct ClusteredLightGpuParams {
     std::uint32_t clusterCount = 0;
     std::uint32_t visible = 0;
     std::uint32_t copyWords = 0;
-    std::uint32_t rangeOffset = 0;
+    std::uint32_t maskOffset = 0;
+    std::uint32_t maskWords = 0; // ceil(visible / 32)
     std::uint32_t maxIndexCount = 0;
     std::uint32_t gridOffset = 0;
     std::uint32_t indexOffset = 0;
@@ -124,8 +128,7 @@ struct ClusteredLightGpuParams {
     std::uint32_t totalWords = 0;
 };
 
-// Stats match buildClusteredLightBuffer except maxLightsPerCluster, which is
-// only known on the GPU and is reported as 0.
+// Stats match buildClusteredLightBuffer exactly, maxLightsPerCluster included.
 auto buildClusteredLightBinningInput(std::span<const ClusteredLightInput> lights,
                                      const math::Mat4& view, const math::Mat4& projection,
                                      float nearPlane, float farPlane,

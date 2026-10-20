@@ -898,7 +898,7 @@ auto validateRendererFrame() -> bool {
                         renderer.stats().pointLights == 1 &&
                         renderer.stats().pointLightsVisible == 1 &&
                         // Cluster binning ran as the WGSL compute pass.
-                        renderer.stats().pointLightBinningDispatches == 3;
+                        renderer.stats().pointLightBinningDispatches == 1;
                 }
                 if (pointLightsOk) {
                     for (std::size_t offset = 0; offset < gApp.pointLightCapture.size();
@@ -955,7 +955,7 @@ auto validateRendererFrame() -> bool {
                                          GfxError::None &&
                                      renderer.stats().pointShadowLights == 1 &&
                                      renderer.stats().pointShadowDraws > 0 &&
-                                     renderer.stats().pointLightBinningDispatches == 3;
+                                     renderer.stats().pointLightBinningDispatches == 1;
                 }
                 if (pointShadowsOk) {
                     for (std::size_t offset = 0; offset < gApp.effectCaptureA.size();

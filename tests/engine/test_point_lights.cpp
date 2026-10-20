@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -474,41 +475,30 @@ namespace {
 [[nodiscard]] auto emulateGpuBinning(const containers::Array<std::uint32_t>& input,
                                      const engine::ClusteredLightGpuParams& p)
     -> std::vector<std::uint32_t> {
+    // Mirrors light_binning.comp: every invocation copies one prefix word and
+    // cluster invocations walk their ANDed column/row/slice masks.
     std::vector<std::uint32_t> out(p.totalWords, 0xdeadbeefu);
-    for (std::uint32_t word = 0; word < p.copyWords; ++word) out[word] = input[word];
-    const auto covers = [&](std::uint32_t light, std::uint32_t x, std::uint32_t y,
-                            std::uint32_t z) {
-        const std::uint32_t* box = input.data() + p.rangeOffset + light * 3u;
-        return x >= (box[0] & 0xffffu) && x <= (box[0] >> 16) && y >= (box[1] & 0xffffu) &&
-               y <= (box[1] >> 16) && z >= (box[2] & 0xffffu) && z <= (box[2] >> 16);
-    };
-    std::vector<std::uint32_t> counts(p.clusterCount, 0);
-    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
-        const std::uint32_t x = cluster % p.tilesX;
-        const std::uint32_t y = (cluster / p.tilesX) % p.tilesY;
-        const std::uint32_t z = cluster / (p.tilesX * p.tilesY);
-        for (std::uint32_t light = 0; light < p.visible; ++light) {
-            if (covers(light, x, y, z)) ++counts[cluster];
-        }
-    }
-    std::uint32_t prefix = 0;
-    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
-        const std::uint32_t start = std::min(prefix, p.maxIndexCount);
-        out[p.gridOffset + cluster * 2u] = p.indexOffset + start;
-        out[p.gridOffset + cluster * 2u + 1u] = std::min(counts[cluster], p.maxIndexCount - start);
-        prefix += counts[cluster];
-    }
-    for (std::uint32_t cluster = 0; cluster < p.clusterCount; ++cluster) {
-        const std::uint32_t x = cluster % p.tilesX;
-        const std::uint32_t y = (cluster / p.tilesX) % p.tilesY;
-        const std::uint32_t z = cluster / (p.tilesX * p.tilesY);
-        const std::uint32_t first = out[p.gridOffset + cluster * 2u];
-        const std::uint32_t allowed = out[p.gridOffset + cluster * 2u + 1u];
-        std::uint32_t count = 0;
-        for (std::uint32_t light = 0; light < p.visible; ++light) {
-            if (!covers(light, x, y, z)) continue;
-            if (count < allowed) out[first + count] = light;
-            ++count;
+    const std::uint32_t threads = std::max(p.clusterCount, p.copyWords);
+    for (std::uint32_t id = 0; id < threads; ++id) {
+        if (id < p.copyWords) out[id] = input[id];
+        if (id >= p.clusterCount) continue;
+        const std::uint32_t first = input[p.gridOffset + id * 2u];
+        const std::uint32_t allowed = input[p.gridOffset + id * 2u + 1u];
+        const std::uint32_t x = id % p.tilesX;
+        const std::uint32_t y = (id / p.tilesX) % p.tilesY;
+        const std::uint32_t z = id / (p.tilesX * p.tilesY);
+        const std::uint32_t* rowX = input.data() + p.maskOffset + x * p.maskWords;
+        const std::uint32_t* rowY = input.data() + p.maskOffset + (p.tilesX + y) * p.maskWords;
+        const std::uint32_t* rowZ =
+            input.data() + p.maskOffset + (p.tilesX + p.tilesY + z) * p.maskWords;
+        std::uint32_t written = 0;
+        for (std::uint32_t word = 0; word < p.maskWords && written < allowed; ++word) {
+            std::uint32_t bits = rowX[word] & rowY[word] & rowZ[word];
+            while (bits != 0 && written < allowed) {
+                out[first + written] = word * 32u + static_cast<std::uint32_t>(std::countr_zero(bits));
+                ++written;
+                bits &= bits - 1u;
+            }
         }
     }
     return out;
@@ -588,6 +578,9 @@ TEST_CASE("Point lights: the GPU binning algorithm reproduces the CPU cluster bu
         CHECK(gpuStats.visible == cpuStats.visible);
         CHECK(gpuStats.indexCount == cpuStats.indexCount);
         CHECK(gpuStats.droppedIndices == cpuStats.droppedIndices);
+        CHECK(gpuStats.maxLightsPerCluster == cpuStats.maxLightsPerCluster);
+        CHECK(cpuStats.maxLightsPerCluster > 0);
+        CHECK(params.maskWords == (cpuStats.visible + 31u) / 32u);
         CHECK(cpuStats.visible > 200);
         if (cap == 3000u) CHECK(cpuStats.droppedIndices > 0);
         REQUIRE(params.totalWords == cpu.size());
@@ -1911,7 +1904,9 @@ void checkBinningFrames(const char* backend, const std::vector<BinningFrame>& fr
                 << " pixel mismatches=" << diff.mismatchPixelCount
                 << " buffer differences=" << bufferDifferences);
         CHECK(frame.cpuStats.pointLightBinningDispatches == 0);
-        CHECK(frame.gpuStats.pointLightBinningDispatches == 3);
+        CHECK(frame.gpuStats.pointLightBinningDispatches == 1);
+        CHECK(frame.gpuStats.maxPointLightsPerCluster == frame.cpuStats.maxPointLightsPerCluster);
+        CHECK(frame.gpuStats.maxPointLightsPerCluster > 0);
         CHECK(frame.cpuStats.pointLightsVisible >= 16);
         CHECK(frame.gpuStats.pointLightsVisible == frame.cpuStats.pointLightsVisible);
         CHECK(frame.gpuStats.pointLightReferences == frame.cpuStats.pointLightReferences);

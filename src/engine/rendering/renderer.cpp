@@ -728,8 +728,8 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         stats_.pointLightsVisible = frameLightStats_.visible;
         stats_.pointLightReferences = frameLightStats_.indexCount;
         stats_.pointLightReferencesDropped = frameLightStats_.droppedIndices;
-        stats_.maxPointLightsPerCluster = 0;
-        stats_.pointLightBinningDispatches = 3;
+        stats_.maxPointLightsPerCluster = frameLightStats_.maxLightsPerCluster;
+        stats_.pointLightBinningDispatches = 1;
     } else {
         pointLightBuffers_.beginFrame();
         framePointLights_ = preparePointLights(*camera, aspect);
@@ -1074,8 +1074,8 @@ void Renderer::writePointShadowWords(std::uint32_t matrixOffset) {
 namespace {
 
 struct LightBinningUbo {
-    std::uint32_t counts[4];  // pass, clusterCount, visible, copyWords
-    std::uint32_t offsets[4]; // rangeOffset, maxIndexCount, gridOffset, indexOffset
+    std::uint32_t counts[4];  // clusterCount, visible, copyWords, maskWords
+    std::uint32_t offsets[4]; // maskOffset, gridOffset, 0, 0
     std::uint32_t grid[4];    // tilesX, tilesY, slices, 0
 };
 
@@ -1108,7 +1108,7 @@ auto Renderer::ensureLightBinning() -> bool {
     desc.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
     auto pipeline = device_.createPipeline(desc);
     if (!pipeline.hasValue()) return unavailable();
-    if (lightBinningConstants_.create(device_, sizeof(LightBinningUbo), 3) !=
+    if (lightBinningConstants_.create(device_, sizeof(LightBinningUbo), 1) !=
             gfx::GfxError::None ||
         pointLightGpuBuffers_.create(
             device_, gfx::BufferUsage::Storage | gfx::BufferUsage::TransferSrc) !=
@@ -1167,33 +1167,23 @@ void Renderer::recordLightBinning(gfx::CommandBuffer& commandBuffer) {
     };
     const gfx::ResourceState written{gfx::PipelineStageMask::ComputeShader,
                                      gfx::ResourceAccessMask::ShaderWrite};
-    for (std::uint32_t pass = 0; pass < 3; ++pass) {
-        LightBinningUbo constants{{pass, p.clusterCount, p.visible, p.copyWords},
-                                  {p.rangeOffset, p.maxIndexCount, p.gridOffset, p.indexOffset},
-                                  {p.tilesX, p.tilesY, p.slices, 0u}};
-        const auto slot = lightBinningConstants_.alloc(
-            device_, std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
-        if (!slot.valid) {
-            recordError_ = gfx::GfxError::OutOfMemory;
-            return;
-        }
-        commandBuffer.bindPipeline(lightBinningPipeline_);
-        lightBinningConstants_.bind(commandBuffer, slot);
-        commandBuffer.bindResource(0, gfx::BindingType::StorageBuffer, framePointLightInput_.index,
-                                   framePointLightInput_.generation);
-        commandBuffer.bindResource(1, gfx::BindingType::StorageBuffer, framePointLights_.index,
-                                   framePointLights_.generation);
-        const std::uint32_t groupCount =
-            pass == 0 ? groups(std::max(p.clusterCount, p.copyWords))
-                      : (pass == 1 ? 1u : groups(p.clusterCount));
-        commandBuffer.dispatch(groupCount);
-        if (pass < 2) {
-            commandBuffer.bufferBarrier(
-                framePointLights_, written,
-                {gfx::PipelineStageMask::ComputeShader,
-                 gfx::ResourceAccessMask::ShaderRead | gfx::ResourceAccessMask::ShaderWrite});
-        }
+    // One dispatch: copy the prefix and fill every cluster's list.
+    const LightBinningUbo constants{{p.clusterCount, p.visible, p.copyWords, p.maskWords},
+                                    {p.maskOffset, p.gridOffset, 0u, 0u},
+                                    {p.tilesX, p.tilesY, p.slices, 0u}};
+    const auto slot = lightBinningConstants_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
+    if (!slot.valid) {
+        recordError_ = gfx::GfxError::OutOfMemory;
+        return;
     }
+    commandBuffer.bindPipeline(lightBinningPipeline_);
+    lightBinningConstants_.bind(commandBuffer, slot);
+    commandBuffer.bindResource(0, gfx::BindingType::StorageBuffer, framePointLightInput_.index,
+                               framePointLightInput_.generation);
+    commandBuffer.bindResource(1, gfx::BindingType::StorageBuffer, framePointLights_.index,
+                               framePointLights_.generation);
+    commandBuffer.dispatch(groups(std::max(p.clusterCount, p.copyWords)));
     commandBuffer.bufferBarrier(
         framePointLights_, written,
         {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});

@@ -2,128 +2,68 @@
 
 // Clustered point-light binning on the GPU (see clustered_lights.h).
 //
-// The CPU culls the lights and computes each visible light's cluster box
-// exactly as the CPU binning does, then uploads the finished buffer prefix
-// (header, light records, shadow matrices) followed by the boxes. Three
-// dispatches of this shader fill the cluster records and light lists:
-//   pass 0: copy the prefix; count the lights covering each cluster
-//   pass 1: one workgroup turns the counts into list offsets (prefix sum, cut
-//           to maxIndexCount in cluster order like the CPU)
-//   pass 2: write each cluster's list, lights in ascending order
-// so the output is word-for-word the CPU layout.
-// One source serves OpenGL (SSBO bindings 0/1) and Vulkan (-DF4_VULKAN=1,
-// storage slots 0/1 flatten to bindings 3/7).
+// The CPU culls the lights, computes each visible light's cluster box, and
+// derives every cluster's light count from the boxes with a 3D difference
+// array (O(lights + clusters)), so it uploads the finished buffer prefix:
+// header, light records, shadow matrices, and the cluster records (list
+// offset, count; capped to maxIndexCount in cluster order like the CPU path).
+// After the prefix come per-axis light masks: one bit per visible light for
+// every tile column, tile row, and depth slice the light's box covers. A
+// light lies in cluster (x, y, z) exactly when its bit is set in column x,
+// row y and slice z, so ANDing three mask words tests 32 lights at once.
+//
+// One dispatch: thread i copies prefix word i, and thread c < clusterCount
+// writes cluster c's light list by walking the ANDed mask words lowest bit
+// first, i.e. in ascending light order. The output is word-for-word the CPU
+// layout. One source serves OpenGL (SSBO bindings 0/1) and Vulkan
+// (-DF4_VULKAN=1, storage slots 0/1 flatten to bindings 3/7).
 
 #ifdef F4_VULKAN
 layout(set = 0, binding = 0, std140) uniform BinParams {
-    uvec4 counts;  // pass, clusterCount, visible, copyWords
-    uvec4 offsets; // rangeOffset, maxIndexCount, gridOffset, indexOffset
+    uvec4 counts;  // clusterCount, visible, copyWords, maskWords
+    uvec4 offsets; // maskOffset, gridOffset, 0, 0
     uvec4 grid;    // tilesX, tilesY, slices, 0
 } params;
-layout(set = 0, binding = 3, std430) buffer BinInput { uint words[]; } src;
-layout(set = 0, binding = 7, std430) buffer BinOutput { uint words[]; } dst;
+layout(set = 0, binding = 3, std430) readonly buffer BinInput { uint words[]; } src;
+layout(set = 0, binding = 7, std430) writeonly buffer BinOutput { uint words[]; } dst;
 #else
 layout(std140, binding = 0) uniform BinParams {
     uvec4 counts;
     uvec4 offsets;
     uvec4 grid;
 } params;
-layout(std430, binding = 0) buffer BinInput { uint words[]; } src;
-layout(std430, binding = 1) buffer BinOutput { uint words[]; } dst;
+layout(std430, binding = 0) readonly buffer BinInput { uint words[]; } src;
+layout(std430, binding = 1) writeonly buffer BinOutput { uint words[]; } dst;
 #endif
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-shared uint sRanges[64 * 3];
-shared uint sScan[64];
-
-bool covers(uint i, uvec3 cluster) {
-    uint rx = sRanges[i * 3u];
-    uint ry = sRanges[i * 3u + 1u];
-    uint rz = sRanges[i * 3u + 2u];
-    return cluster.x >= (rx & 0xffffu) && cluster.x <= (rx >> 16) &&
-           cluster.y >= (ry & 0xffffu) && cluster.y <= (ry >> 16) &&
-           cluster.z >= (rz & 0xffffu) && cluster.z <= (rz >> 16);
-}
-
-void binLights(bool fill) {
-    uint clusterCount = params.counts.y;
-    uint visible = params.counts.z;
-    uint rangeOffset = params.offsets.x;
-    uint gridOffset = params.offsets.z;
-    uint lane = gl_LocalInvocationID.x;
-    uint cluster = gl_GlobalInvocationID.x;
-    bool inGrid = cluster < clusterCount;
-    uvec3 coord = uvec3(cluster % params.grid.x, (cluster / params.grid.x) % params.grid.y,
-                        cluster / (params.grid.x * params.grid.y));
-    uint first = 0u;
-    uint allowed = 0u;
-    if (fill && inGrid) {
-        first = dst.words[gridOffset + cluster * 2u];
-        allowed = dst.words[gridOffset + cluster * 2u + 1u];
-    }
-    uint count = 0u;
-    for (uint base = 0u; base < visible; base += 64u) {
-        uint light = base + lane;
-        if (light < visible) {
-            sRanges[lane * 3u] = src.words[rangeOffset + light * 3u];
-            sRanges[lane * 3u + 1u] = src.words[rangeOffset + light * 3u + 1u];
-            sRanges[lane * 3u + 2u] = src.words[rangeOffset + light * 3u + 2u];
-        }
-        barrier();
-        uint n = min(64u, visible - base);
-        if (inGrid) {
-            for (uint i = 0u; i < n; ++i) {
-                if (covers(i, coord)) {
-                    if (fill && count < allowed) dst.words[first + count] = base + i;
-                    ++count;
-                }
-            }
-        }
-        barrier();
-    }
-    if (!fill && inGrid) dst.words[gridOffset + cluster * 2u + 1u] = count;
-}
-
-void scanCounts() {
-    uint clusterCount = params.counts.y;
-    uint maxIndexCount = params.offsets.y;
-    uint gridOffset = params.offsets.z;
-    uint indexOffset = params.offsets.w;
-    uint lane = gl_LocalInvocationID.x;
-    uint carry = 0u;
-    for (uint base = 0u; base < clusterCount; base += 64u) {
-        uint cluster = base + lane;
-        uint count = cluster < clusterCount ? dst.words[gridOffset + cluster * 2u + 1u] : 0u;
-        sScan[lane] = count;
-        barrier();
-        for (uint offset = 1u; offset < 64u; offset <<= 1u) {
-            uint add = lane >= offset ? sScan[lane - offset] : 0u;
-            barrier();
-            sScan[lane] += add;
-            barrier();
-        }
-        uint prefix = carry + sScan[lane] - count;
-        if (cluster < clusterCount) {
-            uint start = min(prefix, maxIndexCount);
-            dst.words[gridOffset + cluster * 2u] = indexOffset + start;
-            dst.words[gridOffset + cluster * 2u + 1u] = min(count, maxIndexCount - start);
-        }
-        carry += sScan[63];
-        barrier();
-    }
-}
-
 void main() {
-    uint passIndex = params.counts.x;
-    if (passIndex == 0u) {
-        uint word = gl_GlobalInvocationID.x;
-        if (word < params.counts.w) dst.words[word] = src.words[word];
-        // Workgroups past the last cluster only copy.
-        if (gl_WorkGroupID.x * 64u < params.counts.y) binLights(false);
-    } else if (passIndex == 1u) {
-        scanCounts();
-    } else {
-        binLights(true);
+    uint id = gl_GlobalInvocationID.x;
+    if (id < params.counts.z) dst.words[id] = src.words[id];
+    uint clusterCount = params.counts.x;
+    if (id >= clusterCount) return;
+    uint gridOffset = params.offsets.y;
+    uint first = src.words[gridOffset + id * 2u];
+    uint allowed = src.words[gridOffset + id * 2u + 1u];
+    if (allowed == 0u) return;
+    uint maskWords = params.counts.w;
+    uint tilesX = params.grid.x;
+    uint tilesY = params.grid.y;
+    uint x = id % tilesX;
+    uint y = (id / tilesX) % tilesY;
+    uint z = id / (tilesX * tilesY);
+    uint rowX = params.offsets.x + x * maskWords;
+    uint rowY = params.offsets.x + (tilesX + y) * maskWords;
+    uint rowZ = params.offsets.x + (tilesX + tilesY + z) * maskWords;
+    uint written = 0u;
+    for (uint word = 0u; word < maskWords && written < allowed; ++word) {
+        uint bits = src.words[rowX + word] & src.words[rowY + word] & src.words[rowZ + word];
+        while (bits != 0u && written < allowed) {
+            uint bit = uint(findLSB(bits));
+            dst.words[first + written] = word * 32u + bit;
+            ++written;
+            bits &= bits - 1u;
+        }
     }
 }

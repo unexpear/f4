@@ -32,8 +32,8 @@ struct FrameStats {
     std::uint32_t pointLightsVisible = 0;
     std::uint32_t pointLightReferences = 0;
     std::uint32_t pointLightReferencesDropped = 0;
-    // 0 when the GPU binned the lights (the per-cluster maximum stays on the
-    // GPU); see pointLightBinningDispatches.
+    // Largest per-cluster light count after the index cap (exact on both the
+    // CPU and the GPU binning path).
     std::uint32_t maxPointLightsPerCluster = 0;
     // Compute dispatches that binned the point lights this frame: 0 means the
     // CPU binned them (PbrRenderSettings::gpuLightBinning).
