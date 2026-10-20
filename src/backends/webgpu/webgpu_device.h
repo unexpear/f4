@@ -51,6 +51,14 @@ public:
     [[nodiscard]] auto stats() const -> DeviceStats override;
     auto resetFrameStats() -> void override;
 
+    // GPU timestamps through the optional "timestamp-query" feature (requested
+    // when the adapter offers it). Each writeTimestamp lands on the nearest
+    // pass boundary (timestampWrites); results come back through mapAsync and
+    // never block a frame.
+    [[nodiscard]] auto supportsGpuTimestamps() const -> bool override;
+    [[nodiscard]] auto lastGpuTimestampSerial() const -> std::uint64_t override;
+    auto latestGpuTimestamps() -> GpuTimestampFrame override;
+
 private:
     explicit WebGpuDevice(const char* canvasSelector);
 

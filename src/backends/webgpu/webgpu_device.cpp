@@ -1,6 +1,7 @@
 #include "backends/webgpu/webgpu_device.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include <emscripten/console.h>
 #include <webgpu/webgpu.h>
 
 #include "core/logging/logger.h"
@@ -323,6 +325,26 @@ struct WebGpuFramebuffer {
     GpuFramebuffer rec;
 };
 
+// Timestamp queries: per ring set, kMaxGpuTimestamps queries for the RHI
+// indices followed by kMaxGpuTimestamps scratch queries for pass boundaries
+// that no RHI timestamp maps to.
+constexpr std::uint32_t kTimestampQueriesPerSet = 2 * kMaxGpuTimestamps;
+constexpr std::uint64_t kTimestampSetBytes = kMaxGpuTimestamps * sizeof(std::uint64_t); // 256
+constexpr std::uint32_t kNoTimestamp = 0xFFFFFFFFu;
+
+enum class TimestampMapState : std::uint8_t { Idle, Mapping, Mapped };
+
+struct TimestampReadback {
+    WGPUBuffer buffer = nullptr;
+    TimestampMapState state = TimestampMapState::Idle;
+};
+
+void onTimestampMap(WGPUMapAsyncStatus status, WGPUStringView, void* userdata1, void*) {
+    auto* readback = static_cast<TimestampReadback*>(userdata1);
+    readback->state = status == WGPUMapAsyncStatus_Success ? TimestampMapState::Mapped
+                                                           : TimestampMapState::Idle;
+}
+
 [[nodiscard]] auto isDepthFormat(TextureFormat format) -> bool {
     return format == TextureFormat::Depth32F || format == TextureFormat::Depth24Stencil8;
 }
@@ -345,6 +367,24 @@ struct WebGpuDevice::Impl {
     std::vector<TextureFormat> surfaceFormats;
     std::vector<WGPUPresentMode> presentModes;
     DeviceStats stats;
+
+    // timestamp-query state (see kTimestampQueriesPerSet).
+    bool timestampQuery = false;
+    WGPUQuerySet timestampQueries = nullptr;
+    WGPUBuffer timestampResolve = nullptr;
+    std::array<TimestampReadback, kGpuTimestampSets> timestampReadback{};
+    GpuTimestampRing timestamps;
+
+    // Unmaps finished readbacks whose results nobody will read any more.
+    void recycleTimestampReadbacks() {
+        for (std::uint32_t set = 0; set < kGpuTimestampSets; ++set) {
+            TimestampReadback& readback = timestampReadback[set];
+            if (readback.state == TimestampMapState::Mapped && !timestamps.sets[set].pending) {
+                wgpuBufferUnmap(readback.buffer);
+                readback.state = TimestampMapState::Idle;
+            }
+        }
+    }
 
     ObjectStore<WebGpuBuffer, GpuBufferTag> buffers;
     ObjectStore<WebGpuTexture, GpuTextureTag> textures;
@@ -435,6 +475,9 @@ WebGpuDevice::WebGpuDevice(const char* canvasSelector) : impl_(new Impl()) {
         requiredFeatures.push_back(WGPUFeatureName_DepthClipControl);
         impl_->depthClipControl = true;
     }
+    const bool timestampQuery =
+        wgpuAdapterHasFeature(impl_->adapter, WGPUFeatureName_TimestampQuery) == WGPU_TRUE;
+    if (timestampQuery) requiredFeatures.push_back(WGPUFeatureName_TimestampQuery);
     WGPUDeviceDescriptor deviceDesc = WGPU_DEVICE_DESCRIPTOR_INIT;
     deviceDesc.requiredFeatureCount = requiredFeatures.size();
     deviceDesc.requiredFeatures = requiredFeatures.data();
@@ -466,6 +509,32 @@ WebGpuDevice::WebGpuDevice(const char* canvasSelector) : impl_(new Impl()) {
     impl_->queue = wgpuDeviceGetQueue(impl_->device);
     impl_->limitsValid =
         wgpuDeviceGetLimits(impl_->device, &impl_->limits) == WGPUStatus_Success;
+
+    if (timestampQuery && wgpuDeviceHasFeature(impl_->device, WGPUFeatureName_TimestampQuery) ==
+                              WGPU_TRUE) {
+        WGPUQuerySetDescriptor queryDesc = WGPU_QUERY_SET_DESCRIPTOR_INIT;
+        queryDesc.type = WGPUQueryType_Timestamp;
+        queryDesc.count = kGpuTimestampSets * kTimestampQueriesPerSet;
+        impl_->timestampQueries = wgpuDeviceCreateQuerySet(impl_->device, &queryDesc);
+        WGPUBufferDescriptor resolveDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
+        resolveDesc.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+        resolveDesc.size = kGpuTimestampSets * kTimestampSetBytes;
+        impl_->timestampResolve = wgpuDeviceCreateBuffer(impl_->device, &resolveDesc);
+        bool created = impl_->timestampQueries != nullptr && impl_->timestampResolve != nullptr;
+        for (TimestampReadback& readback : impl_->timestampReadback) {
+            WGPUBufferDescriptor readbackDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
+            readbackDesc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+            readbackDesc.size = kTimestampSetBytes;
+            readback.buffer = wgpuDeviceCreateBuffer(impl_->device, &readbackDesc);
+            created = created && readback.buffer != nullptr;
+        }
+        impl_->timestampQuery = created;
+    }
+    if (!impl_->timestampQuery) {
+        // Logged once per device, on the console rather than stderr: missing
+        // timer queries are not an error, GPU timers just report unavailable.
+        emscripten_console_log("f4 WebGPU: timestamp-query unavailable; GPU timers are off");
+    }
 }
 
 WebGpuDevice::~WebGpuDevice() {
@@ -498,6 +567,19 @@ WebGpuDevice::~WebGpuDevice() {
             wgpuBufferRelease(buffer->object);
         }
     });
+    for (TimestampReadback& readback : impl_->timestampReadback) {
+        if (readback.buffer == nullptr) continue;
+        wgpuBufferDestroy(readback.buffer);
+        wgpuBufferRelease(readback.buffer);
+    }
+    if (impl_->timestampResolve != nullptr) {
+        wgpuBufferDestroy(impl_->timestampResolve);
+        wgpuBufferRelease(impl_->timestampResolve);
+    }
+    if (impl_->timestampQueries != nullptr) {
+        wgpuQuerySetDestroy(impl_->timestampQueries);
+        wgpuQuerySetRelease(impl_->timestampQueries);
+    }
     if (impl_->surface != nullptr) {
         wgpuSurfaceUnconfigure(impl_->surface);
         wgpuSurfaceRelease(impl_->surface);
@@ -1259,6 +1341,111 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
     std::vector<BoundResource> boundResources;
     DeviceStats delta;
     GfxError error = GfxError::None;
+    const auto& list = commands.commands();
+
+    // GPU timestamps. WebGPU writes timestamps only at pass boundaries, so
+    // RHI timestamp i lands on the end of the pass right before it (the time
+    // its work finished) or, failing that, the start of the next pass. A
+    // WriteTimestamp also ends the open compute pass so passes stay separate.
+    wgpuInstanceProcessEvents(impl_->instance);
+    bool timestampsActive = false;
+    std::uint32_t timestampSet = 0;
+    std::uint32_t timestampCount = 0;
+    if (impl_->timestampQuery) {
+        std::uint32_t timestampMask = 0;
+        commands.timestampUsage(timestampCount, timestampMask);
+        if (timestampCount != 0) {
+            TimestampReadback& readback = impl_->timestampReadback[impl_->timestamps.next];
+            if (readback.state == TimestampMapState::Mapped) {
+                wgpuBufferUnmap(readback.buffer); // unread result of an old frame
+                readback.state = TimestampMapState::Idle;
+            }
+            if (readback.state == TimestampMapState::Idle) {
+                timestampSet = impl_->timestamps.begin(timestampCount, timestampMask);
+                timestampsActive = true;
+            } else {
+                // That set's readback is still mapping: this submit goes untimed,
+                // but still takes a serial so callers never pair it with another.
+                ++impl_->timestamps.lastSerial;
+            }
+        }
+    }
+    std::uint32_t timestampsPlaced = 0; // RHI indices already given a pass boundary
+    std::vector<std::uint32_t> pendingTimestamps;
+    std::uint32_t scratchQuery = 0;
+    WGPUPassTimestampWrites passTimestamps = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    auto queryIndex = [&](std::uint32_t index) {
+        return timestampSet * kTimestampQueriesPerSet + index;
+    };
+    auto scratchIndex = [&]() {
+        const std::uint32_t index = queryIndex(kMaxGpuTimestamps + scratchQuery);
+        scratchQuery = (scratchQuery + 1) % kMaxGpuTimestamps;
+        return index;
+    };
+    // An empty compute pass whose end writes RHI timestamp `index`.
+    auto timestampPass = [&](std::uint32_t index) {
+        WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        writes.querySet = impl_->timestampQueries;
+        writes.beginningOfPassWriteIndex = scratchIndex();
+        writes.endOfPassWriteIndex = queryIndex(index);
+        WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+        desc.timestampWrites = &writes;
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &desc);
+        if (pass == nullptr) return;
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    };
+    // The RHI timestamp written right after the pass that begins at `position`
+    // ends, if any.
+    auto timestampAfterPass = [&](std::size_t position, bool render) -> std::uint32_t {
+        std::size_t k = position + 1;
+        if (render) {
+            while (k < list.size() && list[k].kind != CommandKind::EndRenderPass) ++k;
+            if (k == list.size()) return kNoTimestamp;
+            ++k;
+            while (k < list.size() && (list[k].kind == CommandKind::ResourceBarrier ||
+                                       list[k].kind == CommandKind::BindResources)) {
+                ++k;
+            }
+        } else {
+            while (k < list.size() && list[k].kind != CommandKind::WriteTimestamp &&
+                   list[k].kind != CommandKind::BeginRenderPass) {
+                ++k;
+            }
+        }
+        if (k == list.size() || list[k].kind != CommandKind::WriteTimestamp) return kNoTimestamp;
+        const std::uint32_t index = list[k].timestampIndex;
+        if (index >= kMaxGpuTimestamps || (timestampsPlaced & (1u << index)) != 0) {
+            return kNoTimestamp;
+        }
+        return index;
+    };
+    // timestampWrites for a pass beginning at `position` (nullptr if none).
+    auto passTimestampWrites = [&](std::size_t position, bool render)
+        -> const WGPUPassTimestampWrites* {
+        if (!timestampsActive) return nullptr;
+        while (pendingTimestamps.size() > 1) {
+            timestampPass(pendingTimestamps.front());
+            pendingTimestamps.erase(pendingTimestamps.begin());
+        }
+        const std::uint32_t begin = pendingTimestamps.empty() ? kNoTimestamp
+                                                              : pendingTimestamps.front();
+        pendingTimestamps.clear();
+        const std::uint32_t end = timestampAfterPass(position, render);
+        if (begin == kNoTimestamp && end == kNoTimestamp) return nullptr;
+        if (end != kNoTimestamp) timestampsPlaced |= 1u << end;
+        passTimestamps = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        passTimestamps.querySet = impl_->timestampQueries;
+        passTimestamps.beginningOfPassWriteIndex =
+            begin != kNoTimestamp ? queryIndex(begin) : scratchIndex();
+        passTimestamps.endOfPassWriteIndex = end != kNoTimestamp ? queryIndex(end) : scratchIndex();
+        return &passTimestamps;
+    };
+    auto beginComputePass = [&](std::size_t position) {
+        WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+        desc.timestampWrites = passTimestampWrites(position, false);
+        computePass = wgpuCommandEncoderBeginComputePass(encoder, &desc);
+    };
 
     auto findBound = [&](std::uint32_t bindPoint, const BindingSlot& slot)
         -> const BoundResource* {
@@ -1328,7 +1515,8 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
         return GfxError::None;
     };
 
-    for (const Command& command : commands.commands()) {
+    for (std::size_t position = 0; position < list.size(); ++position) {
+        const Command& command = list[position];
         if (error != GfxError::None) break;
         switch (command.kind) {
         case CommandKind::ResourceBarrier:
@@ -1440,6 +1628,7 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             passDesc.colorAttachmentCount = colors.size();
             passDesc.colorAttachments = colors.empty() ? nullptr : colors.data();
             passDesc.depthStencilAttachment = hasDepth ? &depth : nullptr;
+            passDesc.timestampWrites = passTimestampWrites(position, true);
             renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
             if (renderPass == nullptr) error = GfxError::DeviceLost;
             else {
@@ -1449,10 +1638,19 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             break;
         }
         case CommandKind::WriteTimestamp:
-            // No timer queries on WebGPU yet (timestamp-query is optional and
-            // only writes at pass boundaries); validate and ignore.
             if (renderPass != nullptr || command.timestampIndex >= kMaxGpuTimestamps) {
                 error = GfxError::BadDescriptor;
+            } else if (timestampsActive) {
+                if (computePass != nullptr) {
+                    wgpuComputePassEncoderEnd(computePass);
+                    wgpuComputePassEncoderRelease(computePass);
+                    computePass = nullptr;
+                }
+                const std::uint32_t bit = 1u << command.timestampIndex;
+                if ((timestampsPlaced & bit) == 0) {
+                    timestampsPlaced |= bit;
+                    pendingTimestamps.push_back(command.timestampIndex);
+                }
             }
             break;
         case CommandKind::EndRenderPass:
@@ -1470,9 +1668,7 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             } else if (renderPass != nullptr && pipeline->render != nullptr) {
                 wgpuRenderPassEncoderSetPipeline(renderPass, pipeline->render);
             } else if (renderPass == nullptr && pipeline->compute != nullptr) {
-                if (computePass == nullptr) {
-                    computePass = wgpuCommandEncoderBeginComputePass(encoder, nullptr);
-                }
+                if (computePass == nullptr) beginComputePass(position);
                 wgpuComputePassEncoderSetPipeline(computePass, pipeline->compute);
             } else {
                 error = GfxError::BadDescriptor;
@@ -1596,6 +1792,14 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             }
             break;
         case CommandKind::Dispatch:
+            // A timestamp may have ended the compute pass since the bind.
+            if (computePass == nullptr && renderPass == nullptr && pipeline != nullptr &&
+                pipeline->compute != nullptr && timestampsActive) {
+                beginComputePass(position);
+                if (computePass != nullptr) {
+                    wgpuComputePassEncoderSetPipeline(computePass, pipeline->compute);
+                }
+            }
             if (computePass == nullptr || pipeline == nullptr || pipeline->compute == nullptr) {
                 error = GfxError::BadDescriptor;
             } else if (command.groupCountX == 0 || command.groupCountY == 0 ||
@@ -1624,12 +1828,24 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
         wgpuComputePassEncoderEnd(computePass);
         wgpuComputePassEncoderRelease(computePass);
     }
+    TimestampReadback* timestampReadback =
+        timestampsActive ? &impl_->timestampReadback[timestampSet] : nullptr;
+    if (error == GfxError::None && timestampReadback != nullptr) {
+        for (const std::uint32_t index : pendingTimestamps) timestampPass(index);
+        const std::uint64_t offset = timestampSet * kTimestampSetBytes;
+        wgpuCommandEncoderResolveQuerySet(encoder, impl_->timestampQueries, queryIndex(0),
+                                          timestampCount, impl_->timestampResolve, offset);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, impl_->timestampResolve, offset,
+                                             timestampReadback->buffer, 0, kTimestampSetBytes);
+    }
+    bool submitted = false;
     if (error == GfxError::None) {
         WGPUCommandBuffer nativeCommands = wgpuCommandEncoderFinish(encoder, nullptr);
         if (nativeCommands == nullptr) error = GfxError::DeviceLost;
         else {
             wgpuQueueSubmit(impl_->queue, 1, &nativeCommands);
             wgpuCommandBufferRelease(nativeCommands);
+            submitted = true;
             // Browser canvas textures are presented at the requestAnimationFrame
             // boundary. Emdawn deliberately rejects wgpuSurfacePresent().
             impl_->stats.drawCalls += delta.drawCalls;
@@ -1639,6 +1855,21 @@ auto WebGpuDevice::submit(CommandBuffer& commands) -> GfxError {
             impl_->stats.instances += delta.instances;
             impl_->stats.primitives += delta.primitives;
             impl_->stats.vertices += delta.vertices;
+        }
+    }
+    if (timestampReadback != nullptr) {
+        if (submitted) {
+            // Results arrive asynchronously; latestGpuTimestamps() picks them
+            // up (wgpuInstanceProcessEvents) without ever waiting.
+            WGPUBufferMapCallbackInfo callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+            callback.mode = WGPUCallbackMode_AllowProcessEvents;
+            callback.callback = onTimestampMap;
+            callback.userdata1 = timestampReadback;
+            timestampReadback->state = TimestampMapState::Mapping;
+            static_cast<void>(wgpuBufferMapAsync(timestampReadback->buffer, WGPUMapMode_Read, 0,
+                                                 kTimestampSetBytes, callback));
+        } else {
+            impl_->timestamps.sets[timestampSet].pending = false;
         }
     }
     wgpuCommandEncoderRelease(encoder);
@@ -1657,6 +1888,36 @@ auto WebGpuDevice::waitIdle() -> void {
     callback.userdata1 = &request;
     const WGPUFuture future = wgpuQueueOnSubmittedWorkDone(impl_->queue, callback);
     static_cast<void>(waitFor(impl_->instance, future));
+}
+
+auto WebGpuDevice::supportsGpuTimestamps() const -> bool {
+    return impl_ != nullptr && impl_->timestampQuery;
+}
+
+auto WebGpuDevice::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_->timestamps.lastSerial;
+}
+
+auto WebGpuDevice::latestGpuTimestamps() -> GpuTimestampFrame {
+    if (!supportsGpuTimestamps() || !ready()) return {};
+    wgpuInstanceProcessEvents(impl_->instance);
+    const GpuTimestampFrame frame = impl_->timestamps.poll(
+        [&](std::uint32_t set, const GpuTimestampRing::Set& info,
+            std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+            TimestampReadback& readback = impl_->timestampReadback[set];
+            if (readback.state != TimestampMapState::Mapped) return false;
+            const void* mapped =
+                wgpuBufferGetConstMappedRange(readback.buffer, 0, kTimestampSetBytes);
+            if (mapped != nullptr) {
+                // WebGPU timestamps are already nanoseconds.
+                std::memcpy(ns.data(), mapped, info.count * sizeof(std::uint64_t));
+            }
+            wgpuBufferUnmap(readback.buffer);
+            readback.state = TimestampMapState::Idle;
+            return mapped != nullptr;
+        });
+    impl_->recycleTimestampReadbacks();
+    return frame;
 }
 
 auto WebGpuDevice::stats() const -> DeviceStats {

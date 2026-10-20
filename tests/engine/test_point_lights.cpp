@@ -622,6 +622,15 @@ TEST_CASE("Point lights: the null device always bins on the CPU") {
     CHECK(renderer.stats().pointLightBinningDispatches == 0);
     CHECK(renderer.stats().pointLightsVisible > 0);
     CHECK(device.stats().dispatchCalls == 0);
+    // No timer queries: GPU timers report unavailable, never zero timings.
+    renderer.pbrSettings().gpuTimers = true;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(renderer.render(framebuffer.value(), camera, 1.0f) == gfx::GfxError::None);
+    }
+    CHECK_FALSE(renderer.stats().gpuTimersAvailable);
+    CHECK_FALSE(renderer.stats().gpuTimingValid);
+    CHECK(renderer.stats().gpuPassCount == 0);
+    CHECK(renderer.stats().gpuFrameMs == 0.0);
 }
 
 TEST_CASE("Point lights: the renderer uploads and binds clustered lights for every draw") {
@@ -1919,6 +1928,7 @@ void checkBinningFrames(const char* backend, const std::vector<BinningFrame>& fr
         // and timing does not change the image.
         const engine::FrameStats& timed = frame.timedStats;
         CHECK(frame.timestampsSupported);
+        CHECK(timed.gpuTimersAvailable);
         CHECK(timed.gpuTimingValid);
         std::string passes;
         double passSum = 0.0;

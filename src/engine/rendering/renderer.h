@@ -65,6 +65,9 @@ struct FrameStats {
     double gpuMainPassMs = 0.0;     // "main" pass (PBR shading)
     std::uint32_t gpuTimingLag = 0;  // render() calls since the timed frame
     bool gpuTimingValid = false;
+    // gpuTimers is on and the device has timer queries. When false the GPU
+    // fields above stay 0 and gpuTimingValid stays false: "unavailable".
+    bool gpuTimersAvailable = false;
 };
 
 struct PbrRenderSettings {

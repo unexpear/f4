@@ -2121,6 +2121,9 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
     stats_.pointShadowLightsRedrawn =
         framePointShadowsActive_ && framePointShadowsDirty_ ? pointShadowRedrawn_ : 0u;
     stats_.bloomPasses = bloomPasses_;
+    stats_.gpuTimersAvailable = pbrSettings_.gpuTimers && device_.supportsGpuTimestamps();
+    // Timers off or unsupported: report unavailable, not a stale or zero timing.
+    if (!stats_.gpuTimersAvailable) gpuTiming_ = FrameStats{};
     stats_.gpuTimingValid = gpuTiming_.gpuTimingValid;
     stats_.gpuPassCount = gpuTiming_.gpuPassCount;
     for (std::uint32_t i = 0; i < gpuTiming_.gpuPassCount; ++i) {
