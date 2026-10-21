@@ -971,12 +971,47 @@ Completed delivery and acceptance gates:
     tolerance. Upper-left OpenGL == Vulkan within that tolerance (0
     mismatches). Default OpenGL may differ only in tie pixels: at most 64, one
     per lamp cube in the row; 41 here.
-  - Not changed: the OpenGL backend keeps the lower-left origin. Switching
-    it to upper-left would make ties resolve like Vulkan/DX12 everywhere.
-    But it would also flip the GL shadow and atlas UVs, the viewport and
-    scissor y, window presentation (or need a flip at present), the bloom
-    composite to the window, and every GL readback. That is a
-    backend-wide convention change for its own PR.
+  - Superseded by the upper-left origin item below (branch
+    `gl/upper-left-origin`): OpenGL now matches exactly and the tolerance is
+    gone.
+- ✅ OpenGL upper-left clip origin for offscreen targets (2026-10-20, branch
+  `gl/upper-left-origin`, stacked on `lights/point-lights`).
+  - `BeginRenderPass` sets `glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE)` for
+    framebuffer objects and `GL_LOWER_LEFT` for the window (framebuffer 0).
+    `EndRenderPass` restores `GL_LOWER_LEFT`, so code outside the RHI sees
+    the conventional origin. Offscreen rows are now stored top-down exactly
+    as on Vulkan and DX12:
+    - texture v = 0 is the top of a rendered image;
+    - RHI viewport/scissor y counts from the top;
+    - edges exactly through pixel centres resolve to the same side.
+  - The window keeps the lower-left origin, so it is presented upright with no
+    extra blit: NDC +y is up in both. There, viewport and scissor y are
+    mirrored against the framebuffer height (`windowY`). Face culling is
+    unchanged because the extension negates the polygon area under
+    GL_UPPER_LEFT.
+  - Shaders and CPU code that depended on the old origin:
+    - `pbr_opengl.frag`: the sun-shadow and point-shadow atlas lookups use
+      the Vulkan/DX12 formula `v = 0.5 - 0.5 * ndc.y`.
+    - `Renderer::recordPointShadows`: the GL-only atlas row order is gone;
+      every backend writes slot `s` to row block `rows - 1 - s`.
+    - `post_bloom_opengl`: `gl_FragCoord` is top-down in framebuffer objects
+      but bottom-up in the window. The vertex shader now passes a top-down
+      `vUv`, and the fragment shader flips v when the two disagree by more
+      than half a pixel (the composite into the window). Offscreen bloom
+      passes keep the exact `gl_FragCoord` arithmetic.
+    - `demo_render_validation` (hybrid deferred scene): the lighting pass
+      samples the G-buffer at `v = 1 - vUv.y`.
+    - Tests: the OpenGL readback flips are gone (point-light captures and
+      the M11 PBR captures). OpenGL FBO readbacks are now in the same row
+      order as Vulkan/DX12.
+  - Results: the 4,096-light parity scene matches across GL, VK, and DX12
+    (0 mismatching pixels, max delta 0; it was 41 px, max delta 48). The
+    fill-rule tie test asserts that all three cover rows 4-10 (GL used to
+    cover 5-11). Every other parity row stays at 0 mismatches. Demo
+    captures (scenes 0-20, 30 frames, before vs after) match exactly
+    outside the HUD text in every static scene. Animated scenes were checked
+    by eye: night lights (bloom aligned, pillar shadows), hybrid deferred,
+    and others are upright and unchanged.
 - Still open:
   - Metal has every shader and binding written but was not compiled or run
     (no Apple hardware). It bins on the CPU and has no timer queries.
@@ -989,10 +1024,6 @@ Completed delivery and acceptance gates:
     but measured no real gain, so it is off by default. Larger shadow/atlas
     work (many uncached shadowed lights) is where it could pay off; the
     shadowed 4,096 bench gained 0.4-3.5%, within noise.
-  - OpenGL resolves fill-rule ties (edges exactly through pixel centres)
-    on the other side from Vulkan/DX12 because it stores images bottom-up
-    (see the item below). A GL_UPPER_LEFT origin would remove this, but it is
-    a backend-wide change.
   - Bloom has no lens dirt or anamorphic options.
   - The 1,024-per-type object stores crash on overflow instead of returning
     an error, so two renderers cannot share one GL device.

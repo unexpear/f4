@@ -321,6 +321,22 @@ struct OpenGLDevice::Impl {
     GLuint boundIndexBuffer_ = 0;
     IndexFormat boundIndexFormat_ = IndexFormat::U16;
     GlFramebuffer* boundFramebuffer_ = nullptr;
+    // Clip origin of the current render pass: GL_UPPER_LEFT for framebuffer
+    // objects (rows stored top-down like Vulkan/DX12), GL_LOWER_LEFT for the
+    // window, which GL presents bottom-up. Restored to GL_LOWER_LEFT at the end
+    // of every pass so code outside the RHI sees the conventional origin.
+    bool clipUpperLeft_ = false;
+
+    // RHI viewport/scissor y counts rows from the top of the target. With the
+    // upper-left origin that is GL's window y as-is; on the window (lower-left
+    // origin) it is mirrored.
+    [[nodiscard]] auto windowY(std::uint32_t y, std::uint32_t height) const -> GLint {
+        if (boundFramebuffer_ == nullptr || boundFramebuffer_->fbo != 0) {
+            return static_cast<GLint>(y);
+        }
+        return static_cast<GLint>(boundFramebuffer_->rec.extent.height) -
+               static_cast<GLint>(y) - static_cast<GLint>(height);
+    }
 
     // GL state cache — engine-owned GL state is only modified through submit().
     // This avoids redundant state changes when the same pipeline is re-bound.
@@ -947,6 +963,19 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 return GfxError::InvalidHandle;
             }
             glBindFramebuffer(GL_FRAMEBUFFER, fb->fbo);
+            // Offscreen targets render with an upper-left origin so their rows
+            // are stored top-down exactly as on Vulkan and DX12: texture v = 0
+            // is the top of the image, RHI viewport/scissor y counts from the
+            // top, and edges through pixel centres resolve to the same side.
+            // The window keeps the lower-left origin so it is presented upright
+            // (NDC +y is up in both); there viewport/scissor y are mirrored.
+            {
+                const bool upperLeft = fb->fbo != 0;
+                if (upperLeft != impl_->clipUpperLeft_) {
+                    glClipControl(upperLeft ? GL_UPPER_LEFT : GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+                    impl_->clipUpperLeft_ = upperLeft;
+                }
+            }
             // Scissor is dynamic per pass. Reset it before clears so state from
             // an earlier pass cannot clip this pass's attachments.
             if (impl_->glScissorTest_) {
@@ -1008,6 +1037,10 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
         case CommandKind::EndRenderPass: {
             impl_->renderPassActive_ = false;
             impl_->boundFramebuffer_ = nullptr;
+            if (impl_->clipUpperLeft_) {
+                glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+                impl_->clipUpperLeft_ = false;
+            }
             break;
         }
         case CommandKind::WriteTimestamp:
@@ -1168,7 +1201,7 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
         }
         case CommandKind::SetViewport: {
             glViewport(static_cast<GLint>(command.viewportX),
-                       static_cast<GLint>(command.viewportY),
+                       impl_->windowY(command.viewportY, command.viewport.height),
                        static_cast<GLsizei>(command.viewport.width),
                        static_cast<GLsizei>(command.viewport.height));
             break;
@@ -1178,7 +1211,8 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 glEnable(GL_SCISSOR_TEST);
                 impl_->glScissorTest_ = true;
             }
-            glScissor(static_cast<GLint>(command.scissorX), static_cast<GLint>(command.scissorY),
+            glScissor(static_cast<GLint>(command.scissorX),
+                      impl_->windowY(command.scissorY, command.scissor.height),
                       static_cast<GLsizei>(command.scissor.width),
                       static_cast<GLsizei>(command.scissor.height));
             break;

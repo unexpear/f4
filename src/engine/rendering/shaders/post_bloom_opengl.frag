@@ -6,6 +6,7 @@ layout(std140, binding = 0) uniform PostUbo {
 };
 uniform sampler2D uTex;
 uniform sampler2D uTex1;
+layout(location = 0) in vec2 vUv;
 layout(location = 0) out vec4 outColor;
 
 #define SAMPLE0(p) textureLod(uTex, (p), 0.0)
@@ -15,8 +16,12 @@ layout(location = 0) out vec4 outColor;
 // chosen by params1.x: 0 prefilter (threshold + 2x downsample), 1 downsample,
 // 2 upsample (tent of the coarser level + this level), 3 composite (scene +
 // bloom * intensity, then the same ACES + sRGB encode as the PBR pass).
-// Texture coordinates come from the pixel position, so no backend needs a
-// flip: every API rasterizes and samples its own render targets the same way.
+// Texture coordinates come from the pixel position. Render targets are stored
+// top-down on every backend (OpenGL renders offscreen passes with an
+// upper-left clip origin), so in a framebuffer object gl_FragCoord.y already
+// counts rows from the top. The window keeps GL's lower-left origin, where it
+// counts from the bottom: there the composite flips v. vUv (top-down, from the
+// vertex shader) tells the two apart; uv itself stays exact pixel arithmetic.
 vec3 linearToSrgb(vec3 c) {
     c = max(c, vec3(0.0));
     vec3 low = c * 12.92;
@@ -35,6 +40,7 @@ vec3 acesToneMap(vec3 color) {
 
 void main() {
     vec2 uv = gl_FragCoord.xy * params1.zw;
+    if (abs(uv.y - vUv.y) > 0.5 * params1.w) uv.y = 1.0 - uv.y; // window target
     int mode = int(params1.x + 0.5);
     vec2 t = params0.xy;
     if (mode <= 1) {

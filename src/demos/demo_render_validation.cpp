@@ -865,14 +865,18 @@ uniform sampler2D uTex;
 uniform sampler2D uTex1;
 out vec4 fragColor;
 void main() {
-    vec4 albedoSample = texture(uTex, vUv);
+    // The G-buffer is a render target: stored top-down (OpenGL renders
+    // offscreen passes with an upper-left clip origin), so v runs from the top
+    // while vUv.y runs up the window.
+    vec2 st = vec2(vUv.x, 1.0 - vUv.y);
+    vec4 albedoSample = texture(uTex, st);
     if (albedoSample.a < 0.5) {
         vec3 low = vec3(0.018, 0.032, 0.065);
         vec3 high = vec3(0.11, 0.19, 0.28);
         fragColor = vec4(mix(low, high, vUv.y), 1.0);
         return;
     }
-    vec3 N = normalize(texture(uTex1, vUv).xyz * 2.0 - 1.0);
+    vec3 N = normalize(texture(uTex1, st).xyz * 2.0 - 1.0);
     vec3 L = normalize(vec3(-0.45, 0.8, 0.55));
     float diffuse = max(dot(N, L), 0.0);
     float rim = pow(1.0 - max(N.z, 0.0), 2.0);

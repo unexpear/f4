@@ -70,19 +70,6 @@ using PbrCapture = std::array<std::uint8_t,
             capture[offset + 3]};
 }
 
-void flipCaptureRows(PbrCapture& capture) {
-    constexpr std::size_t rowBytes = kCaptureExtent * 4u;
-    for (std::size_t y = 0; y < kCaptureExtent / 2; ++y) {
-        const std::size_t top = y * rowBytes;
-        const std::size_t bottom = (kCaptureExtent - y - 1) * rowBytes;
-        for (std::size_t x = 0; x < rowBytes; ++x) {
-            const std::uint8_t value = capture[top + x];
-            capture[top + x] = capture[bottom + x];
-            capture[bottom + x] = value;
-        }
-    }
-}
-
 #ifdef F4_GRAPHICS_HAS_METAL
 [[nodiscard]] auto decodeBase64(const std::string& encoded) -> std::vector<std::byte> {
     const auto decode = [](char character) -> int {
@@ -328,7 +315,6 @@ template <typename Reader>
 
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
                 gfx::GfxError::None);
-        if (device.backend() == gfx::Backend::OpenGL) flipCaptureRows(pixels);
     }
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
     CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
