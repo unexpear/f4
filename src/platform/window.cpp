@@ -3,6 +3,7 @@
 #include <SDL2/SDL.h>
 #if defined(_WIN32)
 #include <SDL2/SDL_syswm.h>
+#include <windows.h>
 #endif
 #if defined(F4_PLATFORM_HAS_VULKAN)
 #include <SDL2/SDL_vulkan.h>
@@ -12,8 +13,11 @@
 #endif
 
 #include <cstdio>
+#include <cstring>
 
 #include "core/assert.h"
+#include "core/logging/logger.h"
+#include "graphics/gpu_selection.h"
 
 namespace f4::platform {
 
@@ -38,6 +42,46 @@ namespace {
 auto glMajor_ = 4;
 auto glMinor_ = 3;
 
+// OpenGL cannot enumerate adapters. Hybrid-GPU drivers instead read the
+// NvOptimusEnablement / AmdPowerXpressRequestHighPerformance exports of the
+// executable (platform/high_performance_gpu.cpp) when their ICD loads, so the
+// F4_GPU=integrated override clears them before the first GL window.
+void applyOpenGlGpuPreference() {
+    static bool applied = false;
+    if (applied) return;
+    applied = true;
+    const gfx::GpuPreference preference = gfx::gpuPreferenceFromEnvironment();
+#if defined(_WIN32)
+    HMODULE executable = GetModuleHandleW(nullptr);
+    const auto exported = [&](const char* symbol) -> void* {
+        const FARPROC address = GetProcAddress(executable, symbol);
+        void* data = nullptr;
+        static_assert(sizeof(address) == sizeof(data));
+        std::memcpy(&data, &address, sizeof(data));
+        return data;
+    };
+    auto* nvidia = static_cast<unsigned long*>(exported("NvOptimusEnablement"));
+    auto* amd = static_cast<int*>(exported("AmdPowerXpressRequestHighPerformance"));
+    if (preference.mode == gfx::GpuPreferenceMode::Integrated) {
+        if (nvidia != nullptr) *nvidia = 0;
+        if (amd != nullptr) *amd = 0;
+    }
+    if (nvidia == nullptr && amd == nullptr) {
+        F4_LOG_INFO() << "OpenGL GPU hint (F4_GPU=" << gfx::gpuPreferenceName(preference)
+                      << "): executable exports no Optimus/PowerXpress hint";
+    } else {
+        F4_LOG_INFO() << "OpenGL GPU hint (F4_GPU=" << gfx::gpuPreferenceName(preference)
+                      << "): NvOptimusEnablement=" << (nvidia != nullptr ? *nvidia : 0ul)
+                      << " AmdPowerXpressRequestHighPerformance="
+                      << (amd != nullptr ? *amd : 0);
+    }
+#endif
+    if (preference.mode == gfx::GpuPreferenceMode::Index) {
+        F4_LOG_WARNING() << "OpenGL cannot select an adapter by index; F4_GPU="
+                         << preference.index << " is ignored for OpenGL";
+    }
+}
+
 } // namespace
 
 auto Window::createInternal(const WindowDesc& desc, Api api)
@@ -47,6 +91,7 @@ auto Window::createInternal(const WindowDesc& desc, Api api)
     }
 
     if (api == Api::OpenGL) {
+        applyOpenGlGpuPreference();
         // Request a core-profile GL 4.3 context (vertex-attrib-binding API +
         // implicit FBOs + glReadPixels for the headless conformance path).
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, glMajor_);

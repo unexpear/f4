@@ -44,6 +44,7 @@ add_executable(f4_tests
     core/test_transform.cpp
     core/test_shapes.cpp
     core/test_frustum.cpp
+    graphics/test_gpu_selection.cpp
     graphics/test_rhi.cpp
     engine/test_m8.cpp
     engine/test_m11.cpp
@@ -52,16 +53,19 @@ add_executable(f4_tests
     engine/test_m14.cpp
     engine/test_m15.cpp
     engine/test_m16.cpp
+    engine/test_point_lights.cpp
 )
 target_include_directories(f4_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(f4_tests PRIVATE f4_core f4_graphics f4_engine doctest::doctest)
 target_compile_definitions(f4_tests PRIVATE
     F4_UFBX_TEST_DATA_DIR="${ufbx_SOURCE_DIR}/data"
     F4_TINYUSDZ_TEST_DATA_DIR="${tinyusdz_SOURCE_DIR}/models"
+    F4_EFFECT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
 )
 f4_set_warnings(f4_tests)
 f4_set_float_precision(f4_tests)
 f4_enable_sanitizers(f4_tests)
+f4_prefer_high_performance_gpu(f4_tests)
 
 # Headless OpenGL conformance: only on toolchains where the GL backend exists
 # (MSYS2 ucrt64 / GCC). F4_GRAPHICS_HAS_OPENGL is set by src/CMakeLists.txt and

@@ -13,6 +13,7 @@
 #include "graphics/gfx_error.h"
 #include "graphics/handle.h"
 #include "graphics/pipeline/pipeline_state.h"
+#include "graphics/render_graph/render_graph.h"
 #include "graphics/sampler/sampler_desc.h"
 #include "graphics/shader/shader_desc.h"
 #include "graphics/texture/texture_desc.h"
@@ -884,4 +885,48 @@ TEST_CASE("Resources: typed bindResource validates texture/sampler handles") {
         cb.end();
         CHECK(d->submit(cb) == GfxError::InvalidHandle);
     }
+}
+
+TEST_CASE("RHI: waitAsyncCompute marks the split point once; graphs fall back inline") {
+    CommandBuffer commands;
+    commands.begin();
+    CHECK(commands.asyncComputeWaitIndex() == CommandBuffer::kNoAsyncComputeWait);
+    commands.setViewport({8, 8});
+    commands.waitAsyncCompute();
+    commands.setScissor({8, 8});
+    commands.waitAsyncCompute(); // the first call wins
+    commands.end();
+    CHECK(commands.asyncComputeWaitIndex() == 1);
+    commands.begin(); // begin() clears it
+    CHECK(commands.asyncComputeWaitIndex() == CommandBuffer::kNoAsyncComputeWait);
+    commands.end();
+
+    // A device without an async compute queue: the asyncCompute pass is
+    // recorded inline, in declaration order, and the wait is ignored.
+    NullDevice device;
+    CHECK_FALSE(device.supportsAsyncCompute());
+    CommandBuffer compute;
+    compute.begin();
+    compute.end();
+    CHECK(device.submitAsyncCompute(compute) == GfxError::BackendUnavailable);
+    RenderGraph graph;
+    graph.setAsyncCompute(true);
+    std::vector<int> order;
+    PassDesc binning;
+    binning.name = String("async");
+    binning.asyncCompute = true;
+    binning.record = [&](CommandBuffer&) { order.push_back(0); };
+    (void)graph.declarePass(static_cast<PassDesc&&>(binning));
+    PassDesc wait;
+    wait.name = String("wait");
+    wait.record = [&](CommandBuffer& cb) {
+        cb.waitAsyncCompute();
+        order.push_back(1);
+    };
+    (void)graph.declarePass(static_cast<PassDesc&&>(wait));
+    CommandBuffer frame;
+    CHECK(graph.execute(device, frame) == GfxError::None);
+    CHECK_FALSE(graph.asyncComputeUsed());
+    CHECK(order == std::vector<int>{0, 1});
+    CHECK(graph.clear(device) == GfxError::None);
 }

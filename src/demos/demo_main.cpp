@@ -33,6 +33,7 @@
 #include "demos/demo_hierarchy.h"
 #include "demos/demo_cornell_box.h"
 #include "demos/demo_render_validation.h"
+#include "demos/demo_night_lights.h"
 
 using namespace f4::demo;
 
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
     bench.addScene(new AlphaOrderScene());    // 17 / Shift+9 - sorted vs reversed transparency
     bench.addScene(new NormalMapOrientationScene()); // 18 / Tab or CLI - tangent-space Y orientation
     bench.addScene(new HybridRenderingScene());      // 19 / Tab or CLI - deferred opaque + forward alpha
+    bench.addScene(new NightLightsScene());          // 20 / Tab or CLI - clustered point lights, [ ] P M B K
 
     if (initialScene > 0 && initialScene < static_cast<int>(bench.sceneCount()) &&
         !bench.setScene(static_cast<std::size_t>(initialScene))) {

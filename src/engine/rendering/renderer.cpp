@@ -1,7 +1,9 @@
 #include "engine/rendering/renderer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -13,6 +15,8 @@
 #include "core/math/mat4.h"
 #include "engine/cameras/camera.h"
 #include "engine/lighting/light.h"
+#include "engine/lighting/point_shadows.h"
+#include "engine/rendering/effect_shaders.h"
 #include "graphics/buffer/buffer_desc.h"
 #include "graphics/framebuffer/framebuffer_desc.h"
 #include "graphics/sampler/sampler_desc.h"
@@ -46,6 +50,85 @@ struct ShadowUbo {
     math::Vec4 alphaParams;
 };
 static_assert(sizeof(ShadowUbo) == 144, "ShadowUbo must match std140/HLSL layout");
+
+struct PointShadowUbo {
+    math::Mat4 faceViewProj;
+    math::Mat4 reserved; // unused: casters are instanced (model in the instance stream)
+    math::Vec4 lightPositionInvRange;
+    math::Vec4 tileTransform;
+    math::Vec4 alphaParams;
+};
+static_assert(sizeof(PointShadowUbo) == 176, "PointShadowUbo must match std140/HLSL layout");
+
+struct BloomUbo {
+    math::Vec4 params0; // source texel size xy, threshold, knee
+    math::Vec4 params1; // mode, intensity, 1 / target size xy
+};
+static_assert(sizeof(BloomUbo) == 32, "BloomUbo must match std140/HLSL layout");
+
+constexpr std::uint32_t kBloomMaxLevels = 8;
+
+[[nodiscard]] auto floatWord(float value) -> std::uint32_t {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+[[nodiscard]] auto pointShadowGroupKey(resources::MeshHandle mesh,
+                                       resources::MaterialHandle material,
+                                       std::uint32_t subMesh) -> std::array<std::uint64_t, 3> {
+    return {(static_cast<std::uint64_t>(mesh.index) << 32) | mesh.generation,
+            (static_cast<std::uint64_t>(material.index) << 32) | material.generation, subMesh};
+}
+
+// FNV-1a over the exact bits of everything a shadow tile depends on.
+struct SignatureHash {
+    std::uint64_t value = 0xcbf29ce484222325ull;
+    void add(std::uint32_t word) {
+        for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+            value ^= (word >> shift) & 0xffu;
+            value *= 0x100000001b3ull;
+        }
+    }
+    void add(float number) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &number, sizeof(bits));
+        add(bits);
+    }
+    void add(const math::Vec3& v) {
+        add(v.x);
+        add(v.y);
+        add(v.z);
+    }
+    void add(const math::Vec4& v) {
+        add(v.x);
+        add(v.y);
+        add(v.z);
+        add(v.w);
+    }
+};
+
+[[nodiscard]] auto sphereTouchesBox(const math::Vec3& center, float radius,
+                                    const math::AABB& box) -> bool {
+    const math::Vec3 closest(std::clamp(center.x, box.min.x, box.max.x),
+                             std::clamp(center.y, box.min.y, box.max.y),
+                             std::clamp(center.z, box.min.z, box.max.z));
+    return math::lengthSq(closest - center) <= radius * radius;
+}
+
+[[nodiscard]] auto createRenderTexture(gfx::IDevice& device, gfx::TextureFormat format,
+                                       gfx::Extent extent, const float (&clear)[4],
+                                       float clearDepth)
+    -> Result<gfx::TextureHandle, gfx::GfxError> {
+    gfx::TextureDesc desc;
+    desc.format = format;
+    desc.width = extent.width;
+    desc.height = extent.height;
+    desc.hasOptimizedClear = true;
+    for (std::size_t i = 0; i < 4; ++i) desc.optimizedClear.color[i] = clear[i];
+    desc.optimizedClear.depth = clearDepth;
+    return device.createTexture(desc);
+}
 
 inline constexpr std::uint32_t kInstanceModelLocation = 9;
 inline constexpr std::uint32_t kInstanceNormalLocation = 13;
@@ -334,9 +417,37 @@ void Renderer::releaseInitializationResources() {
     shadowSampler_ = {};
     environmentSampler_ = {};
     surfaceSampler_ = {};
+    releasePointShadowAtlas();
+    releaseBloomTargets();
+    if (bloomHdrPipeline_.isValid()) (void)device_.destroyPipeline(bloomHdrPipeline_);
+    if (bloomCompositePipeline_.isValid()) (void)device_.destroyPipeline(bloomCompositePipeline_);
+    if (bloomVs_.isValid()) (void)device_.destroyShader(bloomVs_);
+    if (bloomFs_.isValid()) (void)device_.destroyShader(bloomFs_);
+    if (bloomTriangle_.isValid()) (void)device_.destroyBuffer(bloomTriangle_);
+    if (bloomSampler_.isValid()) (void)device_.destroySampler(bloomSampler_);
+    bloomHdrPipeline_ = {};
+    bloomCompositePipeline_ = {};
+    bloomVs_ = {};
+    bloomFs_ = {};
+    bloomTriangle_ = {};
+    bloomSampler_ = {};
+    bloomConstants_.destroy(device_);
+    pointShadowConstants_.destroy(device_);
+    pointShadowInstanceBuffers_.destroy(device_);
     shadowConstants_.destroy(device_);
     sceneConstants_.destroy(device_);
     sceneInstances_.destroy(device_);
+    pointLightBuffers_.destroy(device_);
+    pointLightGpuBuffers_.destroy(device_);
+    lightBinningConstants_.destroy(device_);
+    if (lightBinningPipeline_.isValid()) (void)device_.destroyPipeline(lightBinningPipeline_);
+    if (lightBinningShader_.isValid()) (void)device_.destroyShader(lightBinningShader_);
+    lightBinningPipeline_ = {};
+    lightBinningShader_ = {};
+    lightBinningUnavailable_ = false;
+    framePointLightsReady_ = false;
+    framePointLightInput_ = {};
+    framePointLights_ = {};
     defaultEnvironmentMipCount_ = 1;
     inited_ = false;
 }
@@ -370,7 +481,24 @@ auto Renderer::init() -> gfx::GfxError {
         error != gfx::GfxError::None) {
         return fail(error);
     }
+    if (const auto error = pointShadowConstants_.create(device_, sizeof(PointShadowUbo), 64);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
+    if (const auto error = bloomConstants_.create(device_, sizeof(BloomUbo), 16);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
     if (const auto error = sceneInstances_.create(device_, gfx::BufferUsage::Vertex);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
+    if (const auto error = pointShadowInstanceBuffers_.create(device_, gfx::BufferUsage::Vertex);
+        error != gfx::GfxError::None) {
+        return fail(error);
+    }
+    if (const auto error = pointLightBuffers_.create(
+            device_, gfx::BufferUsage::Storage | gfx::BufferUsage::HostWrite);
         error != gfx::GfxError::None) {
         return fail(error);
     }
@@ -593,6 +721,23 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
     const math::Frustum frustum = math::Frustum::fromViewProjection(camera->viewProj);
     sceneConstants_.beginFrame();
     sceneInstances_.beginFrame();
+    if (framePointLightsReady_) {
+        // render() binned the lights on the GPU; its compute pass ran first.
+        framePointLightsReady_ = false;
+        stats_.pointLights = frameLightStats_.submitted;
+        stats_.pointLightsVisible = frameLightStats_.visible;
+        stats_.pointLightReferences = frameLightStats_.indexCount;
+        stats_.pointLightReferencesDropped = frameLightStats_.droppedIndices;
+        stats_.maxPointLightsPerCluster = frameLightStats_.maxLightsPerCluster;
+        stats_.pointLightBinningDispatches = 1;
+    } else {
+        pointLightBuffers_.beginFrame();
+        framePointLights_ = preparePointLights(*camera, aspect);
+    }
+    if (!framePointLights_.isValid()) {
+        recordError_ = gfx::GfxError::OutOfMemory;
+        return;
+    }
     queue_.clear();
 
     for (auto [entity, renderer, world] :
@@ -610,13 +755,13 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
             continue;
         }
         if (const auto error = materials_.ensurePipeline(
-                device_, renderer.material, entry->instancedLayout);
+                device_, renderer.material, entry->instancedLayout, recordColorFormat_);
             error != gfx::GfxError::None) {
             recordError_ = error;
             continue;
         }
-        const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(renderer.material, entry->instancedLayout);
+        const gfx::PipelineHandle pipeline = materials_.pipelineFor(
+            renderer.material, entry->instancedLayout, recordColorFormat_);
         if (!pipeline.isValid()) continue;
         RenderItem item;
         item.entity = entity;
@@ -651,7 +796,7 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         const StandardMaterial* material = materials_.get(item.material);
         if (entry == nullptr || material == nullptr) continue;
         const gfx::PipelineHandle pipeline =
-            materials_.pipelineFor(item.material, entry->instancedLayout);
+            materials_.pipelineFor(item.material, entry->instancedLayout, recordColorFormat_);
         if (!pipeline.isValid()) continue;
 
         instanceStaging_.clear();
@@ -709,7 +854,8 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
             std::max(pbrSettings_.shadowBias, 0.0f), frameShadowsActive_ ? 1.0f : 0.0f,
             static_cast<float>(environmentMipCount > 0 ? environmentMipCount - 1 : 0)};
         constants.ambientFlags = {std::max(pbrSettings_.ambientIntensity, 0.0f),
-                                  static_cast<float>(flags), 0.0f, 0.0f};
+                                  static_cast<float>(flags), frameBloomActive_ ? 1.0f : 0.0f,
+                                  0.0f};
         const auto slot = sceneConstants_.alloc(
             device_, std::span(reinterpret_cast<const std::byte*>(&constants),
                                sizeof(constants)));
@@ -720,6 +866,9 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
 
         commandBuffer.bindPipeline(pipeline);
         sceneConstants_.bind(commandBuffer, slot);
+        commandBuffer.bindResource(pointLightStorageSlot(device_.backend()),
+                                   gfx::BindingType::StorageBuffer,
+                                   framePointLights_.index, framePointLights_.generation);
         const gfx::TextureHandle textures[7] = {
             resolveTexture(material->desc.albedo, whiteTex_),
             resolveTexture(material->desc.normal, neutralNormalTex_),
@@ -741,6 +890,14 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
                                        samplers[resourceSlot].index,
                                        samplers[resourceSlot].generation);
         }
+        const PointShadowBinding atlasBinding = pointShadowAtlasBinding(device_.backend());
+        const gfx::TextureHandle atlas =
+            framePointShadowsActive_ ? pointShadowColorTex_ : whiteTex_;
+        commandBuffer.bindResource(atlasBinding.bindPoint, atlasBinding.slot,
+                                   gfx::BindingType::Texture, atlas.index, atlas.generation);
+        commandBuffer.bindResource(atlasBinding.bindPoint, atlasBinding.slot,
+                                   gfx::BindingType::Sampler, shadowSampler_.index,
+                                   shadowSampler_.generation);
         bindMesh(commandBuffer, entry->gpu);
         commandBuffer.bindVertexBuffer(entry->instanceBinding, instanceSlot.handle,
                                        kRenderInstanceStride);
@@ -750,6 +907,316 @@ void Renderer::record(gfx::CommandBuffer& commandBuffer, ecs::Entity cameraEntit
         ++stats_.draws;
         stats_.instances += static_cast<std::uint32_t>(instanceStaging_.size());
     }
+}
+
+void Renderer::gatherPointLights() {
+    pointLightInputs_.clear();
+    pointLightCastsShadow_.clear();
+    pointLightKeys_.clear();
+    if (!pbrSettings_.pointLightsEnabled) return;
+    for (auto [entity, light] : ecs::View<PointLight>(registry_)) {
+        ClusteredLightInput input;
+        input.position = light.position;
+        if (const ecs::WorldMatrix* world = registry_.get<ecs::WorldMatrix>(entity)) {
+            input.position = world->matrix.transformPoint(light.position);
+        }
+        input.radiance = math::maxComponentwise(light.color, math::Vec3(0.0f)) *
+                         std::max(light.intensity, 0.0f);
+        input.range = light.range;
+        pointLightInputs_.push(input);
+        pointLightCastsShadow_.push(light.castShadows ? 1u : 0u);
+        pointLightKeys_.push((static_cast<std::uint64_t>(entity.index) << 32) |
+                             entity.generation);
+    }
+}
+
+auto Renderer::preparePointShadows(const Camera& camera) -> gfx::GfxError {
+    framePointShadowsActive_ = false;
+    framePointShadowsDirty_ = false;
+    framePointShadowsFullClear_ = true;
+    frameShadowedLights_.clear();
+    frameShadowFaces_.clear();
+    pointLightsGathered_ = false;
+    const auto invalidateCache = [this] {
+        std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(), std::uint8_t{0});
+    };
+    const std::uint32_t budget = std::min(pbrSettings_.pointShadowBudget, kPointShadowMaxBudget);
+    if (!pbrSettings_.pointLightsEnabled || !pbrSettings_.pointShadowsEnabled || budget == 0) {
+        invalidateCache();
+        return gfx::GfxError::None;
+    }
+    gatherPointLights();
+    pointLightsGathered_ = true;
+
+    bool anyCaster = false;
+    for (auto [entity, renderer] : ecs::View<MeshRenderer>(registry_)) {
+        (void)entity;
+        if (renderer.castShadows) {
+            anyCaster = true;
+            break;
+        }
+    }
+    if (!anyCaster) {
+        invalidateCache();
+        return gfx::GfxError::None;
+    }
+
+    const math::Frustum frustum = math::Frustum::fromViewProjection(camera.viewProj);
+    shadowCandidates_.clear();
+    shadowCandidateSources_.clear();
+    for (std::size_t i = 0; i < pointLightInputs_.size(); ++i) {
+        if (pointLightCastsShadow_[i] == 0) continue;
+        const ClusteredLightInput& light = pointLightInputs_[i];
+        if (!(light.range > 0.0f)) continue;
+        const math::Vec3 reach(light.range);
+        if (!frustum.intersects(math::AABB{light.position - reach, light.position + reach})) {
+            continue;
+        }
+        shadowCandidates_.push({light.position, light.radiance, light.range});
+        shadowCandidateSources_.push(static_cast<std::uint32_t>(i));
+    }
+    selectShadowedPointLights(
+        std::span<const PointShadowCandidate>(shadowCandidates_.data(),
+                                              shadowCandidates_.size()),
+        camera.eye, budget, shadowSelection_);
+    if (shadowSelection_.isEmpty()) {
+        invalidateCache();
+        return gfx::GfxError::None;
+    }
+    if (const auto error = ensurePointShadowAtlas(budget); error != gfx::GfxError::None) {
+        return error;
+    }
+    if (const auto error = ensurePointShadowResetMesh(); error != gfx::GfxError::None) {
+        return error;
+    }
+
+    // Stable slots: a light keeps its atlas row while it stays selected.
+    shadowSlotKeys_.clear();
+    for (const std::uint32_t candidate : shadowSelection_) {
+        shadowSlotKeys_.push(pointLightKeys_[shadowCandidateSources_[candidate]]);
+    }
+    const containers::Array<std::uint64_t> previousOwners = pointShadowSlotOwners_;
+    assignStablePointShadowSlots(
+        std::span<const std::uint64_t>(shadowSlotKeys_.data(), shadowSlotKeys_.size()),
+        pointShadowSlotOwners_, shadowSlots_);
+    for (std::size_t slot = 0; slot < pointShadowSlotOwners_.size(); ++slot) {
+        if (pointShadowSlotOwners_[slot] != previousOwners[slot] ||
+            pointShadowSlotOwners_[slot] == kPointShadowFreeSlot) {
+            pointShadowSlotValid_[slot] = 0;
+        }
+    }
+    std::uint32_t slotCount = 0;
+    for (const std::uint32_t slot : shadowSlots_) {
+        if (slot < budget) slotCount = std::max(slotCount, slot + 1u);
+    }
+    frameShadowedLights_.resize(slotCount);
+    std::fill(frameShadowedLights_.begin(), frameShadowedLights_.end(), ShadowedPointLight{});
+    frameShadowFaces_.resize(static_cast<std::size_t>(slotCount) * kPointShadowFaces);
+    std::fill(frameShadowFaces_.begin(), frameShadowFaces_.end(), math::Mat4::identity());
+    for (std::size_t i = 0; i < shadowSelection_.size(); ++i) {
+        const std::uint32_t slot = shadowSlots_[i];
+        if (slot >= slotCount) continue;
+        ClusteredLightInput& light =
+            pointLightInputs_[shadowCandidateSources_[shadowSelection_[i]]];
+        light.shadowSlot = slot + 1u;
+        ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+        shadowed.position = light.position;
+        shadowed.range = light.range;
+        shadowed.active = true;
+        for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+            frameShadowFaces_[slot * kPointShadowFaces + face] =
+                pointShadowFaceViewProj(light.position, light.range, face);
+        }
+    }
+
+    // Dirty tracking: a slot is redrawn unless its signature (light + every
+    // caster inside its sphere) matches the one its tiles were drawn with.
+    gatherPointShadowCasters();
+    for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
+        ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+        if (!shadowed.active) continue;
+        shadowed.signature = pointShadowSignature(shadowed.position, shadowed.range);
+        shadowed.dirty = !pbrSettings_.pointShadowCaching || pointShadowSlotValid_[slot] == 0 ||
+                         pointShadowSlotSignatures_[slot] != shadowed.signature;
+        framePointShadowsDirty_ = framePointShadowsDirty_ || shadowed.dirty;
+        framePointShadowsFullClear_ = framePointShadowsFullClear_ && shadowed.dirty;
+    }
+    framePointShadowsActive_ = true;
+    return gfx::GfxError::None;
+}
+
+// Point-shadow header words and face matrices; the matrices go at
+// `matrixOffset` (the CPU path appends them, the GPU path reserves room after
+// the light records).
+void Renderer::writePointShadowWords(std::uint32_t matrixOffset) {
+    if (!framePointShadowsActive_ || frameShadowedLights_.isEmpty()) return;
+    const std::size_t matrixWords = frameShadowFaces_.size() * 16u;
+    if (pointLightWords_.size() < matrixOffset + matrixWords) {
+        pointLightWords_.resize(matrixOffset + matrixWords);
+    }
+    pointLightWords_[10] = matrixOffset;
+    pointLightWords_[11] = static_cast<std::uint32_t>(frameShadowedLights_.size());
+    pointLightWords_[12] = pointShadowRows_;
+    pointLightWords_[13] = floatWord(std::max(pbrSettings_.pointShadowBias, 0.0f));
+    pointLightWords_[14] = floatWord(2.0f / static_cast<float>(pointShadowTileSize_));
+    std::uint32_t* out = pointLightWords_.data() + matrixOffset;
+    for (const math::Mat4& face : frameShadowFaces_) {
+        for (std::uint32_t column = 0; column < 4; ++column) {
+            const math::Vec4& c = face.col[column];
+            *out++ = floatWord(c.x);
+            *out++ = floatWord(c.y);
+            *out++ = floatWord(c.z);
+            *out++ = floatWord(c.w);
+        }
+    }
+}
+
+namespace {
+
+struct LightBinningUbo {
+    std::uint32_t counts[4];  // clusterCount, visible, copyWords, maskWords
+    std::uint32_t offsets[4]; // maskOffset, gridOffset, 0, 0
+    std::uint32_t grid[4];    // tilesX, tilesY, slices, 0
+};
+
+constexpr std::uint32_t kLightBinningGroupSize = 64;
+
+} // namespace
+
+auto Renderer::ensureLightBinning() -> bool {
+    if (lightBinningPipeline_.isValid()) return true;
+    if (lightBinningUnavailable_ || device_.backend() == gfx::Backend::Null) return false;
+    const auto unavailable = [this] {
+        if (lightBinningShader_.isValid()) (void)device_.destroyShader(lightBinningShader_);
+        lightBinningShader_ = {};
+        lightBinningConstants_.destroy(device_);
+        pointLightGpuBuffers_.destroy(device_);
+        lightBinningUnavailable_ = true;
+        return false;
+    };
+    auto shader = loadEffectShader(device_, EffectShader::LightBinningCompute);
+    if (!shader.hasValue()) return unavailable();
+    lightBinningShader_ = shader.value();
+    gfx::PipelineStateDesc desc;
+    desc.computeShader = lightBinningShader_;
+    gfx::BindGroup group;
+    group.bindPoint = 0;
+    const std::uint32_t compute = gfx::shaderStageBit(gfx::ShaderStage::Compute);
+    group.slots.push({0, gfx::BindingType::UniformBuffer, compute, 1});
+    group.slots.push({0, gfx::BindingType::StorageBuffer, compute, 1});
+    group.slots.push({1, gfx::BindingType::StorageBuffer, compute, 1});
+    desc.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+    auto pipeline = device_.createPipeline(desc);
+    if (!pipeline.hasValue()) return unavailable();
+    if (lightBinningConstants_.create(device_, sizeof(LightBinningUbo), 1) !=
+            gfx::GfxError::None ||
+        pointLightGpuBuffers_.create(
+            device_, gfx::BufferUsage::Storage | gfx::BufferUsage::TransferSrc) !=
+            gfx::GfxError::None) {
+        (void)device_.destroyPipeline(pipeline.value());
+        return unavailable();
+    }
+    lightBinningPipeline_ = pipeline.value();
+    return true;
+}
+
+auto Renderer::preparePointLightsGpu(const Camera& camera, float aspect) -> bool {
+    framePointLightsReady_ = false;
+    if (!pbrSettings_.gpuLightBinning || !pbrSettings_.pointLightsEnabled) return false;
+    const ClusterGridConfig& grid = pbrSettings_.pointLightClusters;
+    if (grid.tilesX > 0xffffu || grid.tilesY > 0xffffu || grid.slices > 0xffffu) return false;
+    if (!ensureLightBinning()) return false;
+    if (!pointLightsGathered_) {
+        gatherPointLights();
+        pointLightsGathered_ = true;
+    }
+    const std::uint32_t shadowWords =
+        framePointShadowsActive_ && !frameShadowedLights_.isEmpty()
+            ? static_cast<std::uint32_t>(frameShadowFaces_.size() * 16u)
+            : 0u;
+    const float safeAspect = aspect > 0.0f ? aspect : 1.0f;
+    frameLightStats_ = buildClusteredLightBinningInput(
+        std::span<const ClusteredLightInput>(pointLightInputs_.data(),
+                                             pointLightInputs_.size()),
+        cameraView(camera), cameraProj(camera, safeAspect), camera.nearPlane, camera.farPlane,
+        grid, shadowWords, pointLightWords_, frameBinning_);
+    // Nothing to bin: the CPU path writes the header-only buffer. Grids or
+    // buffers past the 65535-workgroup dispatch limit also bin on the CPU.
+    if (frameBinning_.visible == 0) return false;
+    if (std::max(frameBinning_.clusterCount,
+                 (frameBinning_.copyWords + kLightBinningGroupSize - 1u) /
+                     kLightBinningGroupSize) > 65535u) {
+        return false;
+    }
+    pointLightsGathered_ = false;
+    if (shadowWords != 0) writePointShadowWords(frameBinning_.reservedOffset);
+
+    pointLightBuffers_.beginFrame();
+    pointLightGpuBuffers_.beginFrame();
+    const DynamicBufferRing::Slot input = pointLightBuffers_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(pointLightWords_.data()),
+                           pointLightWords_.size() * sizeof(std::uint32_t)));
+    const DynamicBufferRing::Slot output = pointLightGpuBuffers_.allocUninitialized(
+        device_, frameBinning_.totalWords * static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+    if (!input.valid || !output.valid) return false;
+    framePointLightInput_ = input.handle;
+    framePointLights_ = output.handle;
+    framePointLightsReady_ = true;
+    return true;
+}
+
+void Renderer::recordLightBinning(gfx::CommandBuffer& commandBuffer) {
+    const ClusteredLightGpuParams& p = frameBinning_;
+    lightBinningConstants_.beginFrame();
+    const auto groups = [](std::uint32_t threads) {
+        return (threads + kLightBinningGroupSize - 1u) / kLightBinningGroupSize;
+    };
+    const gfx::ResourceState written{gfx::PipelineStageMask::ComputeShader,
+                                     gfx::ResourceAccessMask::ShaderWrite};
+    // One dispatch: copy the prefix and fill every cluster's list.
+    const LightBinningUbo constants{{p.clusterCount, p.visible, p.copyWords, p.maskWords},
+                                    {p.maskOffset, p.gridOffset, 0u, 0u},
+                                    {p.tilesX, p.tilesY, p.slices, 0u}};
+    const auto slot = lightBinningConstants_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
+    if (!slot.valid) {
+        recordError_ = gfx::GfxError::OutOfMemory;
+        return;
+    }
+    commandBuffer.bindPipeline(lightBinningPipeline_);
+    lightBinningConstants_.bind(commandBuffer, slot);
+    commandBuffer.bindResource(0, gfx::BindingType::StorageBuffer, framePointLightInput_.index,
+                               framePointLightInput_.generation);
+    commandBuffer.bindResource(1, gfx::BindingType::StorageBuffer, framePointLights_.index,
+                               framePointLights_.generation);
+    // Workgroup c bins cluster c; every workgroup also copies 64 prefix words.
+    commandBuffer.dispatch(std::max(p.clusterCount, groups(p.copyWords)));
+    // Overlap order: the "light-binning-wait" pass holds this barrier.
+    if (frameBinningOverlap_) return;
+    commandBuffer.bufferBarrier(
+        framePointLights_, written,
+        {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});
+}
+
+auto Renderer::preparePointLights(const Camera& camera, float aspect) -> gfx::BufferHandle {
+    if (!pointLightsGathered_) gatherPointLights();
+    pointLightsGathered_ = false;
+    const float safeAspect = aspect > 0.0f ? aspect : 1.0f;
+    const ClusteredLightStats lightStats = buildClusteredLightBuffer(
+        std::span<const ClusteredLightInput>(pointLightInputs_.data(),
+                                             pointLightInputs_.size()),
+        cameraView(camera), cameraProj(camera, safeAspect), camera.nearPlane,
+        camera.farPlane, pbrSettings_.pointLightClusters, pointLightWords_);
+    stats_.pointLights = lightStats.submitted;
+    stats_.pointLightsVisible = lightStats.visible;
+    stats_.pointLightReferences = lightStats.indexCount;
+    stats_.pointLightReferencesDropped = lightStats.droppedIndices;
+    stats_.maxPointLightsPerCluster = lightStats.maxLightsPerCluster;
+    writePointShadowWords(static_cast<std::uint32_t>(pointLightWords_.size()));
+    const DynamicBufferRing::Slot slot = pointLightBuffers_.alloc(
+        device_, std::span(reinterpret_cast<const std::byte*>(pointLightWords_.data()),
+                           pointLightWords_.size() * sizeof(std::uint32_t)));
+    return slot.valid ? slot.handle : gfx::BufferHandle{};
 }
 
 void Renderer::recordShadow(gfx::CommandBuffer& commandBuffer) {
@@ -795,11 +1262,669 @@ void Renderer::recordShadow(gfx::CommandBuffer& commandBuffer) {
     }
 }
 
+void Renderer::gatherPointShadowCasters() {
+    // Casters grouped by (mesh, material, submesh) so each group is one
+    // instanced draw per light face, like the main pass.
+    pointShadowCasters_.clear();
+    for (auto [entity, renderer, world] :
+         ecs::View<MeshRenderer, ecs::WorldMatrix>(registry_)) {
+        (void)entity;
+        if (!renderer.castShadows) continue;
+        const auto* entry = meshMap_.find(renderer.mesh);
+        const StandardMaterial* material = materials_.get(renderer.material);
+        if (entry == nullptr || material == nullptr || isBlended(material->desc)) continue;
+        PointShadowCaster caster;
+        caster.mesh = renderer.mesh;
+        caster.material = renderer.material;
+        caster.subMesh = renderer.subMeshIndex;
+        caster.model = world.matrix;
+        if (entry->mesh.bounds.isValid()) {
+            caster.bounds = entry->mesh.bounds.transformed(world.matrix);
+            caster.cullable = caster.bounds.isValid();
+        }
+        pointShadowCasters_.push(caster);
+    }
+    std::stable_sort(pointShadowCasters_.begin(), pointShadowCasters_.end(),
+                     [](const PointShadowCaster& a, const PointShadowCaster& b) {
+                         return pointShadowGroupKey(a.mesh, a.material, a.subMesh) <
+                                pointShadowGroupKey(b.mesh, b.material, b.subMesh);
+                     });
+}
+
+auto Renderer::pointShadowSignature(const math::Vec3& position, float range) const
+    -> std::uint64_t {
+    SignatureHash hash;
+    hash.add(position);
+    hash.add(range);
+    hash.add(pointShadowTileSize_);
+    hash.add(pointShadowRows_);
+    for (const PointShadowCaster& caster : pointShadowCasters_) {
+        if (caster.cullable && !sphereTouchesBox(position, range, caster.bounds)) continue;
+        hash.add(caster.mesh.index);
+        hash.add(caster.mesh.generation);
+        hash.add(caster.material.index);
+        hash.add(caster.material.generation);
+        hash.add(caster.subMesh);
+        hash.add(caster.cullable ? 1u : 0u);
+        for (const math::Vec4& column : caster.model.col) hash.add(column);
+        if (const StandardMaterial* material = materials_.get(caster.material)) {
+            // Everything the shadow shader reads from the material.
+            hash.add(material->desc.tint.w);
+            hash.add(material->desc.alphaCutoff);
+            hash.add(static_cast<std::uint32_t>(material->desc.alphaMode));
+            const gfx::TextureHandle albedo = resolveTexture(material->desc.albedo, whiteTex_);
+            hash.add(albedo.index);
+            hash.add(albedo.generation);
+        }
+    }
+    return hash.value;
+}
+
+auto Renderer::ensurePointShadowResetMesh() -> gfx::GfxError {
+    if (pointShadowResetMesh_.isValid() && meshMap_.find(pointShadowResetMesh_) != nullptr) {
+        return gfx::GfxError::None;
+    }
+    // One triangle covering clip space at z = 0.5 with the identity face
+    // matrix; with the light at the origin and a huge 1/range every fragment
+    // stores clamp(|p| * 1e4) = 1.0, the same value the atlas clear writes.
+    struct ResetVertex {
+        float position[3];
+        float uv[2];
+    };
+    static constexpr ResetVertex kVertices[3] = {
+        {{-1.0f, -1.0f, 0.5f}, {0.0f, 0.0f}},
+        {{3.0f, -1.0f, 0.5f}, {2.0f, 0.0f}},
+        {{-1.0f, 3.0f, 0.5f}, {0.0f, 2.0f}},
+    };
+    static constexpr std::uint16_t kIndices[3] = {0, 1, 2};
+    resources::Mesh mesh;
+    resources::VertexStream stream;
+    stream.strideBytes = sizeof(ResetVertex);
+    stream.data.resize(sizeof(kVertices));
+    std::memcpy(stream.data.data(), kVertices, sizeof(kVertices));
+    mesh.streams.push(static_cast<resources::VertexStream&&>(stream));
+    mesh.attributes.push({resources::VertexSemantic::Position, resources::VertexFormat::F32_3, 0,
+                          0});
+    mesh.attributes.push({resources::VertexSemantic::TexCoord0, resources::VertexFormat::F32_2,
+                          0, 12});
+    mesh.indexFormat = resources::IndexFormat::U16;
+    mesh.indices.resize(sizeof(kIndices));
+    std::memcpy(mesh.indices.data(), kIndices, sizeof(kIndices));
+    mesh.submeshes.push({0, 3});
+    pointShadowResetMesh_ = createMesh(mesh);
+    return pointShadowResetMesh_.isValid() ? gfx::GfxError::None : gfx::GfxError::OutOfMemory;
+}
+
+void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
+    pointShadowConstants_.beginFrame();
+    pointShadowInstanceBuffers_.beginFrame();
+    pointShadowDraws_ = 0;
+    pointShadowRedrawn_ = 0;
+    const auto rows = pointShadowRows_;
+    const std::uint32_t tile = pointShadowTileSize_;
+    // Stored rows of a slot's tiles: the PBR shader reads slot `s` at atlas
+    // NDC rows (see pointShadowTileTransform), which is stored row block `s`
+    // on OpenGL and `rows - 1 - s` elsewhere.
+    const auto selectTile = [&](std::size_t slot, std::uint32_t face) {
+        const std::uint32_t rowBlock = device_.backend() == gfx::Backend::OpenGL
+                                           ? static_cast<std::uint32_t>(slot)
+                                           : rows - 1u - static_cast<std::uint32_t>(slot);
+        commandBuffer.setViewport(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
+        commandBuffer.setScissor(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
+    };
+
+    // Tile reset for partial redraws: the pass keeps the cached colour, so a
+    // dirty slot first rewrites its six tiles to 1.0 (depth is cleared for
+    // the whole atlas every pass, exactly as in the full-clear path).
+    gfx::PipelineHandle resetPipeline{};
+    const MeshEntry* resetEntry = nullptr;
+    DynamicBufferRing::Slot resetInstance{};
+    ConstantRing::Slot resetConstants{};
+    if (!framePointShadowsFullClear_) {
+        resetEntry = meshMap_.find(pointShadowResetMesh_);
+        if (resetEntry == nullptr) {
+            recordError_ = gfx::GfxError::InvalidHandle;
+            return;
+        }
+        if (const auto error = materials_.ensurePointShadowPipeline(
+                device_, resetEntry->instancedLayout, true);
+            error != gfx::GfxError::None) {
+            recordError_ = error;
+            return;
+        }
+        resetPipeline = materials_.pointShadowPipelineFor(resetEntry->instancedLayout, true);
+        RenderInstance identity{};
+        identity.model = math::Mat4::identity();
+        resetInstance = pointShadowInstanceBuffers_.alloc(
+            device_, std::span(reinterpret_cast<const std::byte*>(&identity), sizeof(identity)));
+        PointShadowUbo constants;
+        constants.faceViewProj = math::Mat4::identity();
+        constants.reserved = math::Mat4::identity();
+        constants.lightPositionInvRange = math::Vec4(0.0f, 0.0f, 0.0f, 1.0e4f);
+        constants.tileTransform = math::Vec4(1.0f, 1.0f, 0.0f, 0.0f);
+        constants.alphaParams = math::Vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        resetConstants = pointShadowConstants_.alloc(
+            device_,
+            std::span(reinterpret_cast<const std::byte*>(&constants), sizeof(constants)));
+        if (!resetPipeline.isValid() || !resetInstance.valid || !resetConstants.valid) {
+            recordError_ = gfx::GfxError::OutOfMemory;
+            return;
+        }
+    }
+
+    std::array<math::Frustum, kPointShadowFaces> faceFrusta{};
+    std::array<bool, kPointShadowFaces> faceUsed{};
+    for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
+        const ShadowedPointLight& light = frameShadowedLights_[slot];
+        if (!light.active || !light.dirty) continue;
+        ++pointShadowRedrawn_;
+        if (resetEntry != nullptr) {
+            for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+                selectTile(slot, face);
+                commandBuffer.bindPipeline(resetPipeline);
+                pointShadowConstants_.bind(commandBuffer, resetConstants);
+                commandBuffer.bindResource(0, gfx::BindingType::Texture, whiteTex_.index,
+                                           whiteTex_.generation);
+                commandBuffer.bindResource(0, gfx::BindingType::Sampler,
+                                           surfaceSampler_.index, surfaceSampler_.generation);
+                bindMesh(commandBuffer, resetEntry->gpu);
+                commandBuffer.bindVertexBuffer(resetEntry->instanceBinding,
+                                               resetInstance.handle, kRenderInstanceStride);
+                drawMesh(commandBuffer, resetEntry->mesh, resetEntry->gpu, 0, 1);
+            }
+        }
+        for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+            faceFrusta[face] = math::Frustum::fromViewProjection(
+                frameShadowFaces_[slot * kPointShadowFaces + face]);
+        }
+        std::size_t first = 0;
+        while (first < pointShadowCasters_.size()) {
+            const PointShadowCaster& head = pointShadowCasters_[first];
+            const auto headKey = pointShadowGroupKey(head.mesh, head.material, head.subMesh);
+            std::size_t last = first + 1;
+            while (last < pointShadowCasters_.size() &&
+                   pointShadowGroupKey(pointShadowCasters_[last].mesh,
+                                       pointShadowCasters_[last].material,
+                                       pointShadowCasters_[last].subMesh) == headKey) {
+                ++last;
+            }
+            const std::size_t groupBegin = first;
+            first = last;
+
+            // Casters of this group inside the light's sphere, and which of
+            // the six faces see at least one of them.
+            pointShadowInstanceStaging_.clear();
+            faceUsed.fill(false);
+            for (std::size_t index = groupBegin; index < last; ++index) {
+                const PointShadowCaster& caster = pointShadowCasters_[index];
+                if (caster.cullable &&
+                    !sphereTouchesBox(light.position, light.range, caster.bounds)) {
+                    continue;
+                }
+                for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+                    faceUsed[face] = faceUsed[face] || !caster.cullable ||
+                                     faceFrusta[face].intersects(caster.bounds);
+                }
+                RenderInstance instance{};
+                instance.model = caster.model;
+                pointShadowInstanceStaging_.push(instance);
+            }
+            if (pointShadowInstanceStaging_.isEmpty()) continue;
+
+            auto* entry = meshMap_.find(head.mesh);
+            const StandardMaterial* material = materials_.get(head.material);
+            if (entry == nullptr || material == nullptr) continue;
+            if (const auto error =
+                    materials_.ensurePointShadowPipeline(device_, entry->instancedLayout);
+                error != gfx::GfxError::None) {
+                recordError_ = error;
+                continue;
+            }
+            const gfx::PipelineHandle pipeline =
+                materials_.pointShadowPipelineFor(entry->instancedLayout);
+            if (!pipeline.isValid()) continue;
+            const DynamicBufferRing::Slot instances = pointShadowInstanceBuffers_.alloc(
+                device_, std::span(reinterpret_cast<const std::byte*>(
+                                       pointShadowInstanceStaging_.data()),
+                                   pointShadowInstanceStaging_.size() * sizeof(RenderInstance)));
+            if (!instances.valid) {
+                recordError_ = gfx::GfxError::OutOfMemory;
+                continue;
+            }
+            const gfx::TextureHandle albedo = resolveTexture(material->desc.albedo, whiteTex_);
+            for (std::uint32_t face = 0; face < kPointShadowFaces; ++face) {
+                if (!faceUsed[face]) continue;
+                PointShadowUbo constants;
+                constants.faceViewProj = frameShadowFaces_[slot * kPointShadowFaces + face];
+                constants.reserved = math::Mat4::identity();
+                constants.lightPositionInvRange =
+                    math::Vec4(light.position, 1.0f / std::max(light.range, 1.0e-4f));
+                // The tile is selected with the viewport + scissor, so the
+                // hardware clips each face to its own frustum; the shader's
+                // tile transform stays the identity.
+                constants.tileTransform = math::Vec4(1.0f, 1.0f, 0.0f, 0.0f);
+                constants.alphaParams = {
+                    material->desc.tint.w, material->desc.alphaCutoff,
+                    material->desc.alphaMode == MaterialAlphaMode::Mask ? 1.0f : 0.0f,
+                    hasSemantic(entry->mesh, resources::VertexSemantic::TexCoord0) ? 1.0f
+                                                                                   : 0.0f};
+                const auto constantSlot = pointShadowConstants_.alloc(
+                    device_, std::span(reinterpret_cast<const std::byte*>(&constants),
+                                       sizeof(constants)));
+                if (!constantSlot.valid) {
+                    recordError_ = gfx::GfxError::OutOfMemory;
+                    continue;
+                }
+                selectTile(slot, face);
+                commandBuffer.bindPipeline(pipeline);
+                pointShadowConstants_.bind(commandBuffer, constantSlot);
+                commandBuffer.bindResource(0, gfx::BindingType::Texture, albedo.index,
+                                           albedo.generation);
+                commandBuffer.bindResource(0, gfx::BindingType::Sampler,
+                                           surfaceSampler_.index, surfaceSampler_.generation);
+                bindMesh(commandBuffer, entry->gpu);
+                commandBuffer.bindVertexBuffer(entry->instanceBinding, instances.handle,
+                                               kRenderInstanceStride);
+                drawMesh(commandBuffer, entry->mesh, entry->gpu, head.subMesh,
+                         static_cast<std::uint32_t>(pointShadowInstanceStaging_.size()));
+                ++pointShadowDraws_;
+            }
+        }
+    }
+}
+
+void Renderer::releasePointShadowAtlas() {
+    if (pointShadowFramebuffer_.isValid() || pointShadowLoadFramebuffer_.isValid() ||
+        pointShadowColorTex_.isValid() || pointShadowDepthTex_.isValid()) {
+        device_.waitIdle();
+    }
+    if (pointShadowFramebuffer_.isValid()) (void)device_.destroyFramebuffer(pointShadowFramebuffer_);
+    if (pointShadowLoadFramebuffer_.isValid()) {
+        (void)device_.destroyFramebuffer(pointShadowLoadFramebuffer_);
+    }
+    pointShadowLoadFramebuffer_ = {};
+    pointShadowSlotOwners_.clear();
+    pointShadowSlotSignatures_.clear();
+    pointShadowSlotValid_.clear();
+    if (pointShadowColorTex_.isValid()) (void)device_.destroyTexture(pointShadowColorTex_);
+    if (pointShadowDepthTex_.isValid()) (void)device_.destroyTexture(pointShadowDepthTex_);
+    pointShadowFramebuffer_ = {};
+    pointShadowColorTex_ = {};
+    pointShadowDepthTex_ = {};
+    pointShadowTileSize_ = 0;
+    pointShadowRows_ = 0;
+}
+
+auto Renderer::ensurePointShadowAtlas(std::uint32_t rows) -> gfx::GfxError {
+    // Six face columns by `rows` lights. 8192 keeps the atlas inside WebGPU's
+    // default texture limit.
+    constexpr std::uint32_t kMaxAtlasSide = 8192;
+    std::uint32_t tile = std::clamp(pbrSettings_.pointShadowTileSize, 16u, 1024u);
+    tile = std::min(tile, kMaxAtlasSide / std::max(rows, kPointShadowFaces));
+    if (pointShadowColorTex_.isValid() && tile == pointShadowTileSize_ &&
+        rows == pointShadowRows_) {
+        return gfx::GfxError::None;
+    }
+    releasePointShadowAtlas();
+    const gfx::Extent extent{tile * kPointShadowFaces, tile * rows};
+    const float far[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    auto color = createRenderTexture(device_, gfx::TextureFormat::R16_FLOAT, extent, far, 1.0f);
+    if (!color.hasValue()) return color.error();
+    pointShadowColorTex_ = color.value();
+    auto depth = createRenderTexture(device_, gfx::TextureFormat::Depth32F, extent, far, 1.0f);
+    if (!depth.hasValue()) {
+        releasePointShadowAtlas();
+        return depth.error();
+    }
+    pointShadowDepthTex_ = depth.value();
+    gfx::FramebufferDesc desc;
+    desc.extent = extent;
+    gfx::AttachmentDesc colorAttachment;
+    colorAttachment.type = gfx::AttachmentType::Color;
+    colorAttachment.texture = pointShadowColorTex_;
+    colorAttachment.clearOnLoad = true;
+    for (std::size_t i = 0; i < 4; ++i) colorAttachment.clear.color[i] = 1.0f;
+    desc.attachments.push(colorAttachment);
+    gfx::AttachmentDesc depthAttachment;
+    depthAttachment.type = gfx::AttachmentType::Depth;
+    depthAttachment.texture = pointShadowDepthTex_;
+    depthAttachment.clearOnLoad = true;
+    depthAttachment.clear.depth = 1.0f;
+    desc.attachments.push(depthAttachment);
+    auto framebuffer = device_.createFramebuffer(desc);
+    if (!framebuffer.hasValue()) {
+        releasePointShadowAtlas();
+        return framebuffer.error();
+    }
+    pointShadowFramebuffer_ = framebuffer.value();
+    // Same attachments, but the colour is loaded so cached tiles survive.
+    desc.attachments[0].clearOnLoad = false;
+    auto loadFramebuffer = device_.createFramebuffer(desc);
+    if (!loadFramebuffer.hasValue()) {
+        releasePointShadowAtlas();
+        return loadFramebuffer.error();
+    }
+    pointShadowLoadFramebuffer_ = loadFramebuffer.value();
+    pointShadowTileSize_ = tile;
+    pointShadowRows_ = rows;
+    pointShadowSlotOwners_.resize(rows);
+    std::fill(pointShadowSlotOwners_.begin(), pointShadowSlotOwners_.end(),
+              kPointShadowFreeSlot);
+    pointShadowSlotSignatures_.resize(rows);
+    std::fill(pointShadowSlotSignatures_.begin(), pointShadowSlotSignatures_.end(), 0ull);
+    pointShadowSlotValid_.resize(rows);
+    std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(), std::uint8_t{0});
+    return gfx::GfxError::None;
+}
+
+void Renderer::releaseBloomTargets() {
+    const bool any = hdrColorTex_.isValid() || !bloomDown_.isEmpty();
+    if (any) device_.waitIdle();
+    const auto releaseTarget = [this](BloomTarget& target) {
+        if (target.framebuffer.isValid()) (void)device_.destroyFramebuffer(target.framebuffer);
+        if (target.texture.isValid()) (void)device_.destroyTexture(target.texture);
+        target = {};
+    };
+    for (BloomTarget& target : bloomDown_) releaseTarget(target);
+    for (BloomTarget& target : bloomUp_) releaseTarget(target);
+    bloomDown_.clear();
+    bloomUp_.clear();
+    if (hdrFramebuffer_.isValid()) (void)device_.destroyFramebuffer(hdrFramebuffer_);
+    if (hdrColorTex_.isValid()) (void)device_.destroyTexture(hdrColorTex_);
+    if (hdrDepthTex_.isValid()) (void)device_.destroyTexture(hdrDepthTex_);
+    hdrFramebuffer_ = {};
+    hdrColorTex_ = {};
+    hdrDepthTex_ = {};
+    bloomExtent_ = {};
+    bloomLevelCount_ = 0;
+}
+
+auto Renderer::ensureBloomResources(gfx::Extent extent) -> gfx::GfxError {
+    if (!bloomVs_.isValid()) {
+        auto shader = loadEffectShader(device_, EffectShader::BloomVertex);
+        if (!shader.hasValue()) return shader.error();
+        bloomVs_ = shader.value();
+    }
+    if (!bloomFs_.isValid()) {
+        auto shader = loadEffectShader(device_, EffectShader::BloomFragment);
+        if (!shader.hasValue()) return shader.error();
+        bloomFs_ = shader.value();
+    }
+    if (!bloomTriangle_.isValid()) {
+        // One triangle covering the whole viewport, already in clip space.
+        const float positions[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+        gfx::BufferDesc desc;
+        desc.sizeBytes = sizeof(positions);
+        desc.usage = gfx::BufferUsage::Vertex;
+        auto buffer = device_.createBuffer(
+            desc, std::span(reinterpret_cast<const std::byte*>(positions), sizeof(positions)));
+        if (!buffer.hasValue()) return buffer.error();
+        bloomTriangle_ = buffer.value();
+    }
+    if (!bloomSampler_.isValid()) {
+        gfx::SamplerDesc desc; // bilinear, clamp to edge
+        auto sampler = device_.createSampler(desc);
+        if (!sampler.hasValue()) return sampler.error();
+        bloomSampler_ = sampler.value();
+    }
+    const auto makePipeline = [this](gfx::TextureFormat format, bool depthCompatible)
+        -> Result<gfx::PipelineHandle, gfx::GfxError> {
+        gfx::PipelineStateDesc desc;
+        desc.vertexShader = bloomVs_;
+        desc.fragmentShader = bloomFs_;
+        desc.vertexInput.bindings.push({0, 8, 0});
+        desc.vertexInput.attributes.push({0, 0, gfx::VertexFormat::Float32x2, 0});
+        desc.topology = gfx::PrimitiveTopology::TriangleList;
+        desc.raster.cullMode = gfx::CullMode::None;
+        // The composite draws into the caller's framebuffer, which carries a
+        // depth attachment; declare it without testing or writing.
+        desc.depthStencil.depthAttachmentEnable = depthCompatible;
+        desc.depthStencil.format = gfx::TextureFormat::Depth32F;
+        gfx::ColorAttachmentState color;
+        color.format = format;
+        desc.colorAttachments.push(color);
+        gfx::BindGroup group;
+        group.bindPoint = 0;
+        group.slots.push({0, gfx::BindingType::UniformBuffer,
+                          gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        for (std::uint32_t slot = 0; slot < 2; ++slot) {
+            group.slots.push({slot, gfx::BindingType::Texture,
+                              gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+            group.slots.push({slot, gfx::BindingType::Sampler,
+                              gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        }
+        desc.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+        return device_.createPipeline(desc);
+    };
+    if (!bloomHdrPipeline_.isValid()) {
+        auto pipeline = makePipeline(gfx::TextureFormat::RGBA16_FLOAT, false);
+        if (!pipeline.hasValue()) return pipeline.error();
+        bloomHdrPipeline_ = pipeline.value();
+    }
+    if (!bloomCompositePipeline_.isValid()) {
+        auto pipeline = makePipeline(gfx::TextureFormat::RGBA8_UNORM, true);
+        if (!pipeline.hasValue()) return pipeline.error();
+        bloomCompositePipeline_ = pipeline.value();
+    }
+
+    const std::uint32_t levels = std::clamp(pbrSettings_.bloomLevels, 1u, kBloomMaxLevels);
+    const math::Vec4 clearColor = pbrSettings_.bloomClearColor;
+    if (hdrColorTex_.isValid() && extent == bloomExtent_ && levels == bloomLevelCount_ &&
+        clearColor == hdrClearColor_) {
+        return gfx::GfxError::None;
+    }
+    releaseBloomTargets();
+    const float clear[4] = {clearColor.x, clearColor.y, clearColor.z, clearColor.w};
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    auto color = createRenderTexture(device_, gfx::TextureFormat::RGBA16_FLOAT, extent, clear,
+                                     1.0f);
+    if (!color.hasValue()) return color.error();
+    hdrColorTex_ = color.value();
+    auto depth = createRenderTexture(device_, gfx::TextureFormat::Depth32F, extent, black, 1.0f);
+    if (!depth.hasValue()) {
+        releaseBloomTargets();
+        return depth.error();
+    }
+    hdrDepthTex_ = depth.value();
+    {
+        gfx::FramebufferDesc desc;
+        desc.extent = extent;
+        gfx::AttachmentDesc colorAttachment;
+        colorAttachment.type = gfx::AttachmentType::Color;
+        colorAttachment.texture = hdrColorTex_;
+        colorAttachment.clearOnLoad = true;
+        for (std::size_t i = 0; i < 4; ++i) colorAttachment.clear.color[i] = clear[i];
+        desc.attachments.push(colorAttachment);
+        gfx::AttachmentDesc depthAttachment;
+        depthAttachment.type = gfx::AttachmentType::Depth;
+        depthAttachment.texture = hdrDepthTex_;
+        depthAttachment.clearOnLoad = true;
+        depthAttachment.clear.depth = 1.0f;
+        desc.attachments.push(depthAttachment);
+        auto framebuffer = device_.createFramebuffer(desc);
+        if (!framebuffer.hasValue()) {
+            releaseBloomTargets();
+            return framebuffer.error();
+        }
+        hdrFramebuffer_ = framebuffer.value();
+    }
+    const auto makeTarget = [&](gfx::Extent size, BloomTarget& target) -> gfx::GfxError {
+        auto texture =
+            createRenderTexture(device_, gfx::TextureFormat::RGBA16_FLOAT, size, black, 1.0f);
+        if (!texture.hasValue()) return texture.error();
+        target.texture = texture.value();
+        target.extent = size;
+        gfx::FramebufferDesc desc;
+        desc.extent = size;
+        gfx::AttachmentDesc attachment;
+        attachment.type = gfx::AttachmentType::Color;
+        attachment.texture = target.texture;
+        // Every bloom pass overwrites its whole target with a fullscreen
+        // triangle; clearing (to the optimized black) instead of loading keeps
+        // the pass from reading the previous contents, which Vulkan sync
+        // validation flags after the layout transition.
+        attachment.clearOnLoad = true;
+        for (std::size_t i = 0; i < 4; ++i) attachment.clear.color[i] = black[i];
+        desc.attachments.push(attachment);
+        auto framebuffer = device_.createFramebuffer(desc);
+        if (!framebuffer.hasValue()) return framebuffer.error();
+        target.framebuffer = framebuffer.value();
+        return gfx::GfxError::None;
+    };
+    for (std::uint32_t level = 0; level < levels; ++level) {
+        const gfx::Extent size{std::max(1u, extent.width >> (level + 1u)),
+                               std::max(1u, extent.height >> (level + 1u))};
+        bloomDown_.push(BloomTarget{});
+        if (const auto error = makeTarget(size, bloomDown_[bloomDown_.size() - 1]);
+            error != gfx::GfxError::None) {
+            releaseBloomTargets();
+            return error;
+        }
+        if (level + 1u < levels) {
+            bloomUp_.push(BloomTarget{});
+            if (const auto error = makeTarget(size, bloomUp_[bloomUp_.size() - 1]);
+                error != gfx::GfxError::None) {
+                releaseBloomTargets();
+                return error;
+            }
+        }
+    }
+    bloomExtent_ = extent;
+    bloomLevelCount_ = levels;
+    hdrClearColor_ = clearColor;
+    return gfx::GfxError::None;
+}
+
+void Renderer::declareBloomPasses(std::uint32_t hdrImage, std::uint32_t target,
+                                  gfx::Extent extent) {
+    using ResourceId = gfx::RenderGraph::ResourceId;
+    const std::uint32_t levels = static_cast<std::uint32_t>(bloomDown_.size());
+    containers::Array<ResourceId> downImages;
+    containers::Array<ResourceId> downTargets;
+    containers::Array<ResourceId> upImages;
+    containers::Array<ResourceId> upTargets;
+    for (std::uint32_t level = 0; level < levels; ++level) {
+        downImages.push(graph_.importTexture(containers::String("bloom-down"),
+                                             bloomDown_[level].texture));
+        downTargets.push(graph_.importFramebuffer(containers::String("bloom-down-target"),
+                                                  bloomDown_[level].framebuffer));
+    }
+    for (std::size_t level = 0; level < bloomUp_.size(); ++level) {
+        upImages.push(graph_.importTexture(containers::String("bloom-up"),
+                                           bloomUp_[level].texture));
+        upTargets.push(graph_.importFramebuffer(containers::String("bloom-up-target"),
+                                                bloomUp_[level].framebuffer));
+    }
+    const float threshold = std::max(pbrSettings_.bloomThreshold, 0.0f);
+    const float knee = std::max(pbrSettings_.bloomKnee, 1.0e-4f);
+    // up[0] is the sum of every blurred level (wide + narrow glow), weighted
+    // once by the intensity in the composite.
+    const float intensity = std::max(pbrSettings_.bloomIntensity, 0.0f);
+    const auto texel = [](gfx::Extent size) {
+        return math::Vec4(1.0f / static_cast<float>(size.width),
+                          1.0f / static_cast<float>(size.height), 0.0f, 0.0f);
+    };
+    struct Source {
+        ResourceId image;
+        gfx::TextureHandle texture;
+    };
+    const auto addPass = [&](const char* name, ResourceId targetFramebuffer,
+                             const ResourceId* targetImage, gfx::Extent targetExtent,
+                             gfx::PipelineHandle pipeline, Source first, Source second,
+                             BloomUbo constants) {
+        gfx::PassDesc pass;
+        pass.name = containers::String(name);
+        pass.writes.push(targetFramebuffer);
+        if (targetImage != nullptr) {
+            pass.writes.push(*targetImage);
+            pass.accesses.push({*targetImage,
+                                {gfx::PipelineStageMask::ColorAttachment,
+                                 gfx::ResourceAccessMask::ColorWrite,
+                                 gfx::TextureLayout::ColorAttachment}});
+        }
+        for (const Source& source : {first, second}) {
+            pass.reads.push(source.image);
+            pass.accesses.push({source.image,
+                                {gfx::PipelineStageMask::FragmentShader,
+                                 gfx::ResourceAccessMask::ShaderRead,
+                                 gfx::TextureLayout::ShaderRead}});
+        }
+        constants.params1.z = 1.0f / static_cast<float>(targetExtent.width);
+        constants.params1.w = 1.0f / static_cast<float>(targetExtent.height);
+        const gfx::TextureHandle firstTexture = first.texture;
+        const gfx::TextureHandle secondTexture = second.texture;
+        pass.record = [this, pipeline, firstTexture, secondTexture, constants,
+                       targetExtent](gfx::CommandBuffer& commandBuffer) {
+            const auto slot = bloomConstants_.alloc(
+                device_, std::span(reinterpret_cast<const std::byte*>(&constants),
+                                   sizeof(constants)));
+            if (!slot.valid) {
+                recordError_ = gfx::GfxError::OutOfMemory;
+                return;
+            }
+            commandBuffer.setViewport(targetExtent);
+            commandBuffer.bindPipeline(pipeline);
+            bloomConstants_.bind(commandBuffer, slot);
+            const gfx::TextureHandle textures[2] = {firstTexture, secondTexture};
+            for (std::uint32_t resourceSlot = 0; resourceSlot < 2; ++resourceSlot) {
+                commandBuffer.bindResource(resourceSlot, gfx::BindingType::Texture,
+                                           textures[resourceSlot].index,
+                                           textures[resourceSlot].generation);
+                commandBuffer.bindResource(resourceSlot, gfx::BindingType::Sampler,
+                                           bloomSampler_.index, bloomSampler_.generation);
+            }
+            commandBuffer.bindVertexBuffer(0, bloomTriangle_, 8);
+            commandBuffer.draw(3);
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(pass));
+        ++bloomPasses_;
+    };
+
+    const Source hdr{hdrImage, hdrColorTex_};
+    BloomUbo prefilter;
+    prefilter.params0 = texel(extent);
+    prefilter.params0.z = threshold;
+    prefilter.params0.w = knee;
+    prefilter.params1 = {0.0f, 0.0f, 0.0f, 0.0f};
+    addPass("bloom-prefilter", downTargets[0], &downImages[0], bloomDown_[0].extent,
+            bloomHdrPipeline_, hdr, hdr, prefilter);
+    for (std::uint32_t level = 1; level < levels; ++level) {
+        BloomUbo down;
+        down.params0 = texel(bloomDown_[level - 1].extent);
+        down.params1 = {1.0f, 0.0f, 0.0f, 0.0f};
+        const Source source{downImages[level - 1], bloomDown_[level - 1].texture};
+        addPass("bloom-down", downTargets[level], &downImages[level], bloomDown_[level].extent,
+                bloomHdrPipeline_, source, source, down);
+    }
+    for (std::uint32_t level = levels - 1; level-- > 0;) {
+        const bool coarsest = level + 2u == levels;
+        const Source coarse = coarsest
+                                  ? Source{downImages[level + 1], bloomDown_[level + 1].texture}
+                                  : Source{upImages[level + 1], bloomUp_[level + 1].texture};
+        BloomUbo up;
+        up.params0 = texel(bloomDown_[level + 1].extent);
+        up.params1 = {2.0f, 0.0f, 0.0f, 0.0f};
+        addPass("bloom-up", upTargets[level], &upImages[level], bloomUp_[level].extent,
+                bloomHdrPipeline_, coarse, Source{downImages[level], bloomDown_[level].texture},
+                up);
+    }
+    const Source bloom = levels > 1 ? Source{upImages[0], bloomUp_[0].texture}
+                                    : Source{downImages[0], bloomDown_[0].texture};
+    BloomUbo composite;
+    composite.params0 = texel(extent);
+    composite.params1 = {3.0f, intensity, 0.0f, 0.0f};
+    addPass("bloom-composite", target, nullptr, extent, bloomCompositePipeline_, hdr, bloom,
+            composite);
+}
+
 auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEntity,
-                      float aspect) -> gfx::GfxError {
+                      float aspect, gfx::Extent extent) -> gfx::GfxError {
     if (!inited_) return gfx::GfxError::BadDescriptor;
     if (!framebuffer.isValid()) return gfx::GfxError::InvalidHandle;
+    const bool bloom = pbrSettings_.bloomEnabled;
+    if (bloom && (extent.width == 0 || extent.height == 0)) return gfx::GfxError::BadDescriptor;
     if (const auto error = graph_.clear(device_); error != gfx::GfxError::None) return error;
+    updateCameras(registry_, aspect);
     const Camera* camera = registry_.get<Camera>(cameraEntity);
     if (camera == nullptr) return gfx::GfxError::InvalidHandle;
     const FrameLight light = findFrameLight(registry_, *camera, pbrSettings_);
@@ -815,6 +1940,42 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         }
     }
     recordError_ = gfx::GfxError::None;
+    pointShadowDraws_ = 0;
+    pointShadowRedrawn_ = 0;
+    bloomPasses_ = 0;
+    const auto finish = [this](gfx::GfxError error) {
+        frameShadowsActive_ = false;
+        framePointShadowsActive_ = false;
+        frameBloomActive_ = false;
+        pointLightsGathered_ = false;
+        framePointLightsReady_ = false;
+        frameBinningOverlap_ = false;
+        recordColorFormat_ = gfx::TextureFormat::RGBA8_UNORM;
+        return error;
+    };
+    if (const auto error = preparePointShadows(*camera); error != gfx::GfxError::None) {
+        return finish(error);
+    }
+    if (bloom) {
+        if (const auto error = ensureBloomResources(extent); error != gfx::GfxError::None) {
+            return finish(error);
+        }
+        bloomConstants_.beginFrame();
+    }
+
+    // GPU light binning runs first; record() then binds its output. With
+    // lightBinningOverlap it may run on the async compute queue, and its
+    // barrier moves to a "light-binning-wait" pass right before the main pass.
+    if (preparePointLightsGpu(*camera, aspect)) {
+        frameBinningOverlap_ = pbrSettings_.lightBinningOverlap;
+        gfx::PassDesc binningPass;
+        binningPass.name = containers::String("light-binning");
+        binningPass.asyncCompute = frameBinningOverlap_;
+        binningPass.record = [this](gfx::CommandBuffer& commandBuffer) {
+            recordLightBinning(commandBuffer);
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(binningPass));
+    }
 
     gfx::RenderGraph::ResourceId shadowImage = 0;
     if (frameShadowsActive_) {
@@ -837,10 +1998,82 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(shadowPass));
     }
 
+    gfx::RenderGraph::ResourceId pointShadowImage = 0;
+    if (framePointShadowsActive_) {
+        pointShadowImage = graph_.importTexture(containers::String("point-shadow-atlas"),
+                                                pointShadowColorTex_);
+    }
+    // With every shadowed light cached the atlas pass is skipped entirely and
+    // the main pass samples last frame's tiles.
+    if (framePointShadowsActive_ && framePointShadowsDirty_ && !framePointShadowsFullClear_) {
+        // A partial redraw loads the cached tiles. Start from the state last
+        // frame left the atlas in (sampled by the main pass) so the barrier
+        // into the atlas pass orders after those reads and keeps the texels.
+        gfx::PassDesc keepPass;
+        keepPass.name = containers::String("point-shadow-atlas-keep");
+        keepPass.reads.push(pointShadowImage);
+        keepPass.accesses.push({
+            pointShadowImage,
+            {gfx::PipelineStageMask::FragmentShader,
+             gfx::ResourceAccessMask::ShaderRead,
+             gfx::TextureLayout::ShaderRead},
+        });
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(keepPass));
+    }
+    if (framePointShadowsActive_ && framePointShadowsDirty_) {
+        const auto atlasTarget = graph_.importFramebuffer(
+            containers::String("point-shadow-target"),
+            framePointShadowsFullClear_ ? pointShadowFramebuffer_ : pointShadowLoadFramebuffer_);
+        gfx::PassDesc atlasPass;
+        atlasPass.name = containers::String("point-shadows");
+        atlasPass.writes.push(atlasTarget);
+        atlasPass.writes.push(pointShadowImage);
+        atlasPass.accesses.push({
+            pointShadowImage,
+            {gfx::PipelineStageMask::ColorAttachment,
+             framePointShadowsFullClear_
+                 ? gfx::ResourceAccessMask::ColorWrite
+                 : gfx::ResourceAccessMask::ColorRead | gfx::ResourceAccessMask::ColorWrite,
+             gfx::TextureLayout::ColorAttachment},
+        });
+        atlasPass.record = [this](gfx::CommandBuffer& commandBuffer) {
+            recordPointShadows(commandBuffer);
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(atlasPass));
+    }
+
+    if (frameBinningOverlap_) {
+        gfx::PassDesc waitPass;
+        waitPass.name = containers::String("light-binning-wait");
+        waitPass.record = [this](gfx::CommandBuffer& commandBuffer) {
+            commandBuffer.waitAsyncCompute();
+            commandBuffer.bufferBarrier(
+                framePointLights_,
+                {gfx::PipelineStageMask::ComputeShader, gfx::ResourceAccessMask::ShaderWrite},
+                {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(waitPass));
+    }
+
     const auto target = graph_.importFramebuffer(containers::String("main-target"), framebuffer);
+    gfx::RenderGraph::ResourceId hdrImage = 0;
     gfx::PassDesc mainPass;
     mainPass.name = containers::String("main");
-    mainPass.writes.push(target);
+    if (bloom) {
+        hdrImage = graph_.importTexture(containers::String("hdr-color"), hdrColorTex_);
+        const auto hdrTarget =
+            graph_.importFramebuffer(containers::String("hdr-target"), hdrFramebuffer_);
+        mainPass.writes.push(hdrTarget);
+        mainPass.writes.push(hdrImage);
+        mainPass.accesses.push({
+            hdrImage,
+            {gfx::PipelineStageMask::ColorAttachment,
+             gfx::ResourceAccessMask::ColorWrite,
+             gfx::TextureLayout::ColorAttachment},
+        });
+    } else {
+        mainPass.writes.push(target);
+    }
     if (frameShadowsActive_) {
         mainPass.reads.push(shadowImage);
         mainPass.accesses.push({
@@ -850,14 +2083,114 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
              gfx::TextureLayout::ShaderRead},
         });
     }
+    if (framePointShadowsActive_) {
+        mainPass.reads.push(pointShadowImage);
+        mainPass.accesses.push({
+            pointShadowImage,
+            {gfx::PipelineStageMask::FragmentShader,
+             gfx::ResourceAccessMask::ShaderRead,
+             gfx::TextureLayout::ShaderRead},
+        });
+    }
     mainPass.record = [this, cameraEntity, aspect](gfx::CommandBuffer& commandBuffer) {
         record(commandBuffer, cameraEntity, aspect);
     };
     (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(mainPass));
+    if (bloom) declareBloomPasses(hdrImage, target, extent);
+
+    frameBloomActive_ = bloom;
+    recordColorFormat_ =
+        bloom ? gfx::TextureFormat::RGBA16_FLOAT : gfx::TextureFormat::RGBA8_UNORM;
     gfx::CommandBuffer commandBuffer;
+    graph_.setGpuTimestamps(pbrSettings_.gpuTimers && device_.supportsGpuTimestamps());
+    graph_.setAsyncCompute(frameBinningOverlap_);
     const gfx::GfxError submitError = graph_.execute(device_, commandBuffer);
-    frameShadowsActive_ = false;
-    return submitError != gfx::GfxError::None ? submitError : recordError_;
+    stats_.lightBinningAsyncCompute = submitError == gfx::GfxError::None &&
+                                      graph_.asyncComputeUsed();
+    ++renderFrameCount_;
+    if (submitError == gfx::GfxError::None && graph_.gpuTimestampsWritten()) {
+        const std::uint64_t serial = device_.lastGpuTimestampSerial();
+        GpuTimerFrame& timed = gpuTimerFrames_[serial % gpuTimerFrames_.size()];
+        timed.serial = serial;
+        timed.frame = renderFrameCount_;
+        timed.passCount = static_cast<std::uint32_t>(
+            std::min<std::size_t>(graph_.passCount(), FrameStats::kMaxGpuPasses));
+        for (std::uint32_t i = 0; i < timed.passCount; ++i) {
+            std::snprintf(timed.names[i], sizeof(timed.names[i]), "%s",
+                          graph_.pass(i).name.c_str());
+        }
+    }
+    if (pbrSettings_.gpuTimers) updateGpuTimers();
+    std::uint32_t activeShadowLights = 0;
+    if (framePointShadowsActive_) {
+        const bool drawn = submitError == gfx::GfxError::None &&
+                           recordError_ == gfx::GfxError::None;
+        for (std::size_t slot = 0; slot < frameShadowedLights_.size(); ++slot) {
+            const ShadowedPointLight& shadowed = frameShadowedLights_[slot];
+            if (!shadowed.active) continue;
+            ++activeShadowLights;
+            if (!shadowed.dirty) continue;
+            pointShadowSlotSignatures_[slot] = shadowed.signature;
+            pointShadowSlotValid_[slot] =
+                static_cast<std::uint8_t>(drawn && pbrSettings_.pointShadowCaching ? 1u : 0u);
+        }
+        if (!drawn) {
+            std::fill(pointShadowSlotValid_.begin(), pointShadowSlotValid_.end(),
+                      std::uint8_t{0});
+        }
+    }
+    stats_.pointShadowLights = activeShadowLights;
+    stats_.pointShadowDraws = pointShadowDraws_;
+    stats_.pointShadowLightsRedrawn =
+        framePointShadowsActive_ && framePointShadowsDirty_ ? pointShadowRedrawn_ : 0u;
+    stats_.bloomPasses = bloomPasses_;
+    stats_.gpuTimersAvailable = pbrSettings_.gpuTimers && device_.supportsGpuTimestamps();
+    // Timers off or unsupported: report unavailable, not a stale or zero timing.
+    if (!stats_.gpuTimersAvailable) gpuTiming_ = FrameStats{};
+    stats_.gpuTimingValid = gpuTiming_.gpuTimingValid;
+    stats_.gpuPassCount = gpuTiming_.gpuPassCount;
+    for (std::uint32_t i = 0; i < gpuTiming_.gpuPassCount; ++i) {
+        stats_.gpuPasses[i] = gpuTiming_.gpuPasses[i];
+    }
+    stats_.gpuFrameMs = gpuTiming_.gpuFrameMs;
+    stats_.gpuLightBinningMs = gpuTiming_.gpuLightBinningMs;
+    stats_.gpuMainPassMs = gpuTiming_.gpuMainPassMs;
+    stats_.gpuTimingLag = gpuTiming_.gpuTimingValid
+                              ? static_cast<std::uint32_t>(renderFrameCount_ -
+                                                           gpuTiming_.gpuTimingLag)
+                              : 0u;
+    return finish(submitError != gfx::GfxError::None ? submitError : recordError_);
+}
+
+void Renderer::updateGpuTimers() {
+    const gfx::GpuTimestampFrame frame = device_.latestGpuTimestamps();
+    if (frame.serial == 0) return;
+    const GpuTimerFrame& timed = gpuTimerFrames_[frame.serial % gpuTimerFrames_.size()];
+    if (timed.serial != frame.serial || timed.passCount == 0 ||
+        frame.count < timed.passCount + 1) {
+        return;
+    }
+    FrameStats result;
+    result.gpuTimingValid = true;
+    result.gpuPassCount = timed.passCount;
+    const auto ms = [&](std::uint32_t from, std::uint32_t to) {
+        return frame.ns[to] >= frame.ns[from]
+                   ? static_cast<double>(frame.ns[to] - frame.ns[from]) * 1.0e-6
+                   : 0.0;
+    };
+    for (std::uint32_t i = 0; i < timed.passCount; ++i) {
+        std::memcpy(result.gpuPasses[i].name, timed.names[i], sizeof(timed.names[i]));
+        result.gpuPasses[i].ms = ms(i, i + 1);
+        if (std::strcmp(timed.names[i], "light-binning") == 0) {
+            result.gpuLightBinningMs += result.gpuPasses[i].ms;
+        } else if (std::strcmp(timed.names[i], "main") == 0) {
+            result.gpuMainPassMs += result.gpuPasses[i].ms;
+        }
+    }
+    result.gpuFrameMs = ms(0, timed.passCount);
+    // Stored as the timed frame number; render() turns it into a lag.
+    result.gpuTimingLag = static_cast<std::uint32_t>(timed.frame);
+    gpuTiming_ = result;
 }
 
 } // namespace f4::engine

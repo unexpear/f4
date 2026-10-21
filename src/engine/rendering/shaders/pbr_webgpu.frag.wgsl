@@ -28,6 +28,11 @@ struct SceneUbo {
 @group(0) @binding(22) var environmentSampler: sampler;
 @group(0) @binding(25) var shadowTexture: texture_2d<f32>;
 @group(0) @binding(26) var shadowSampler: sampler;
+// Storage slot 7 flattens to binding 7 * 4 + StorageBuffer(3) = 31.
+@group(0) @binding(31) var<storage, read> pointLightWords: array<u32>;
+// Point-shadow atlas, slot 8: bindings 8 * 4 + 1 = 33 and 8 * 4 + 2 = 34.
+@group(0) @binding(33) var pointShadowTexture: texture_2d<f32>;
+@group(0) @binding(34) var pointShadowSampler: sampler;
 
 const PI = 3.14159265358979323846;
 
@@ -125,6 +130,122 @@ fn shadowVisibility(input: FragmentInput, nDotL: f32) -> f32 {
     return visibility / 9.0;
 }
 
+fn pointLightFloat(word: u32) -> f32 {
+    return bitcast<f32>(pointLightWords[word]);
+}
+
+// Point-light shadows: see engine/lighting/point_shadows.h for the atlas and
+// the clustered-buffer words this reads.
+fn pointLightVec4(word: u32) -> vec4f {
+    return vec4f(pointLightFloat(word), pointLightFloat(word + 1u),
+                 pointLightFloat(word + 2u), pointLightFloat(word + 3u));
+}
+
+fn pointShadowVisibility(shadowSlot: u32, worldPosition: vec3f, toFragment: vec3f,
+                         normalizedDistance: f32, nDotL: f32) -> f32 {
+    let matrixBase = pointLightWords[10];
+    if (matrixBase == 0u) { return 1.0; }
+    let a = abs(toFragment);
+    var face = 5u;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = select(1u, 0u, toFragment.x >= 0.0);
+    } else if (a.y >= a.z) {
+        face = select(3u, 2u, toFragment.y >= 0.0);
+    } else {
+        face = select(5u, 4u, toFragment.z >= 0.0);
+    }
+    let base = matrixBase + ((shadowSlot - 1u) * 6u + face) * 16u;
+    let clip = pointLightVec4(base) * worldPosition.x +
+               pointLightVec4(base + 4u) * worldPosition.y +
+               pointLightVec4(base + 8u) * worldPosition.z + pointLightVec4(base + 12u);
+    if (clip.w <= 0.0) { return 1.0; }
+    let local = clip.xy / clip.w;
+    let rows = f32(pointLightWords[12]);
+    let texel = pointLightFloat(14u);
+    let limit = 1.0 - 1.5 * texel;
+    let bias = pointLightFloat(13u) * (1.0 + 2.0 * (1.0 - nDotL));
+    let column = f32(face);
+    let row = f32(shadowSlot - 1u);
+    var visibility = 0.0;
+    for (var y = -1; y <= 1; y += 1) {
+        for (var x = -1; x <= 1; x += 1) {
+            let tap = clamp(local + vec2f(f32(x), f32(y)) * texel, vec2f(-limit),
+                            vec2f(limit));
+            let atlas = vec2f((tap.x + 1.0 + 2.0 * column) / 6.0 - 1.0,
+                              (tap.y + 1.0 + 2.0 * row) / rows - 1.0);
+            let uv = vec2f(atlas.x * 0.5 + 0.5, 0.5 - atlas.y * 0.5);
+            let stored = textureSampleLevel(pointShadowTexture, pointShadowSampler, uv,
+                                            0.0).r;
+            visibility += select(0.0, 1.0, normalizedDistance - bias <= stored);
+        }
+    }
+    return visibility / 9.0;
+}
+
+// Clustered point lights: see engine/lighting/clustered_lights.h for the word
+// layout and the shared cluster lookup.
+fn pointLightsDirect(worldPosition: vec3f, n: vec3f, v: vec3f, baseColor: vec3f,
+                     metallic: f32, roughness: f32, f0: vec3f) -> vec3f {
+    let lightCount = pointLightWords[0];
+    if (lightCount == 0u) { return vec3f(0.0); }
+    let clip = scene.viewProj * vec4f(worldPosition, 1.0);
+    if (clip.w <= 0.0) { return vec3f(0.0); }
+    let tilesX = pointLightWords[1];
+    let tilesY = pointLightWords[2];
+    let slices = pointLightWords[3];
+    let ndc = clip.xy / clip.w;
+    let tileX = u32(clamp(floor((ndc.x * 0.5 + 0.5) * f32(tilesX)), 0.0,
+                          f32(tilesX - 1u)));
+    let tileY = u32(clamp(floor((ndc.y * 0.5 + 0.5) * f32(tilesY)), 0.0,
+                          f32(tilesY - 1u)));
+    let sliceValue = floor(log2(max(clip.w, 1.0e-4)) * pointLightFloat(8u) +
+                           pointLightFloat(9u));
+    let slice = u32(clamp(sliceValue, 0.0, f32(slices - 1u)));
+    let cluster = (slice * tilesY + tileY) * tilesX + tileX;
+    let clusterWord = pointLightWords[5] + cluster * 2u;
+    let first = pointLightWords[clusterWord];
+    let count = pointLightWords[clusterWord + 1u];
+    let lightBase = pointLightWords[4];
+    var sum = vec3f(0.0);
+    for (var i = 0u; i < count; i += 1u) {
+        let record = lightBase + pointLightWords[first + i] * 8u;
+        let position = vec3f(pointLightFloat(record), pointLightFloat(record + 1u),
+                             pointLightFloat(record + 2u));
+        let range = pointLightFloat(record + 3u);
+        let toLight = position - worldPosition;
+        let distanceSq = dot(toLight, toLight);
+        let rangeSq = range * range;
+        if (distanceSq >= rangeSq) { continue; }
+        let lightDistance = sqrt(distanceSq);
+        let l = select(n, toLight / lightDistance, lightDistance > 1.0e-5);
+        let nDotL = max(dot(n, l), 0.0);
+        if (nDotL <= 0.0) { continue; }
+        let shadowSlot = pointLightWords[record + 7u];
+        var shadow = 1.0;
+        if (shadowSlot != 0u) {
+            shadow = pointShadowVisibility(shadowSlot, worldPosition, -toLight,
+                                           lightDistance / range, nDotL);
+        }
+        if (shadow <= 0.0) { continue; }
+        let radiance = vec3f(pointLightFloat(record + 4u), pointLightFloat(record + 5u),
+                             pointLightFloat(record + 6u));
+        let h = normalize(v + l);
+        let nDotV = max(dot(n, v), 0.0);
+        let nDotH = max(dot(n, h), 0.0);
+        let hDotV = max(dot(h, v), 0.0);
+        let f = fresnelSchlick(hDotV, f0);
+        let distribution = distributionGgx(nDotH, roughness);
+        let geometry = geometrySmith(nDotV, nDotL, roughness);
+        let specular = distribution * geometry * f / max(4.0 * nDotV * nDotL, 1.0e-5);
+        let diffuse = (vec3f(1.0) - f) * (1.0 - metallic) * baseColor / PI;
+        let ratio = distanceSq / rangeSq;
+        let window = clamp(1.0 - ratio * ratio, 0.0, 1.0);
+        let attenuation = window * window / (distanceSq + 1.0);
+        sum += (diffuse + specular) * radiance * (attenuation * nDotL * shadow);
+    }
+    return sum;
+}
+
 fn acesToneMap(color: vec3f) -> vec3f {
     let a = 2.51;
     let b = 0.03;
@@ -181,6 +302,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
         let direct = (diffuse + specular) * radiance * nDotL *
                      shadowVisibility(input, nDotL);
 
+        let pointDirect = pointLightsDirect(input.worldPosition, n, v, base.rgb, metallic,
+                                            roughness, f0);
+
         let reflection = reflect(-v, n);
         let irradiance = textureSampleLevel(environmentTexture, environmentSampler,
                                             environmentUv(n), scene.renderParams.w).rgb;
@@ -198,8 +322,12 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
                               base.rgb * irradiance;
         let ao = mix(1.0, textureSample(occlusionTexture, occlusionSampler,
                                         input.uv).r, scene.materialParams.z);
-        color = direct + (indirectDiffuse + indirectSpecular) * ao *
+        color = direct + pointDirect + (indirectDiffuse + indirectSpecular) * ao *
                          scene.ambientFlags.x + emissive;
     }
-    return vec4f(linearToSrgb(acesToneMap(color * scene.cameraExposure.w)), base.a);
+    let exposed = color * scene.cameraExposure.w;
+    // ambientFlags.z: write linear HDR for the bloom chain, which tone maps at
+    // composite time; otherwise tone map + encode here exactly as before.
+    if (scene.ambientFlags.z > 0.5) { return vec4f(exposed, base.a); }
+    return vec4f(linearToSrgb(acesToneMap(exposed)), base.a);
 }

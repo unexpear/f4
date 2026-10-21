@@ -20,6 +20,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "core/logging/logger.h"
+#include "graphics/gpu_selection.h"
 #include "graphics/device/object_store.h"
 #if defined(F4_DX12_HAS_PLATFORM)
 #include "platform/window.h"
@@ -272,6 +274,12 @@ struct DxBufferRecord {
     std::uint64_t allocationBytes = 0;
     bool upload = false;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    // HostWrite storage buffers: CPU writes land in this upload-heap twin and
+    // are copied into the default-heap resource at the start of the next
+    // submit, instead of a blocking executeImmediate per write.
+    ComPtr<ID3D12Resource> staging;
+    std::uint64_t pendingBegin = 0;
+    std::uint64_t pendingEnd = 0;
 };
 
 struct DxTextureRecord {
@@ -322,6 +330,10 @@ struct DxSwapchainRecord {
 
 struct DxFrameSlot {
     ComPtr<ID3D12CommandAllocator> allocator;
+    // Async compute: the compute list's allocator and shader-visible heaps.
+    ComPtr<ID3D12CommandAllocator> computeAllocator;
+    ComPtr<ID3D12DescriptorHeap> computeResources;
+    ComPtr<ID3D12DescriptorHeap> computeSamplers;
     ComPtr<ID3D12DescriptorHeap> resources;
     ComPtr<ID3D12DescriptorHeap> samplers;
     ComPtr<ID3D12DescriptorHeap> rtvs;
@@ -344,11 +356,20 @@ struct Dx12Device::Impl {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12GraphicsCommandList> commands;
     ComPtr<ID3D12Fence> fence;
+    // Async compute: a COMPUTE queue and list, the graphics list that holds
+    // the commands after waitAsyncCompute(), and the fence between queues.
+    ComPtr<ID3D12CommandQueue> computeQueue;
+    ComPtr<ID3D12GraphicsCommandList> computeCommands;
+    ComPtr<ID3D12GraphicsCommandList> splitCommands;
+    ComPtr<ID3D12Fence> computeFence;
+    std::uint64_t computeFenceValue = 0;
+    bool computePending = false; // signaled work the graphics queue has not waited on
     std::array<DxFrameSlot, kFramesInFlight> frames;
     std::size_t frameIndex = 0;
     std::uint64_t lastSubmittedFence = 0;
     std::uint64_t completedFence = 0;
     HANDLE fenceEvent = nullptr;
+    std::vector<BufferHandle> pendingHostWrites;
     HWND window = nullptr;
     char deviceName[128]{};
     std::uint32_t featureLevel = 0;
@@ -364,6 +385,14 @@ struct Dx12Device::Impl {
     ObjectStore<DxSwapchainRecord, GpuSwapchainTag> swapchains;
     SwapchainHandle activeSwapchain{};
     std::vector<RetiredObject> retired;
+    // GPU timestamps: a kGpuTimestampSets x kMaxGpuTimestamps query heap and a
+    // readback buffer the submit resolves its set into; a set is ready once
+    // its submission fence completes.
+    ComPtr<ID3D12QueryHeap> timestampHeap;
+    ComPtr<ID3D12Resource> timestampReadback;
+    double timestampTickNs = 0.0;
+    bool timestampsFailed = false;
+    GpuTimestampRing timestamps;
 
     auto waitFor(std::uint64_t value) -> HRESULT {
         if (value == 0 || fence->GetCompletedValue() >= value) {
@@ -545,21 +574,48 @@ auto Dx12Device::initialize(platform::Window* window) -> bool {
         factoryFlags, IID_IDXGIFactory4, impl_->factory.putVoid());
     if (FAILED(result)) return false;
 
+    // Rank every D3D12-capable adapter (see graphics/gpu_selection.h): DXGI
+    // lists the integrated GPU first on hybrid laptops, so "first adapter"
+    // silently picked the weaker GPU. UMA architecture marks integrated parts.
+    std::vector<ComPtr<IDXGIAdapter1>> adapters;
+    std::vector<GpuCandidate> candidates;
     for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
         result = impl_->factory->EnumAdapters1(index, candidate.put());
         if (result == DXGI_ERROR_NOT_FOUND) break;
         if (FAILED(result)) continue;
         DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(candidate->GetDesc1(&desc)) ||
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+        if (FAILED(candidate->GetDesc1(&desc))) continue;
+        ComPtr<ID3D12Device> probe;
+        if (FAILED(D3D12CreateDevice(candidate.get(), D3D_FEATURE_LEVEL_11_0,
+                                     IID_ID3D12Device, probe.putVoid()))) {
             continue;
         }
-        if (SUCCEEDED(D3D12CreateDevice(candidate.get(), D3D_FEATURE_LEVEL_11_0,
-                                        IID_ID3D12Device, nullptr))) {
-            impl_->adapter = std::move(candidate);
-            break;
+        GpuCandidate info;
+        char name[256]{};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name,
+                            static_cast<int>(sizeof(name)), nullptr, nullptr);
+        info.name = name;
+        info.dedicatedMemoryBytes = desc.DedicatedVideoMemory;
+        info.apiIndex = index;
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+            info.gpuClass = GpuClass::Software;
+        } else {
+            D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+            const bool uma = SUCCEEDED(probe->CheckFeatureSupport(
+                                 D3D12_FEATURE_ARCHITECTURE, &architecture,
+                                 sizeof(architecture))) &&
+                             architecture.UMA != FALSE;
+            info.gpuClass = uma ? GpuClass::Integrated : GpuClass::Discrete;
         }
+        adapters.push_back(std::move(candidate));
+        candidates.push_back(std::move(info));
+    }
+    if (!candidates.empty()) {
+        const GpuPreference preference = gpuPreferenceFromEnvironment();
+        const GpuSelection selection = selectGpu(candidates, preference);
+        logGpuSelection("DX12", candidates, selection, preference);
+        impl_->adapter = std::move(adapters[selection.chosen]);
     }
     if (!impl_->adapter) {
         result = impl_->factory->EnumWarpAdapter(
@@ -586,6 +642,7 @@ auto Dx12Device::initialize(platform::Window* window) -> bool {
                             impl_->deviceName, static_cast<int>(sizeof(impl_->deviceName)),
                             nullptr, nullptr);
     }
+    F4_LOG_INFO() << "DX12 device: " << impl_->deviceName;
 
     if (impl_->debugLayer) {
         (void)impl_->device->QueryInterface(
@@ -612,6 +669,36 @@ auto Dx12Device::initialize(platform::Window* window) -> bool {
     if (FAILED(result)) return false;
     impl_->fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (impl_->fenceEvent == nullptr) return false;
+    result = impl_->device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, impl_->frames[0].allocator.get(), nullptr,
+        IID_ID3D12GraphicsCommandList, impl_->splitCommands.putVoid());
+    if (FAILED(result) || FAILED(impl_->splitCommands->Close())) return false;
+    // Async compute queue (F4_NO_ASYNC_COMPUTE=1 forces the single-queue
+    // fallback); any failure here just leaves it off.
+    const char* noAsync = std::getenv("F4_NO_ASYNC_COMPUTE");
+    if (noAsync == nullptr || std::strcmp(noAsync, "1") != 0) {
+        D3D12_COMMAND_QUEUE_DESC computeDesc{};
+        computeDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        bool computeReady = SUCCEEDED(impl_->device->CreateCommandQueue(
+            &computeDesc, IID_ID3D12CommandQueue, impl_->computeQueue.putVoid()));
+        for (DxFrameSlot& frame : impl_->frames) {
+            computeReady = computeReady && SUCCEEDED(impl_->device->CreateCommandAllocator(
+                                               D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                               IID_ID3D12CommandAllocator,
+                                               frame.computeAllocator.putVoid()));
+        }
+        computeReady = computeReady && SUCCEEDED(impl_->device->CreateCommandList(
+                                           0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                           impl_->frames[0].computeAllocator.get(), nullptr,
+                                           IID_ID3D12GraphicsCommandList,
+                                           impl_->computeCommands.putVoid())) &&
+                       SUCCEEDED(impl_->computeCommands->Close());
+        computeReady = computeReady && SUCCEEDED(impl_->device->CreateFence(
+                                           0, D3D12_FENCE_FLAG_NONE, IID_ID3D12Fence,
+                                           impl_->computeFence.putVoid()));
+        if (!computeReady) impl_->computeQueue.reset();
+    }
+    if (impl_->computeQueue) F4_LOG_INFO() << "DX12 async compute queue";
     impl_->initialized = true;
     return true;
 }
@@ -691,6 +778,15 @@ auto Dx12Device::createBuffer(const BufferDesc& desc,
             });
             if (FAILED(result)) return toGfxError(result);
         }
+    }
+    if (!record.upload && hasUsage(desc.usage, BufferUsage::HostWrite)) {
+        const D3D12_HEAP_PROPERTIES stagingProperties = heapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC stagingDesc = bufferResourceDesc(record.allocationBytes);
+        result = impl_->device->CreateCommittedResource(
+            &stagingProperties, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_ID3D12Resource,
+            record.staging.putVoid());
+        if (FAILED(result)) return toGfxError(result);
     }
     const BufferHandle handle = impl_->buffers.create(std::move(record));
     ++impl_->stats.bufferCount;
@@ -1106,6 +1202,7 @@ auto Dx12Device::destroyBuffer(BufferHandle handle) -> GfxError {
     if (record == nullptr) return GfxError::StaleHandle;
     const std::uint64_t bytes = record->rec.sizeBytes;
     retainForRetirement(*impl_, record->resource.get());
+    retainForRetirement(*impl_, record->staging.get());
     impl_->buffers.destroy(handle);
     --impl_->stats.bufferCount;
     impl_->stats.bufferBytes -= bytes;
@@ -1172,6 +1269,25 @@ auto Dx12Device::writeBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (data.empty()) return GfxError::None;
+    if (record->staging) {
+        void* mapped = nullptr;
+        const D3D12_RANGE readRange{0, 0};
+        const HRESULT result = record->staging->Map(0, &readRange, &mapped);
+        if (FAILED(result)) return toGfxError(result);
+        std::memcpy(static_cast<std::byte*>(mapped) + offset, data.data(), data.size());
+        const D3D12_RANGE writtenRange{static_cast<SIZE_T>(offset),
+                                       static_cast<SIZE_T>(offset + data.size())};
+        record->staging->Unmap(0, &writtenRange);
+        if (record->pendingEnd <= record->pendingBegin) {
+            impl_->pendingHostWrites.push_back(handle);
+            record->pendingBegin = offset;
+            record->pendingEnd = offset + data.size();
+        } else {
+            record->pendingBegin = std::min<std::uint64_t>(record->pendingBegin, offset);
+            record->pendingEnd = std::max<std::uint64_t>(record->pendingEnd, offset + data.size());
+        }
+        return GfxError::None;
+    }
     if (record->upload) {
         void* mapped = nullptr;
         const D3D12_RANGE readRange{0, 0};
@@ -1219,6 +1335,21 @@ auto Dx12Device::readBuffer(BufferHandle handle, std::uint64_t offset,
         return GfxError::BadDescriptor;
     }
     if (destination.empty()) return GfxError::None;
+    if (record->staging && record->pendingEnd > record->pendingBegin) {
+        const HRESULT flushed = impl_->executeImmediate([&](ID3D12GraphicsCommandList* list) {
+            transition(list, record->resource.get(), record->state,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(record->resource.get(), record->pendingBegin,
+                                   record->staging.get(), record->pendingBegin,
+                                   record->pendingEnd - record->pendingBegin);
+            transition(list, record->resource.get(), record->state,
+                       static_cast<D3D12_RESOURCE_STATES>(
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+        });
+        if (FAILED(flushed)) return toGfxError(flushed);
+        record->pendingBegin = record->pendingEnd = 0;
+    }
     if (record->upload) {
         waitIdle();
         void* mapped = nullptr;
@@ -1318,11 +1449,36 @@ auto Dx12Device::writeTexture(TextureHandle handle, std::uint32_t mipLevel,
 }
 
 auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
+    return submitCommands(commandBuffer, false);
+}
+
+auto Dx12Device::supportsAsyncCompute() const -> bool {
+    return impl_ != nullptr && impl_->computeQueue;
+}
+
+auto Dx12Device::submitAsyncCompute(CommandBuffer& commandBuffer) -> GfxError {
+    if (!supportsAsyncCompute()) return GfxError::BackendUnavailable;
+    return submitCommands(commandBuffer, true);
+}
+
+// Async compute (asyncCompute == true) records a COMPUTE command list and runs
+// it on the compute queue, which then signals computeFence; the next graphics
+// submit executes its commands before CommandBuffer::waitAsyncCompute() as a
+// first list, makes the graphics queue Wait() on computeFence, then executes
+// the rest. Buffers decay to COMMON after each ExecuteCommandLists, so the
+// compute list starts its buffers from COMMON and the graphics list picks
+// them up from COMMON again (no graphics-only states on the compute queue).
+auto Dx12Device::submitCommands(CommandBuffer& commandBuffer, bool asyncCompute) -> GfxError {
     if (!ready() || commandBuffer.isRecording()) return GfxError::BadDescriptor;
+    if (asyncCompute && impl_->computePending) return GfxError::BadDescriptor;
     DxFrameSlot& frame = impl_->frames[impl_->frameIndex];
     HRESULT result = impl_->waitFor(frame.fenceValue);
     if (FAILED(result)) return toGfxError(result);
     collectRetired();
+    ComPtr<ID3D12DescriptorHeap>& resourceHeap =
+        asyncCompute ? frame.computeResources : frame.resources;
+    ComPtr<ID3D12DescriptorHeap>& samplerHeap =
+        asyncCompute ? frame.computeSamplers : frame.samplers;
 
     std::uint64_t resourceDescriptorCount = 0;
     std::uint64_t samplerDescriptorCount = 0;
@@ -1344,6 +1500,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 }
             }
         } else if (command.kind == CommandKind::BeginRenderPass) {
+            if (asyncCompute) return GfxError::BadDescriptor; // compute-only queue
             DxFramebufferRecord* framebuffer = impl_->framebuffers.get(command.framebuffer);
             if (framebuffer == nullptr) return GfxError::InvalidHandle;
             for (const AttachmentDesc& attachment : framebuffer->rec.attachments) {
@@ -1366,16 +1523,16 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         return GfxError::OutOfMemory;
     }
     result = createHeap(impl_->device.get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        static_cast<UINT>(resourceDescriptorCount), true, frame.resources);
+                        static_cast<UINT>(resourceDescriptorCount), true, resourceHeap);
     if (SUCCEEDED(result)) {
         result = createHeap(impl_->device.get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            static_cast<UINT>(samplerDescriptorCount), true, frame.samplers);
+                            static_cast<UINT>(samplerDescriptorCount), true, samplerHeap);
     }
-    if (SUCCEEDED(result)) {
+    if (SUCCEEDED(result) && !asyncCompute) {
         result = createHeap(impl_->device.get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                             static_cast<UINT>(rtvCount), false, frame.rtvs);
     }
-    if (SUCCEEDED(result)) {
+    if (SUCCEEDED(result) && !asyncCompute) {
         result = createHeap(impl_->device.get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
                             static_cast<UINT>(dsvCount), false, frame.dsvs);
     }
@@ -1398,16 +1555,75 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         for (auto& [record, states] : textureStates) record->states = std::move(states);
         for (auto& [record, states] : swapchainStates) record->states = std::move(states);
     };
+    // Compute batch: the buffers it binds. Their last use finished (this
+    // slot's fence), so they have decayed to COMMON.
+    std::vector<DxBufferRecord*> computeBuffers;
+    if (asyncCompute) {
+        for (const Command& command : commandBuffer.commands()) {
+            if (command.kind != CommandKind::BindResources) continue;
+            for (std::uint8_t index = 0; index < command.resourceCount; ++index) {
+                const BoundResource& resource = command.resources[index];
+                if (resource.type != BindingType::StorageBuffer &&
+                    resource.type != BindingType::UniformBuffer) {
+                    return GfxError::BadDescriptor; // buffers only on the compute queue
+                }
+                DxBufferRecord* record =
+                    impl_->buffers.get(BufferHandle{resource.handleIndex, resource.handleGeneration});
+                if (record == nullptr) return GfxError::InvalidHandle;
+                if (!record->upload) {
+                    record->state = D3D12_RESOURCE_STATE_COMMON;
+                    computeBuffers.push_back(record);
+                }
+            }
+        }
+    }
 
-    result = frame.allocator->Reset();
-    if (SUCCEEDED(result)) result = impl_->commands->Reset(frame.allocator.get(), nullptr);
-    if (FAILED(result)) return toGfxError(result);
-    ID3D12GraphicsCommandList* list = impl_->commands.get();
+    ID3D12CommandAllocator* allocator =
+        asyncCompute ? frame.computeAllocator.get() : frame.allocator.get();
+    ID3D12GraphicsCommandList* list =
+        asyncCompute ? impl_->computeCommands.get() : impl_->commands.get();
+    result = allocator->Reset();
+    if (SUCCEEDED(result)) result = list->Reset(allocator, nullptr);
+    if (FAILED(result)) {
+        rollbackStates();
+        return toGfxError(result);
+    }
+    bool timestampsActive = false;
+    std::uint32_t timestampSet = 0;
+    std::uint32_t timestampCount = 0;
+    std::uint32_t timestampMask = 0;
+    commandBuffer.timestampUsage(timestampCount, timestampMask);
+    if (timestampCount != 0 && !asyncCompute && ensureTimestamps()) {
+        timestampSet = impl_->timestamps.begin(timestampCount, timestampMask);
+        timestampsActive = true;
+    }
     std::array<ID3D12DescriptorHeap*, 2> shaderHeaps{};
     UINT shaderHeapCount = 0;
-    if (frame.resources) shaderHeaps[shaderHeapCount++] = frame.resources.get();
-    if (frame.samplers) shaderHeaps[shaderHeapCount++] = frame.samplers.get();
+    if (resourceHeap) shaderHeaps[shaderHeapCount++] = resourceHeap.get();
+    if (samplerHeap) shaderHeaps[shaderHeapCount++] = samplerHeap.get();
     if (shaderHeapCount != 0) list->SetDescriptorHeaps(shaderHeapCount, shaderHeaps.data());
+    // Host writes staged for this submit. The compute batch copies only the
+    // buffers it binds (left in COPY_DEST; binding moves them to UAV) and
+    // leaves the rest for the graphics submit.
+    std::vector<BufferHandle> flushedHostWrites;
+    for (const BufferHandle pending : impl_->pendingHostWrites) {
+        DxBufferRecord* record = impl_->buffers.get(pending);
+        if (record == nullptr || record->pendingEnd <= record->pendingBegin) continue;
+        if (asyncCompute && std::find(computeBuffers.begin(), computeBuffers.end(), record) ==
+                                computeBuffers.end()) {
+            continue;
+        }
+        flushedHostWrites.push_back(pending);
+        transition(list, record->resource.get(), record->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(record->resource.get(), record->pendingBegin,
+                               record->staging.get(), record->pendingBegin,
+                               record->pendingEnd - record->pendingBegin);
+        if (asyncCompute) continue;
+        transition(list, record->resource.get(), record->state,
+                   static_cast<D3D12_RESOURCE_STATES>(
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    }
 
     const UINT resourceIncrement = impl_->device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1444,7 +1660,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         for (const RootTable& table : pipeline.tables) {
             const UINT tableOffset = table.samplers ? samplerOffset : resourceOffset;
             ID3D12DescriptorHeap* heap = table.samplers
-                                              ? frame.samplers.get() : frame.resources.get();
+                                              ? samplerHeap.get() : resourceHeap.get();
             if (heap == nullptr) return GfxError::BackendUnavailable;
             D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
             D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
@@ -1547,11 +1763,45 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         return GfxError::None;
     };
 
-    for (const Command& command : commandBuffer.commands()) {
+    // Graphics submit after an async compute submit: the commands from the
+    // wait point on go into splitCommands, executed after a queue Wait().
+    const std::size_t splitAt = !asyncCompute && impl_->computePending
+                                    ? commandBuffer.asyncComputeWaitIndex()
+                                    : CommandBuffer::kNoAsyncComputeWait;
+    bool split = false;
+    const auto& commandList = commandBuffer.commands();
+    for (std::size_t commandIndex = 0; commandIndex < commandList.size(); ++commandIndex) {
+        const Command& command = commandList[commandIndex];
+        if (commandIndex == splitAt) {
+            if (rendering) {
+                error = GfxError::BadDescriptor;
+                break;
+            }
+            result = list->Close();
+            if (SUCCEEDED(result)) {
+                list = impl_->splitCommands.get();
+                result = list->Reset(allocator, nullptr);
+            }
+            if (FAILED(result)) {
+                error = toGfxError(result);
+                break;
+            }
+            split = true;
+            if (shaderHeapCount != 0) list->SetDescriptorHeaps(shaderHeapCount, shaderHeaps.data());
+            boundPipeline = nullptr;
+            indexBound = false;
+        }
         switch (command.kind) {
         case CommandKind::ResourceBarrier:
             if (rendering || command.after.stages == PipelineStageMask::None) {
                 error = GfxError::BadDescriptor;
+                break;
+            }
+            if (asyncCompute &&
+                (command.barrierType == BarrierResourceType::Texture ||
+                 ((command.before.stages | command.after.stages) &
+                  ~(PipelineStageMask::ComputeShader | PipelineStageMask::Transfer)) != 0)) {
+                error = GfxError::BadDescriptor; // graphics states on the compute queue
                 break;
             }
             if (command.barrierType == BarrierResourceType::Texture) {
@@ -1698,6 +1948,14 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
             boundPipeline = nullptr;
             break;
         }
+        case CommandKind::WriteTimestamp:
+            if (rendering || command.timestampIndex >= kMaxGpuTimestamps) {
+                error = GfxError::BadDescriptor;
+            } else if (timestampsActive) {
+                list->EndQuery(impl_->timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                               timestampSet * kMaxGpuTimestamps + command.timestampIndex);
+            }
+            break;
         case CommandKind::EndRenderPass:
             if (!rendering) {
                 error = GfxError::BadDescriptor;
@@ -1801,7 +2059,8 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 break;
             }
             const D3D12_VIEWPORT viewport{
-                0.0f, 0.0f, static_cast<float>(command.viewport.width),
+                static_cast<float>(command.viewportX), static_cast<float>(command.viewportY),
+                static_cast<float>(command.viewport.width),
                 static_cast<float>(command.viewport.height), 0.0f, 1.0f};
             list->RSSetViewports(1, &viewport);
             break;
@@ -1811,8 +2070,10 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
                 error = GfxError::BadDescriptor;
                 break;
             }
-            const D3D12_RECT scissor{0, 0, static_cast<LONG>(command.scissor.width),
-                                     static_cast<LONG>(command.scissor.height)};
+            const D3D12_RECT scissor{
+                static_cast<LONG>(command.scissorX), static_cast<LONG>(command.scissorY),
+                static_cast<LONG>(command.scissorX + command.scissor.width),
+                static_cast<LONG>(command.scissorY + command.scissor.height)};
             list->RSSetScissorRects(1, &scissor);
             break;
         }
@@ -1863,6 +2124,23 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         if (error != GfxError::None) break;
     }
     if (rendering && error == GfxError::None) error = GfxError::BadDescriptor;
+    if (timestampsActive && error == GfxError::None) {
+        // Resolve each contiguous run of written indices into the readback.
+        std::uint32_t index = 0;
+        while (index < timestampCount) {
+            if ((timestampMask & (1u << index)) == 0) {
+                ++index;
+                continue;
+            }
+            std::uint32_t end = index;
+            while (end < timestampCount && (timestampMask & (1u << end)) != 0) ++end;
+            const UINT first = timestampSet * kMaxGpuTimestamps + index;
+            list->ResolveQueryData(impl_->timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, first,
+                                   end - index, impl_->timestampReadback.get(),
+                                   static_cast<UINT64>(first) * sizeof(std::uint64_t));
+            index = end;
+        }
+    }
     result = list->Close();
     if (error != GfxError::None) {
         rollbackStates();
@@ -1873,8 +2151,44 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
         return toGfxError(result);
     }
 
+    if (asyncCompute) {
+        ID3D12CommandList* computeLists[] = {list};
+        impl_->computeQueue->ExecuteCommandLists(1, computeLists);
+        for (const BufferHandle flushed : flushedHostWrites) {
+            if (DxBufferRecord* record = impl_->buffers.get(flushed)) {
+                record->pendingBegin = record->pendingEnd = 0;
+            }
+            impl_->pendingHostWrites.erase(std::remove(impl_->pendingHostWrites.begin(),
+                                                       impl_->pendingHostWrites.end(), flushed),
+                                           impl_->pendingHostWrites.end());
+        }
+        // Decayed to COMMON once the compute list finishes; the graphics
+        // commands after the wait start from there.
+        for (DxBufferRecord* record : computeBuffers) record->state = D3D12_RESOURCE_STATE_COMMON;
+        result = impl_->computeQueue->Signal(impl_->computeFence.get(),
+                                             ++impl_->computeFenceValue);
+        if (FAILED(result)) return toGfxError(result);
+        impl_->computePending = true;
+        impl_->stats.dispatchCalls += delta.dispatchCalls;
+        return GfxError::None;
+    }
+    if (split) {
+        ID3D12CommandList* firstLists[] = {impl_->commands.get()};
+        impl_->queue->ExecuteCommandLists(1, firstLists);
+    }
+    if (impl_->computePending) {
+        result = impl_->queue->Wait(impl_->computeFence.get(), impl_->computeFenceValue);
+        if (FAILED(result)) return toGfxError(result);
+        impl_->computePending = false;
+    }
     ID3D12CommandList* lists[] = {list};
     impl_->queue->ExecuteCommandLists(1, lists);
+    for (const BufferHandle pending : impl_->pendingHostWrites) {
+        if (DxBufferRecord* record = impl_->buffers.get(pending)) {
+            record->pendingBegin = record->pendingEnd = 0;
+        }
+    }
+    impl_->pendingHostWrites.clear();
     HRESULT presentResult = S_OK;
     if (usedSwapchain && submissionSwapchain != nullptr) {
         const UINT syncInterval = submissionSwapchain->rec.presentMode == PresentMode::Immediate
@@ -1884,6 +2198,7 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     frame.fenceValue = ++impl_->lastSubmittedFence;
     result = impl_->queue->Signal(impl_->fence.get(), frame.fenceValue);
     if (FAILED(result)) return toGfxError(result);
+    if (timestampsActive) impl_->timestamps.sets[timestampSet].fenceValue = frame.fenceValue;
     impl_->frameIndex = (impl_->frameIndex + 1) % kFramesInFlight;
     if (FAILED(presentResult)) return toGfxError(presentResult);
     impl_->stats.drawCalls += delta.drawCalls;
@@ -1894,6 +2209,64 @@ auto Dx12Device::submit(CommandBuffer& commandBuffer) -> GfxError {
     impl_->stats.primitives += delta.primitives;
     impl_->stats.vertices += delta.vertices;
     return GfxError::None;
+}
+
+auto Dx12Device::ensureTimestamps() -> bool {
+    if (impl_->timestampHeap) return true;
+    if (impl_->timestampsFailed) return false;
+    impl_->timestampsFailed = true;
+    UINT64 frequency = 0;
+    if (FAILED(impl_->queue->GetTimestampFrequency(&frequency)) || frequency == 0) return false;
+    D3D12_QUERY_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heapDesc.Count = kGpuTimestampSets * kMaxGpuTimestamps;
+    ComPtr<ID3D12QueryHeap> heap;
+    if (FAILED(impl_->device->CreateQueryHeap(&heapDesc, IID_ID3D12QueryHeap, heap.putVoid()))) {
+        return false;
+    }
+    const D3D12_HEAP_PROPERTIES properties = heapProperties(D3D12_HEAP_TYPE_READBACK);
+    const D3D12_RESOURCE_DESC desc =
+        bufferResourceDesc(sizeof(std::uint64_t) * kGpuTimestampSets * kMaxGpuTimestamps);
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(impl_->device->CreateCommittedResource(
+            &properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_ID3D12Resource, readback.putVoid()))) {
+        return false;
+    }
+    impl_->timestampHeap = static_cast<ComPtr<ID3D12QueryHeap>&&>(heap);
+    impl_->timestampReadback = static_cast<ComPtr<ID3D12Resource>&&>(readback);
+    impl_->timestampTickNs = 1.0e9 / static_cast<double>(frequency);
+    impl_->timestampsFailed = false;
+    return true;
+}
+
+auto Dx12Device::supportsGpuTimestamps() const -> bool {
+    return impl_ != nullptr && impl_->queue && !impl_->timestampsFailed;
+}
+
+auto Dx12Device::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_ != nullptr ? impl_->timestamps.lastSerial : 0;
+}
+
+auto Dx12Device::latestGpuTimestamps() -> GpuTimestampFrame {
+    if (impl_ == nullptr || !impl_->timestampReadback) return {};
+    const std::uint64_t completed = impl_->fence->GetCompletedValue();
+    return impl_->timestamps.poll([&](std::uint32_t set, const GpuTimestampRing::Set& info,
+                                      std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+        if (info.fenceValue == 0 || completed < info.fenceValue) return false;
+        const D3D12_RANGE range{set * kMaxGpuTimestamps * sizeof(std::uint64_t),
+                                (set + 1) * kMaxGpuTimestamps * sizeof(std::uint64_t)};
+        void* mapped = nullptr;
+        if (FAILED(impl_->timestampReadback->Map(0, &range, &mapped))) return false;
+        const auto* ticks = static_cast<const std::uint64_t*>(mapped) + set * kMaxGpuTimestamps;
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            ns[i] = static_cast<std::uint64_t>(static_cast<double>(ticks[i]) *
+                                               impl_->timestampTickNs);
+        }
+        const D3D12_RANGE written{0, 0};
+        impl_->timestampReadback->Unmap(0, &written);
+        return true;
+    });
 }
 
 auto Dx12Device::readTexture(TextureHandle handle, std::uint32_t mipLevel,
@@ -1954,6 +2327,12 @@ auto Dx12Device::readTexture(TextureHandle handle, std::uint32_t mipLevel,
 
 auto Dx12Device::waitIdle() -> void {
     if (!ready()) return;
+    if (impl_->computePending) {
+        // Compute work no graphics submit waited on yet: idle covers it too.
+        if (SUCCEEDED(impl_->queue->Wait(impl_->computeFence.get(), impl_->computeFenceValue))) {
+            impl_->computePending = false;
+        }
+    }
     const std::uint64_t signal = ++impl_->lastSubmittedFence;
     if (SUCCEEDED(impl_->queue->Signal(impl_->fence.get(), signal))) {
         (void)impl_->waitFor(signal);

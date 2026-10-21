@@ -91,6 +91,16 @@ FetchContent_Declare(tinyusdz
 )
 FetchContent_MakeAvailable(tinyusdz)
 
+# Hybrid-GPU laptops (NVIDIA Optimus, AMD PowerXpress) run OpenGL on the
+# integrated GPU unless the executable itself exports a high-performance hint.
+# Every f4 executable that can open a GL context gets the exports.
+function(f4_prefer_high_performance_gpu target)
+    if(WIN32)
+        target_sources(${target} PRIVATE
+            "${PROJECT_SOURCE_DIR}/src/platform/high_performance_gpu.cpp")
+    endif()
+endfunction()
+
 add_library(f4_core STATIC
     core/jobs/job_system.cpp
     core/logging/logger.cpp
@@ -142,6 +152,7 @@ f4_enable_sanitizers(f4_core)
 add_library(f4_graphics STATIC
     graphics/device/device.cpp
     graphics/command/command_buffer.cpp
+    graphics/gpu_selection.cpp
     graphics/handle.cpp
     graphics/hud/hud_font.cpp
     graphics/hud/hud_overlay.cpp
@@ -157,6 +168,8 @@ f4_set_float_precision(f4_graphics)
 f4_enable_sanitizers(f4_graphics)
 
 add_library(f4_engine STATIC
+    engine/lighting/clustered_lights.cpp
+    engine/lighting/point_shadows.cpp
     engine/world/world_data.cpp
     engine/world/terrain_meshing.cpp
     engine/world/world_streaming.cpp
@@ -167,6 +180,7 @@ add_library(f4_engine STATIC
     engine/rendering/renderer.cpp
     engine/rendering/world_grid.cpp
     engine/rendering/shader_constants.cpp
+    engine/rendering/effect_shaders.cpp
     engine/rendering/shader_parity.cpp
 )
 
@@ -177,7 +191,12 @@ target_compile_definitions(f4_engine PRIVATE
     F4_PBR_OPENGL_INSTANCED_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_instanced_opengl.vert"
     F4_PBR_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_opengl.frag"
     F4_SHADOW_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.vert"
-    F4_SHADOW_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.frag")
+    F4_SHADOW_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_opengl.frag"
+    F4_POINT_SHADOW_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_opengl.vert"
+    F4_POINT_SHADOW_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_opengl.frag"
+    F4_BLOOM_OPENGL_VERTEX="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_opengl.vert"
+    F4_BLOOM_OPENGL_FRAGMENT="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_opengl.frag"
+    F4_LIGHT_BINNING_OPENGL_COMPUTE="${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/light_binning.comp")
 f4_set_warnings(f4_engine)
 f4_set_float_precision(f4_engine)
 f4_enable_sanitizers(f4_engine)
@@ -227,6 +246,7 @@ if(TARGET f4_platform AND F4_EPOXY_INCLUDE_DIR AND F4_EPOXY_LIBRARY)
     f4_set_warnings(f4_app)
     f4_set_float_precision(f4_app)
     f4_enable_sanitizers(f4_app)
+    f4_prefer_high_performance_gpu(f4_app)
 
     # Focused one-capability demos.
     add_subdirectory(demos)
@@ -257,6 +277,11 @@ if(Vulkan_FOUND)
         set(F4_PBR_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/pbr.frag.spv")
         set(F4_SHADOW_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/shadow.vert.spv")
         set(F4_SHADOW_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/shadow.frag.spv")
+        set(F4_POINT_SHADOW_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/point_shadow.vert.spv")
+        set(F4_POINT_SHADOW_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/point_shadow.frag.spv")
+        set(F4_BLOOM_VK_VERTEX "${F4_PBR_VK_SHADER_DIR}/post_bloom.vert.spv")
+        set(F4_BLOOM_VK_FRAGMENT "${F4_PBR_VK_SHADER_DIR}/post_bloom.frag.spv")
+        set(F4_LIGHT_BINNING_VK_COMPUTE "${F4_PBR_VK_SHADER_DIR}/light_binning.comp.spv")
         function(f4_compile_pbr_spirv output source stage)
             add_custom_command(
                 OUTPUT "${output}"
@@ -278,17 +303,43 @@ if(Vulkan_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_vulkan.vert" vert)
         f4_compile_pbr_spirv("${F4_SHADOW_VK_FRAGMENT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_vulkan.frag" frag)
+        f4_compile_pbr_spirv("${F4_POINT_SHADOW_VK_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_vulkan.vert" vert)
+        f4_compile_pbr_spirv("${F4_POINT_SHADOW_VK_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_vulkan.frag" frag)
+        f4_compile_pbr_spirv("${F4_BLOOM_VK_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_vulkan.vert" vert)
+        f4_compile_pbr_spirv("${F4_BLOOM_VK_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_vulkan.frag" frag)
+        add_custom_command(
+            OUTPUT "${F4_LIGHT_BINNING_VK_COMPUTE}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${F4_PBR_VK_SHADER_DIR}"
+            COMMAND $<TARGET_FILE:Vulkan::glslangValidator>
+                    -V --target-env vulkan1.3 --target-env spirv1.5
+                    --spirv-val -S comp -DF4_VULKAN=1
+                    -o "${F4_LIGHT_BINNING_VK_COMPUTE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/light_binning.comp"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/light_binning.comp"
+            VERBATIM)
         add_custom_target(f4_pbr_vk_shaders DEPENDS
             "${F4_PBR_VK_VERTEX}" "${F4_PBR_VK_INSTANCED_VERTEX}"
             "${F4_PBR_VK_FRAGMENT}"
-            "${F4_SHADOW_VK_VERTEX}" "${F4_SHADOW_VK_FRAGMENT}")
+            "${F4_SHADOW_VK_VERTEX}" "${F4_SHADOW_VK_FRAGMENT}"
+            "${F4_POINT_SHADOW_VK_VERTEX}" "${F4_POINT_SHADOW_VK_FRAGMENT}"
+            "${F4_BLOOM_VK_VERTEX}" "${F4_BLOOM_VK_FRAGMENT}"
+            "${F4_LIGHT_BINNING_VK_COMPUTE}")
         add_dependencies(f4_engine f4_pbr_vk_shaders)
         target_compile_definitions(f4_engine PRIVATE
             F4_PBR_VULKAN_VERTEX="${F4_PBR_VK_VERTEX}"
             F4_PBR_VULKAN_INSTANCED_VERTEX="${F4_PBR_VK_INSTANCED_VERTEX}"
             F4_PBR_VULKAN_FRAGMENT="${F4_PBR_VK_FRAGMENT}"
             F4_SHADOW_VULKAN_VERTEX="${F4_SHADOW_VK_VERTEX}"
-            F4_SHADOW_VULKAN_FRAGMENT="${F4_SHADOW_VK_FRAGMENT}")
+            F4_SHADOW_VULKAN_FRAGMENT="${F4_SHADOW_VK_FRAGMENT}"
+            F4_POINT_SHADOW_VULKAN_VERTEX="${F4_POINT_SHADOW_VK_VERTEX}"
+            F4_POINT_SHADOW_VULKAN_FRAGMENT="${F4_POINT_SHADOW_VK_FRAGMENT}"
+            F4_BLOOM_VULKAN_VERTEX="${F4_BLOOM_VK_VERTEX}"
+            F4_BLOOM_VULKAN_FRAGMENT="${F4_BLOOM_VK_FRAGMENT}"
+            F4_LIGHT_BINNING_VULKAN_COMPUTE="${F4_LIGHT_BINNING_VK_COMPUTE}")
     endif()
 
     if(TARGET f4_platform)
@@ -333,6 +384,7 @@ if(Vulkan_FOUND)
             f4_set_warnings(f4_vulkan_app)
             f4_set_float_precision(f4_vulkan_app)
             f4_enable_sanitizers(f4_vulkan_app)
+            f4_prefer_high_performance_gpu(f4_vulkan_app)
         endif()
     endif()
 elseif(F4_GRAPHICS_BACKEND STREQUAL "vulkan")
@@ -361,6 +413,11 @@ if(WIN32)
         set(F4_PBR_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/pbr.frag.dxil")
         set(F4_SHADOW_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/shadow.vert.dxil")
         set(F4_SHADOW_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/shadow.frag.dxil")
+        set(F4_POINT_SHADOW_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/point_shadow.vert.dxil")
+        set(F4_POINT_SHADOW_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/point_shadow.frag.dxil")
+        set(F4_BLOOM_DX12_VERTEX "${F4_PBR_DX12_SHADER_DIR}/post_bloom.vert.dxil")
+        set(F4_BLOOM_DX12_FRAGMENT "${F4_PBR_DX12_SHADER_DIR}/post_bloom.frag.dxil")
+        set(F4_LIGHT_BINNING_DX12_COMPUTE "${F4_PBR_DX12_SHADER_DIR}/light_binning.comp.dxil")
         function(f4_compile_pbr_dxil output source profile entry)
             add_custom_command(
                 OUTPUT "${output}"
@@ -385,17 +442,40 @@ if(WIN32)
         f4_compile_pbr_dxil("${F4_SHADOW_DX12_FRAGMENT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_dx12.hlsl"
             ps_6_0 PSMain)
+        f4_compile_pbr_dxil("${F4_POINT_SHADOW_DX12_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_dx12.hlsl"
+            vs_6_0 VSMain)
+        f4_compile_pbr_dxil("${F4_POINT_SHADOW_DX12_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_dx12.hlsl"
+            ps_6_0 PSMain)
+        f4_compile_pbr_dxil("${F4_BLOOM_DX12_VERTEX}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_dx12.hlsl"
+            vs_6_0 VSMain)
+        f4_compile_pbr_dxil("${F4_BLOOM_DX12_FRAGMENT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_dx12.hlsl"
+            ps_6_0 PSMain)
+        f4_compile_pbr_dxil("${F4_LIGHT_BINNING_DX12_COMPUTE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/light_binning_dx12.hlsl"
+            cs_6_0 CSMain)
         add_custom_target(f4_pbr_dx12_shaders DEPENDS
             "${F4_PBR_DX12_VERTEX}" "${F4_PBR_DX12_INSTANCED_VERTEX}"
             "${F4_PBR_DX12_FRAGMENT}"
-            "${F4_SHADOW_DX12_VERTEX}" "${F4_SHADOW_DX12_FRAGMENT}")
+            "${F4_SHADOW_DX12_VERTEX}" "${F4_SHADOW_DX12_FRAGMENT}"
+            "${F4_POINT_SHADOW_DX12_VERTEX}" "${F4_POINT_SHADOW_DX12_FRAGMENT}"
+            "${F4_BLOOM_DX12_VERTEX}" "${F4_BLOOM_DX12_FRAGMENT}"
+            "${F4_LIGHT_BINNING_DX12_COMPUTE}")
         add_dependencies(f4_engine f4_pbr_dx12_shaders)
         target_compile_definitions(f4_engine PRIVATE
             F4_PBR_DX12_VERTEX="${F4_PBR_DX12_VERTEX}"
             F4_PBR_DX12_INSTANCED_VERTEX="${F4_PBR_DX12_INSTANCED_VERTEX}"
             F4_PBR_DX12_FRAGMENT="${F4_PBR_DX12_FRAGMENT}"
             F4_SHADOW_DX12_VERTEX="${F4_SHADOW_DX12_VERTEX}"
-            F4_SHADOW_DX12_FRAGMENT="${F4_SHADOW_DX12_FRAGMENT}")
+            F4_SHADOW_DX12_FRAGMENT="${F4_SHADOW_DX12_FRAGMENT}"
+            F4_POINT_SHADOW_DX12_VERTEX="${F4_POINT_SHADOW_DX12_VERTEX}"
+            F4_POINT_SHADOW_DX12_FRAGMENT="${F4_POINT_SHADOW_DX12_FRAGMENT}"
+            F4_BLOOM_DX12_VERTEX="${F4_BLOOM_DX12_VERTEX}"
+            F4_BLOOM_DX12_FRAGMENT="${F4_BLOOM_DX12_FRAGMENT}"
+            F4_LIGHT_BINNING_DX12_COMPUTE="${F4_LIGHT_BINNING_DX12_COMPUTE}")
     endif()
     if(TARGET f4_platform)
         set(F4_GRAPHICS_HAS_DX12_WINDOW ON)
@@ -436,6 +516,7 @@ if(WIN32)
             f4_set_warnings(f4_dx12_app)
             f4_set_float_precision(f4_dx12_app)
             f4_enable_sanitizers(f4_dx12_app)
+            f4_prefer_high_performance_gpu(f4_dx12_app)
         endif()
     endif()
 elseif(F4_GRAPHICS_BACKEND STREQUAL "dx12")
@@ -471,6 +552,10 @@ if(APPLE)
     set(F4_PBR_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/pbr.frag.metallib")
     set(F4_SHADOW_METAL_VERTEX "${F4_PBR_METAL_SHADER_DIR}/shadow.vert.metallib")
     set(F4_SHADOW_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/shadow.frag.metallib")
+    set(F4_POINT_SHADOW_METAL_VERTEX "${F4_PBR_METAL_SHADER_DIR}/point_shadow.vert.metallib")
+    set(F4_POINT_SHADOW_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/point_shadow.frag.metallib")
+    set(F4_BLOOM_METAL_VERTEX "${F4_PBR_METAL_SHADER_DIR}/post_bloom.vert.metallib")
+    set(F4_BLOOM_METAL_FRAGMENT "${F4_PBR_METAL_SHADER_DIR}/post_bloom.frag.metallib")
     f4_compile_metallib("${F4_PBR_METAL_VERTEX}"
         "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/pbr_metal.vert.metal")
     f4_compile_metallib("${F4_PBR_METAL_INSTANCED_VERTEX}"
@@ -481,17 +566,31 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_metal.vert.metal")
     f4_compile_metallib("${F4_SHADOW_METAL_FRAGMENT}"
         "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/shadow_metal.frag.metal")
+    f4_compile_metallib("${F4_POINT_SHADOW_METAL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_metal.vert.metal")
+    f4_compile_metallib("${F4_POINT_SHADOW_METAL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/point_shadow_metal.frag.metal")
+    f4_compile_metallib("${F4_BLOOM_METAL_VERTEX}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_metal.vert.metal")
+    f4_compile_metallib("${F4_BLOOM_METAL_FRAGMENT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/rendering/shaders/post_bloom_metal.frag.metal")
     add_custom_target(f4_pbr_metal_shaders DEPENDS
         "${F4_PBR_METAL_VERTEX}" "${F4_PBR_METAL_INSTANCED_VERTEX}"
         "${F4_PBR_METAL_FRAGMENT}" "${F4_SHADOW_METAL_VERTEX}"
-        "${F4_SHADOW_METAL_FRAGMENT}")
+        "${F4_SHADOW_METAL_FRAGMENT}"
+        "${F4_POINT_SHADOW_METAL_VERTEX}" "${F4_POINT_SHADOW_METAL_FRAGMENT}"
+        "${F4_BLOOM_METAL_VERTEX}" "${F4_BLOOM_METAL_FRAGMENT}")
     add_dependencies(f4_engine f4_pbr_metal_shaders)
     target_compile_definitions(f4_engine PRIVATE
         F4_PBR_METAL_VERTEX="${F4_PBR_METAL_VERTEX}"
         F4_PBR_METAL_INSTANCED_VERTEX="${F4_PBR_METAL_INSTANCED_VERTEX}"
         F4_PBR_METAL_FRAGMENT="${F4_PBR_METAL_FRAGMENT}"
         F4_SHADOW_METAL_VERTEX="${F4_SHADOW_METAL_VERTEX}"
-        F4_SHADOW_METAL_FRAGMENT="${F4_SHADOW_METAL_FRAGMENT}")
+        F4_SHADOW_METAL_FRAGMENT="${F4_SHADOW_METAL_FRAGMENT}"
+        F4_POINT_SHADOW_METAL_VERTEX="${F4_POINT_SHADOW_METAL_VERTEX}"
+        F4_POINT_SHADOW_METAL_FRAGMENT="${F4_POINT_SHADOW_METAL_FRAGMENT}"
+        F4_BLOOM_METAL_VERTEX="${F4_BLOOM_METAL_VERTEX}"
+        F4_BLOOM_METAL_FRAGMENT="${F4_BLOOM_METAL_FRAGMENT}")
 
     set(F4_METAL_APP_SHADER "${CMAKE_CURRENT_BINARY_DIR}/metal-app-shaders/triangle.metallib")
     f4_compile_metallib("${F4_METAL_APP_SHADER}"

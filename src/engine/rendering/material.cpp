@@ -5,6 +5,9 @@
 #include <fstream>
 #include <limits>
 
+#include "engine/lighting/clustered_lights.h"
+#include "engine/lighting/point_shadows.h"
+#include "engine/rendering/effect_shaders.h"
 #include "graphics/shader/shader_desc.h"
 
 #if defined(F4_WEBGPU_SHADER_HEADER)
@@ -210,7 +213,7 @@ void hashHandle(std::uint64_t& hash, resources::TextureHandle value) {
     return static_cast<bool>(file.read(reinterpret_cast<char*>(output.blob.data()), size));
 }
 
-void addPbrBindings(gfx::PipelineStateDesc& pipeline) {
+void addPbrBindings(gfx::PipelineStateDesc& pipeline, gfx::Backend backend) {
     gfx::BindGroup group;
     group.bindPoint = 0;
     group.slots.push({0, gfx::BindingType::UniformBuffer,
@@ -223,7 +226,41 @@ void addPbrBindings(gfx::PipelineStateDesc& pipeline) {
         group.slots.push({slot, gfx::BindingType::Sampler,
                           gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
     }
-    pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+    // Clustered point lights: one read-only word buffer for the fragment stage.
+    group.slots.push({pointLightStorageSlot(backend), gfx::BindingType::StorageBuffer,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+    // Point-shadow atlas (see engine/lighting/point_shadows.h).
+    const PointShadowBinding atlas = pointShadowAtlasBinding(backend);
+    if (atlas.bindPoint == group.bindPoint) {
+        group.slots.push({atlas.slot, gfx::BindingType::Texture,
+                          gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        group.slots.push({atlas.slot, gfx::BindingType::Sampler,
+                          gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+    } else {
+        pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+        gfx::BindGroup atlasGroup;
+        atlasGroup.bindPoint = atlas.bindPoint;
+        atlasGroup.slots.push({atlas.slot, gfx::BindingType::Texture,
+                               gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        atlasGroup.slots.push({atlas.slot, gfx::BindingType::Sampler,
+                               gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+        pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(atlasGroup));
+    }
+}
+
+[[nodiscard]] auto pointShadowCompatibleInput(const gfx::VertexInputLayout& vertexInput)
+    -> gfx::VertexInputLayout {
+    gfx::VertexInputLayout layout;
+    for (const auto& binding : vertexInput.bindings) layout.bindings.push(binding);
+    for (const auto& attribute : vertexInput.attributes) {
+        // Position, UV, and the instance model columns (locations 9..12).
+        if (attribute.location == 0 || attribute.location == 2 ||
+            (attribute.location >= 9 && attribute.location <= 12)) {
+            layout.attributes.push(attribute);
+        }
+    }
+    return layout;
 }
 
 } // namespace
@@ -382,11 +419,11 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
 }
 
 auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle handle,
-                                   const gfx::VertexInputLayout& vertexInput)
-    -> gfx::GfxError {
+                                   const gfx::VertexInputLayout& vertexInput,
+                                   gfx::TextureFormat colorFormat) -> gfx::GfxError {
     StandardMaterial* material = arena_.get(handle);
     if (material == nullptr) return gfx::GfxError::InvalidHandle;
-    if (pipelineFor(handle, vertexInput).isValid()) return gfx::GfxError::None;
+    if (pipelineFor(handle, vertexInput, colorFormat).isValid()) return gfx::GfxError::None;
     if (const auto error = ensureShaders(dev); error != gfx::GfxError::None) return error;
 
     gfx::PipelineStateDesc pipeline;
@@ -402,6 +439,7 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
     pipeline.depthStencil.depthWriteEnable = !blended;
     pipeline.depthStencil.depthCompare = gfx::CompareOp::Less;
     gfx::ColorAttachmentState color;
+    color.format = colorFormat;
     color.blendEnable = blended;
     if (blended) {
         color.srcColor = gfx::BlendFactor::SrcAlpha;
@@ -410,13 +448,14 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
         color.dstAlpha = gfx::BlendFactor::OneMinusSrcAlpha;
     }
     pipeline.colorAttachments.push(color);
-    addPbrBindings(pipeline);
+    addPbrBindings(pipeline, dev.backend());
 
     auto result = dev.createPipeline(pipeline);
     if (!result.hasValue()) return result.error();
     MaterialPipelineVariant variant;
     variant.vertexLayoutHash = hashLayout(vertexInput);
     variant.vertexInput = vertexInput;
+    variant.colorFormat = colorFormat;
     variant.pipeline = result.value();
     material->variants.push(static_cast<MaterialPipelineVariant&&>(variant));
     if (!material->pipeline.isValid()) material->pipeline = result.value();
@@ -424,13 +463,15 @@ auto MaterialCache::ensurePipeline(gfx::IDevice& dev, resources::MaterialHandle 
 }
 
 auto MaterialCache::pipelineFor(resources::MaterialHandle handle,
-                                const gfx::VertexInputLayout& vertexInput) const
+                                const gfx::VertexInputLayout& vertexInput,
+                                gfx::TextureFormat colorFormat) const
     -> gfx::PipelineHandle {
     const StandardMaterial* material = arena_.get(handle);
     if (material == nullptr) return {};
     const std::uint64_t hash = hashLayout(vertexInput);
     for (const MaterialPipelineVariant& variant : material->variants) {
-        if (variant.vertexLayoutHash == hash && layoutsEqual(variant.vertexInput, vertexInput)) {
+        if (variant.vertexLayoutHash == hash && variant.colorFormat == colorFormat &&
+            layoutsEqual(variant.vertexInput, vertexInput)) {
             return variant.pipeline;
         }
     }
@@ -492,6 +533,74 @@ auto MaterialCache::shadowPipelineFor(const gfx::VertexInputLayout& vertexInput)
     return {};
 }
 
+auto MaterialCache::ensurePointShadowPipeline(gfx::IDevice& dev,
+                                              const gfx::VertexInputLayout& vertexInput,
+                                              bool tileReset) -> gfx::GfxError {
+    if (pointShadowPipelineFor(vertexInput, tileReset).isValid()) return gfx::GfxError::None;
+    if (owner_ != nullptr && owner_ != &dev) return gfx::GfxError::InvalidHandle;
+    if (!pointShadowVs_.isValid()) {
+        auto shader = loadEffectShader(dev, EffectShader::PointShadowVertex);
+        if (!shader.hasValue()) return shader.error();
+        pointShadowVs_ = shader.value();
+    }
+    if (!pointShadowFs_.isValid()) {
+        auto shader = loadEffectShader(dev, EffectShader::PointShadowFragment);
+        if (!shader.hasValue()) return shader.error();
+        pointShadowFs_ = shader.value();
+    }
+    owner_ = &dev;
+
+    gfx::PipelineStateDesc pipeline;
+    pipeline.vertexShader = pointShadowVs_;
+    pipeline.fragmentShader = pointShadowFs_;
+    pipeline.vertexInput = pointShadowCompatibleInput(vertexInput);
+    pipeline.topology = gfx::PrimitiveTopology::TriangleList;
+    pipeline.raster.cullMode = gfx::CullMode::None;
+    pipeline.depthStencil.depthTestEnable = !tileReset;
+    pipeline.depthStencil.depthWriteEnable = !tileReset;
+    pipeline.depthStencil.depthCompare =
+        tileReset ? gfx::CompareOp::Always : gfx::CompareOp::Less;
+    // The reset variant neither tests nor writes depth but still renders into
+    // the atlas framebuffer, which carries the depth attachment.
+    pipeline.depthStencil.depthAttachmentEnable = true;
+    pipeline.depthStencil.format = gfx::TextureFormat::Depth32F;
+    gfx::ColorAttachmentState color;
+    color.format = gfx::TextureFormat::R16_FLOAT;
+    pipeline.colorAttachments.push(color);
+    gfx::BindGroup group;
+    group.bindPoint = 0;
+    group.slots.push({0, gfx::BindingType::UniformBuffer,
+                      gfx::shaderStageBit(gfx::ShaderStage::Vertex), 1});
+    group.slots.push({0, gfx::BindingType::Texture,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+    group.slots.push({0, gfx::BindingType::Sampler,
+                      gfx::shaderStageBit(gfx::ShaderStage::Fragment), 1});
+    pipeline.layout.groups.push(static_cast<gfx::BindGroup&&>(group));
+
+    auto result = dev.createPipeline(pipeline);
+    if (!result.hasValue()) return result.error();
+    MaterialPipelineVariant variant;
+    variant.vertexLayoutHash = hashLayout(vertexInput);
+    variant.vertexInput = vertexInput;
+    variant.colorFormat = gfx::TextureFormat::R16_FLOAT;
+    variant.pipeline = result.value();
+    (tileReset ? pointShadowResetVariants_ : pointShadowVariants_)
+        .push(static_cast<MaterialPipelineVariant&&>(variant));
+    return gfx::GfxError::None;
+}
+
+auto MaterialCache::pointShadowPipelineFor(const gfx::VertexInputLayout& vertexInput,
+                                           bool tileReset) const -> gfx::PipelineHandle {
+    const std::uint64_t hash = hashLayout(vertexInput);
+    for (const MaterialPipelineVariant& variant :
+         tileReset ? pointShadowResetVariants_ : pointShadowVariants_) {
+        if (variant.vertexLayoutHash == hash && layoutsEqual(variant.vertexInput, vertexInput)) {
+            return variant.pipeline;
+        }
+    }
+    return {};
+}
+
 auto MaterialCache::destroy(resources::MaterialHandle handle, gfx::IDevice& dev)
     -> gfx::GfxError {
     StandardMaterial* material = arena_.get(handle);
@@ -514,6 +623,18 @@ void MaterialCache::clear(gfx::IDevice& dev) {
         if (variant.pipeline.isValid()) (void)dev.destroyPipeline(variant.pipeline);
     }
     shadowVariants_.clear();
+    for (const MaterialPipelineVariant& variant : pointShadowVariants_) {
+        if (variant.pipeline.isValid()) (void)dev.destroyPipeline(variant.pipeline);
+    }
+    pointShadowVariants_.clear();
+    for (const MaterialPipelineVariant& variant : pointShadowResetVariants_) {
+        if (variant.pipeline.isValid()) (void)dev.destroyPipeline(variant.pipeline);
+    }
+    pointShadowResetVariants_.clear();
+    if (pointShadowVs_.isValid()) (void)dev.destroyShader(pointShadowVs_);
+    if (pointShadowFs_.isValid()) (void)dev.destroyShader(pointShadowFs_);
+    pointShadowVs_ = {};
+    pointShadowFs_ = {};
     if (pbrVs_.isValid()) (void)dev.destroyShader(pbrVs_);
     if (pbrInstancedVs_.isValid()) (void)dev.destroyShader(pbrInstancedVs_);
     if (pbrFs_.isValid()) (void)dev.destroyShader(pbrFs_);

@@ -28,6 +28,7 @@ if(TARGET SDL2::SDL2 AND NOT MSVC)
         demo_hierarchy.cpp
         demo_cornell_box.cpp
         demo_render_validation.cpp
+        demo_night_lights.cpp
     )
     target_include_directories(demo_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(demo_bench PRIVATE demo_support f4_graphics f4_platform f4_core f4_engine
@@ -35,4 +36,5 @@ if(TARGET SDL2::SDL2 AND NOT MSVC)
     f4_set_warnings(demo_bench)
     f4_set_float_precision(demo_bench)
     f4_enable_sanitizers(demo_bench)
+    f4_prefer_high_performance_gpu(demo_bench)
 endif()

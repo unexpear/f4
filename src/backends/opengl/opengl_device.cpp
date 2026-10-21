@@ -340,6 +340,13 @@ struct OpenGLDevice::Impl {
     GLint maxTextureUnits_ = 0;
     GLuint glProgram_ = 0;
     GLuint glVao_ = 0;
+
+    // GPU timestamps: kGpuTimestampSets x kMaxGpuTimestamps query objects
+    // (GL_TIMESTAMP via glQueryCounter), created on first use.
+    std::vector<GLuint> timestampQueries_;
+    GpuTimestampRing timestamps_;
+    std::uint32_t timestampSet_ = 0;
+    bool timestampsActive_ = false;
 };
 
 OpenGLDevice::OpenGLDevice() : impl_(new Impl()) {
@@ -356,6 +363,10 @@ OpenGLDevice::OpenGLDevice() : impl_(new Impl()) {
 OpenGLDevice::~OpenGLDevice() {
     // Destroy any live GL objects so a caller deleting the device mid-stream
     // won't leak GPU objects.
+    if (!impl_->timestampQueries_.empty()) {
+        glDeleteQueries(static_cast<GLsizei>(impl_->timestampQueries_.size()),
+                        impl_->timestampQueries_.data());
+    }
     impl_->buffers.forEach([](GlBuffer* b) { glDeleteBuffers(1, &b->id); });
     impl_->textures.forEach([](GlTexture* t) { glDeleteTextures(1, &t->id); });
     impl_->samplers.forEach([](GlSampler* s) { glDeleteSamplers(1, &s->id); });
@@ -821,7 +832,8 @@ auto OpenGLDevice::writeBuffer(BufferHandle h, std::uint64_t offset,
     // For Uniform buffers (updated every frame), orphan the buffer to avoid
     // GPU pipeline stalls. Other buffer types are typically uploaded once and
     // read by the GPU, so glBufferSubData is fine.
-    if (hasUsage(b->rec.usage, BufferUsage::Uniform)) {
+    if (hasUsage(b->rec.usage, BufferUsage::Uniform) ||
+        hasUsage(b->rec.usage, BufferUsage::HostWrite)) {
         glBufferData(b->target, static_cast<GLsizeiptr>(b->rec.sizeBytes),
                      nullptr, GL_DYNAMIC_DRAW);
     }
@@ -889,6 +901,21 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
     impl_->boundPipeline_ = nullptr;
     impl_->boundIndexBuffer_ = 0;
     impl_->boundFramebuffer_ = nullptr;
+    impl_->timestampsActive_ = false;
+    {
+        std::uint32_t timestampCount = 0;
+        std::uint32_t timestampMask = 0;
+        cb.timestampUsage(timestampCount, timestampMask);
+        if (timestampCount != 0) {
+            if (impl_->timestampQueries_.empty()) {
+                impl_->timestampQueries_.resize(kGpuTimestampSets * kMaxGpuTimestamps);
+                glGenQueries(static_cast<GLsizei>(impl_->timestampQueries_.size()),
+                             impl_->timestampQueries_.data());
+            }
+            impl_->timestampSet_ = impl_->timestamps_.begin(timestampCount, timestampMask);
+            impl_->timestampsActive_ = true;
+        }
+    }
 
     for (const Command& command : cb.commands()) {
         switch (command.kind) {
@@ -983,6 +1010,15 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             impl_->boundFramebuffer_ = nullptr;
             break;
         }
+        case CommandKind::WriteTimestamp:
+            if (impl_->renderPassActive_ || command.timestampIndex >= kMaxGpuTimestamps) {
+                impl_->lastSubmitError_ = GfxError::BadDescriptor;
+                return GfxError::BadDescriptor;
+            }
+            glQueryCounter(impl_->timestampQueries_[impl_->timestampSet_ * kMaxGpuTimestamps +
+                                                    command.timestampIndex],
+                           GL_TIMESTAMP);
+            break;
         case CommandKind::BindPipeline: {
             GlPipeline* p = impl_->pipelines.get(command.pipeline);
             if (p == nullptr) {
@@ -1131,7 +1167,9 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
             break;
         }
         case CommandKind::SetViewport: {
-            glViewport(0, 0, static_cast<GLsizei>(command.viewport.width),
+            glViewport(static_cast<GLint>(command.viewportX),
+                       static_cast<GLint>(command.viewportY),
+                       static_cast<GLsizei>(command.viewport.width),
                        static_cast<GLsizei>(command.viewport.height));
             break;
         }
@@ -1140,7 +1178,8 @@ auto OpenGLDevice::submit(CommandBuffer& cb) -> GfxError {
                 glEnable(GL_SCISSOR_TEST);
                 impl_->glScissorTest_ = true;
             }
-            glScissor(0, 0, static_cast<GLsizei>(command.scissor.width),
+            glScissor(static_cast<GLint>(command.scissorX), static_cast<GLint>(command.scissorY),
+                      static_cast<GLsizei>(command.scissor.width),
                       static_cast<GLsizei>(command.scissor.height));
             break;
         }
@@ -1334,6 +1373,31 @@ auto OpenGLDevice::stats() const -> DeviceStats {
 
 auto OpenGLDevice::resetFrameStats() -> void { impl_->stats_ = DeviceStats{}; }
 
+auto OpenGLDevice::lastGpuTimestampSerial() const -> std::uint64_t {
+    return impl_->timestamps_.lastSerial;
+}
+
+auto OpenGLDevice::latestGpuTimestamps() -> GpuTimestampFrame {
+    return impl_->timestamps_.poll([&](std::uint32_t set, const GpuTimestampRing::Set& info,
+                                       std::array<std::uint64_t, kMaxGpuTimestamps>& ns) {
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            if ((info.written & (1u << i)) == 0) continue;
+            GLuint available = 0;
+            glGetQueryObjectuiv(impl_->timestampQueries_[set * kMaxGpuTimestamps + i],
+                                GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == 0) return false;
+        }
+        for (std::uint32_t i = 0; i < info.count; ++i) {
+            if ((info.written & (1u << i)) == 0) continue;
+            GLuint64 value = 0;
+            glGetQueryObjectui64v(impl_->timestampQueries_[set * kMaxGpuTimestamps + i],
+                                  GL_QUERY_RESULT, &value);
+            ns[i] = value;
+        }
+        return true;
+    });
+}
+
 auto createOpenGLDevice() -> IDevice* {
     GLint major = 0;
     GLint minor = 0;
@@ -1356,6 +1420,14 @@ auto createOpenGLDevice() -> IDevice* {
         return nullptr;
     }
 
+    static bool loggedRenderer = false;
+    if (!loggedRenderer) {
+        loggedRenderer = true;
+        const auto* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const auto* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+        F4_LOG_INFO() << "OpenGL renderer: " << (renderer != nullptr ? renderer : "?") << " ("
+                      << (vendor != nullptr ? vendor : "?") << ')';
+    }
     return new OpenGLDevice();
 }
 

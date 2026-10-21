@@ -52,6 +52,12 @@ public:
     [[nodiscard]] auto stats() const -> DeviceStats override;
     auto resetFrameStats() -> void override;
 
+    [[nodiscard]] auto supportsGpuTimestamps() const -> bool override;
+    [[nodiscard]] auto lastGpuTimestampSerial() const -> std::uint64_t override;
+    auto latestGpuTimestamps() -> GpuTimestampFrame override;
+    [[nodiscard]] auto supportsAsyncCompute() const -> bool override;
+    auto submitAsyncCompute(CommandBuffer&) -> GfxError override;
+
     [[nodiscard]] auto deviceName() const -> const char*;
     [[nodiscard]] auto apiVersion() const -> std::uint32_t;
     [[nodiscard]] auto graphicsQueueFamily() const -> std::uint32_t;
@@ -75,6 +81,12 @@ private:
     [[nodiscard]] auto initialize(platform::Window* window) -> bool;
     [[nodiscard]] auto ready() const -> bool;
     void collectRetired();
+    // submit() and submitAsyncCompute(): `asyncCompute` records into the
+    // frame slot's compute command buffer and submits it to the compute queue.
+    [[nodiscard]] auto submitCommands(CommandBuffer& commands, bool asyncCompute) -> GfxError;
+    [[nodiscard]] auto copyDeviceLocalBuffer(BufferHandle handle, std::uint64_t offset,
+                                             std::span<const std::byte> upload,
+                                             std::span<std::byte> download) -> GfxError;
 
     struct Impl;
     Impl* impl_ = nullptr;

@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 #include "core/containers/array.h"
 #include "core/ids/handle.h"
 
+#include "graphics/device/gpu_timestamps.h"
 #include "graphics/handle.h"
 #include "graphics/pipeline/pipeline_state.h"
 #include "graphics/types.h"
@@ -33,6 +35,7 @@ enum class CommandKind : std::uint8_t {
     Dispatch,
     BeginRenderPass,
     EndRenderPass,
+    WriteTimestamp,
 };
 
 enum class BarrierResourceType : std::uint8_t { Buffer, Texture };
@@ -63,6 +66,12 @@ struct Command {
     ResourceState after{};
     Extent viewport;
     Extent scissor;
+    // Rectangle origins in attachment pixels, counted from the attachment's
+    // first stored row (GL window coordinates; top-left everywhere else).
+    std::uint32_t viewportX = 0;
+    std::uint32_t viewportY = 0;
+    std::uint32_t scissorX = 0;
+    std::uint32_t scissorY = 0;
     std::uint32_t vertexCount = 0;
     std::uint32_t instanceCount = 1;
     std::uint32_t indexCount = 0;
@@ -70,6 +79,7 @@ struct Command {
     std::uint32_t groupCountX = 0;
     std::uint32_t groupCountY = 0;
     std::uint32_t groupCountZ = 0;
+    std::uint32_t timestampIndex = 0; // WriteTimestamp, < kMaxGpuTimestamps
 
     // Inline resource storage — zero heap allocation for ≤8 resources.
     static constexpr std::uint8_t kInlineCapacity = 8;
@@ -80,7 +90,11 @@ struct Command {
 class CommandBuffer {
 public:
     // Recording lifecycle.
-    void begin() { recording_ = true; commands_.clear(); }
+    void begin() {
+        recording_ = true;
+        commands_.clear();
+        asyncComputeWait_ = kNoAsyncComputeWait;
+    }
     void end() { recording_ = false; }
 
     [[nodiscard]] auto isRecording() const -> bool { return recording_; }
@@ -100,8 +114,12 @@ public:
     void bindResource(std::uint32_t slot, std::uint32_t handleIndex, std::uint32_t handleGeneration);
     void bufferBarrier(BufferHandle buffer, ResourceState before, ResourceState after);
     void textureBarrier(TextureHandle texture, ResourceState before, ResourceState after);
-    void setViewport(Extent viewport);
-    void setScissor(Extent scissor);
+    // (x, y) offsets the rectangle inside the attachment, in pixels from the
+    // attachment's first stored row/column. Every backend passes it straight
+    // through, so a sub-rectangle covers the same stored texels everywhere
+    // (NDC +Y still points to the higher row on OpenGL, the lower elsewhere).
+    void setViewport(Extent viewport, std::uint32_t x = 0, std::uint32_t y = 0);
+    void setScissor(Extent scissor, std::uint32_t x = 0, std::uint32_t y = 0);
     void draw(std::uint32_t vertexCount, std::uint32_t instanceCount = 1);
     void drawIndexed(std::uint32_t indexCount, std::uint32_t instanceCount = 1,
                      std::uint32_t firstIndex = 0);
@@ -109,6 +127,22 @@ public:
                   std::uint32_t groupCountZ = 1);
     void beginRenderPass(FramebufferHandle framebuffer);
     void endRenderPass();
+    // GPU timestamp `index` (< kMaxGpuTimestamps), outside render passes. See
+    // graphics/device/gpu_timestamps.h; devices without timer queries ignore it.
+    void writeTimestamp(std::uint32_t index);
+    // Highest timestamp index + 1 and a bit mask of written indices (0/0 when
+    // the buffer writes none). Backends use it to size the query set.
+    void timestampUsage(std::uint32_t& count, std::uint32_t& written) const;
+    // Async compute (IDevice::submitAsyncCompute): commands recorded after
+    // this point wait until the compute work submitted ahead of this buffer
+    // has finished; the commands before it may run alongside that work.
+    // Outside render passes; the first call wins. Devices without an async
+    // compute queue ignore it (their compute work ran inline, in order).
+    void waitAsyncCompute();
+    static constexpr std::size_t kNoAsyncComputeWait = static_cast<std::size_t>(-1);
+    // Index of the first command after waitAsyncCompute(), or
+    // kNoAsyncComputeWait (the wait then applies to the whole buffer).
+    [[nodiscard]] auto asyncComputeWaitIndex() const -> std::size_t { return asyncComputeWait_; }
 
     // Test/observability surface — a recorded command log (NullDevice submits
     // a validated replay of this).
@@ -120,6 +154,7 @@ private:
 
     bool recording_ = false;
     Array<Command> commands_;
+    std::size_t asyncComputeWait_ = kNoAsyncComputeWait;
 };
 
 } // namespace f4::gfx

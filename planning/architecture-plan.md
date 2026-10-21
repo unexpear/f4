@@ -191,8 +191,8 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M8 Renderer + render graph v1 | ✅ Complete | `Renderer::render()` executes through the graph and graph lifetimes/rollback are covered. The constant ring grows geometrically instead of silently stopping at 64 slots; direct 130-slot and 65-object renderer regressions verify the former boundary. Cross-backend parity remains an M9/M10 acceptance item rather than an M8 requirement. |
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
-| M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. |
-| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
+| M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. Clustered forward point lights (hundreds to thousands per frame) now shade on OpenGL/Vulkan/DX12/WebGPU with GL/VK/DX image parity; Metal point lights are written but unverified. |
+| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, and graph scheduling remain open. Async compute exists for light binning on Vulkan/DX12 (off by default: no measured gain). |
 | M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
@@ -551,6 +551,475 @@ Completed delivery and acceptance gates:
 - ✅ Renderer-generated normal/UV/color fallback streams make position-only
   meshes valid on every backend without depending on API-specific missing-input
   behavior. Single-sided front faces remain visible in all three native paths.
+- ✅ Clustered forward point lights (2026-10-20, branch `lights/point-lights`).
+  `engine::PointLight` (world or `WorldMatrix`-local position, color, intensity,
+  range) is no longer a stub. Each frame the CPU bins visible lights into a
+  16x9-tile, 24-slice logarithmic froxel grid
+  (`engine/lighting/clustered_lights.*`). Binning is conservative: a
+  brute-force test over 600 lights and 40,000 samples finds no light missing
+  from its cluster. Lights, cluster ranges, and indices pack into one read-only
+  `u32` storage buffer (16-word header, 8-word light records, 2-word cluster
+  records, 1-word indices; the index list is capped at 2^20 and overflow is
+  counted in `FrameStats`). The PBR fragment shader on every backend looks up
+  its cluster from `viewProj * worldPos` and adds GGX point lighting with a
+  smooth range window `(1-(d/r)^4)^2 / (d^2+1)`. Directional light, shadow, IBL,
+  emissive, and tone mapping are unchanged. Point-light shadows and HDR bloom
+  were added afterwards (see below).
+  The storage buffer uses RHI slot 7: GL SSBO binding 7, Vulkan/WebGPU flat
+  binding 31, and DX12 `t7` (SRVs share `t` registers with textures 0-6). Metal
+  uses slot 1 (`[[buffer(17)]]`) because it exposes only seven buffer slots.
+  The buffer is a triple-buffered `DynamicBufferRing` with the new
+  `BufferUsage::HostWrite`. On DX12, HostWrite storage writes go to an
+  upload-heap twin and are copied at the start of the next submit instead of
+  through a blocking `executeImmediate` per write. On OpenGL, HostWrite buffers
+  are orphaned like uniforms.
+- ✅ Evidence. `tests/engine/test_point_lights.cpp` covers:
+  - CPU binning: empty header, culling, near-plane-crossing lights,
+    conservativeness, and the index cap.
+  - A NullDevice renderer run with 324 lights.
+  - A 256-light night scene on a dark ground at 160x96, rendered on OpenGL,
+    Vulkan, and DX12. GL/VK and GL/DX agree with 0 mismatching pixels (max
+    channel delta 1).
+  - Lights placed out of reach produce an image byte-identical to the lights-off
+    frame, and validation reports zero warnings or errors.
+
+  The Chromium WebGPU smoke binds the same buffer in its standalone PBR pipeline
+  and requires a red point light to add red light through the engine renderer.
+  `demo_bench` scene 20 ("Night Lights") shows 64-4096 animated colored lights.
+- ✅ Frame time (`F4_POINT_LIGHT_BENCH=1`, 1280x720, RTX 3070 Ti Laptop on
+  every backend after the adapter-selection fix below), 1,024 / 4,096 lights:
+  - Range scaled to spacing: Vulkan 0.76 / 1.8 ms, OpenGL 1.0 / 2.2 ms,
+    DX12 1.4 / 2.3 ms.
+  - Fixed 2.5 m stress range: Vulkan 1.1 / 4.5 ms, OpenGL 1.3 / 5.2 ms,
+    DX12 1.6 / 5.3 ms.
+  - Before the fix, OpenGL and DX12 ran on the Intel Iris Xe iGPU (scaled
+    4.2 / 8.2 ms and 8.0 / 17.4 ms; stress 4,096 lights at 27.5 and 67 ms).
+- ✅ HDR bloom (2026-10-20, branch `lights/point-lights`). With
+  `PbrRenderSettings::bloomEnabled` the PBR pass writes exposed linear HDR to an
+  RGBA16F target instead of tonemapped sRGB. A threshold/soft-knee prefilter
+  (`bloomThreshold` 1.0, `bloomKnee` 0.5) feeds a 13-tap downsample chain of
+  `bloomLevels` half-resolution mips (default 5) and a tent-filter upsample
+  chain. The composite adds `bloomIntensity` (default 0.6) times the glow, then
+  applies ACES and sRGB encoding exactly as the non-bloom path does. The post
+  shaders (`post_bloom_*`) derive UVs from `fragCoord / targetSize` so every
+  backend samples the same texels. `Renderer::render(fb, camera, aspect, extent)`
+  needs the output extent when bloom is on. Bloom is off by default, so all
+  existing goldens are unchanged. Intensity 0 matches bloom-off within 1 level
+  on GL, Vulkan, and DX12.
+- ✅ Point-light shadows (same branch). `PointLight::castShadows` flags a light.
+  Each frame, up to `pointShadowBudget` (0-16, default 8) flagged lights whose
+  range reaches the view are kept, preferring the brightest and nearest.
+  Each kept light gets six 256-texel tiles in an R16F cube-face atlas (plus
+  D32F depth) that store `distance / range`. Casters are culled against the
+  light sphere and each face frustum, then drawn instanced (the model matrix
+  goes through vertex attributes 9-12 from a `DynamicBufferRing`) once per face.
+  Each draw uses the new viewport/scissor origin in the RHI to target its tile.
+  Clustered light records carry the shadow slot in words 10-14. The PBR fragment
+  shaders pick the cube face, do a 3x3 PCF lookup in the atlas (VK/WebGPU
+  binding 33/34, GL unit 8, DX12 `t8/s8`, Metal texture/sampler 7), and apply a
+  bias of 0.02 x range. With no flagged lights the atlas pass is skipped. The
+  sun shadow is untouched.
+- ✅ RHI: `CommandBuffer::setViewport/setScissor` take an `(x, y)` origin in
+  attachment pixels. OpenGL, Vulkan (flipped-height viewport), DX12, WebGPU, and
+  Metal (unverified) all pass it through.
+- ✅ Evidence (`tests/engine/test_point_lights.cpp`, 461/461 `f4_tests` in
+  release and debug):
+  - NullDevice tests cover face selection and matrices, atlas tiles, budget
+    ordering, slot words, and the bloom mip chain.
+  - A GPU night scene runs on GL, Vulkan, and DX12. Shadows darken 220 pixels
+    and brighten none. Bloom at intensity 1.0 / threshold 0.6 lights 15,318
+    more pixels, raising mean luma from 98.6 to 125.7.
+  - Parity: GL/VK and GL/DX have 0 mismatching pixels for shadows (max delta
+    1), bloom (0), and shadows+bloom (0). Validation is clean in debug.
+  - WebGPU: the Chromium smoke renders an occluder in front of a point light and
+    bloom at intensity 0 and 1.5. It compares both frames against locked
+    fixtures (`tests/fixtures/renderer_{point_shadow,bloom}_reference.rgba`)
+    that a native test renders from the same scene. Max delta is 1 against a
+    tolerance of 2; native GL/VK/DX12 match the fixtures exactly. Regenerate
+    the fixtures with `F4_UPDATE_EFFECT_FIXTURES=1`.
+  - `demo_bench` scene 20 enables both. Keys: B toggles bloom, -/= change
+    intensity, ;/' change threshold, K toggles point shadows, and ,/. change
+    the shadow budget. Pillars cast the shadows.
+- ✅ Frame cost at 1280x720 with 1,024 lights on the RTX 3070 Ti Laptop GPU.
+  Ranges are over two runs:
+
+  | Backend | base | +bloom (10 passes) | +32x32 pillars | 4 / 8 / 16 shadowed | 8 shadowed + bloom |
+  |---|---|---|---|---|---|
+  | Vulkan | 0.83-1.13 | 0.87-0.96 | 1.22-1.24 | 1.8-2.5 / 1.4-1.7 / 2.0 | 2.2-2.7 |
+  | OpenGL | 1.06-1.18 | 1.06-1.13 | 1.38-1.40 | 2.0 / 1.8 / 2.2-2.3 | 2.4-2.8 |
+  | DX12 | 1.26-1.50 | 1.31-1.32 | 1.50-1.58 | 2.0 / 1.8-1.9 / 2.5-2.6 | 2.2-2.3 |
+
+  All times are ms/frame. Bloom is within noise at 720p. Point shadows add
+  about 0.4-1.0 ms on top of the pillar scene for 8-16 lights (6 instanced
+  draws per light). The 4-light case runs first and absorbs the atlas and
+  pipeline warm-up. Before instancing, the per-entity, per-face draws exhausted
+  the device buffer arena (crash at 16 lights x 1,024 pillars).
+- ✅ Static point-shadow caching (2026-10-20, commits f0bf4ec, f59be27,
+  0fb4662). `PbrRenderSettings::pointShadowCaching` (default on) keeps a
+  shadowed light's six atlas tiles from the previous frame when nothing they
+  depend on changed.
+  - Slots are stable. `assignStablePointShadowSlots` keeps a surviving light
+    in its old slot and gives freed slots to new lights, so a light entering or
+    leaving the budget does not move the others.
+  - Dirty tracking uses content signatures instead of ECS dirty flags, because
+    `TransformDirty` is consumed before rendering and tests write `WorldMatrix`
+    directly. Each slot hashes the light's position, range, and tile, plus every
+    caster inside its sphere (entity, mesh, submesh, material, world matrix, and
+    alpha inputs). A light is redrawn when its signature changes or the slot is
+    new, and the whole atlas is cleared when the atlas is (re)created.
+  - Partial redraw loads the atlas and resets only the dirty tiles with a
+    full-tile triangle from a `tileReset` pipeline variant (depth compare
+    Always, no depth test or write, still bound to the D32F attachment). It
+    writes exactly what the clear writes, so the result is bit-identical. A
+    zero-work "point-shadow-atlas-keep" graph pass declares the atlas as last
+    frame's fragment-shader read, so the Vulkan barrier into the load pass
+    orders after those reads and requests `ColorRead` for the load op.
+  - `FrameStats::pointShadowLightsRedrawn` reports the redraw count. With
+    nothing moving it is 0 on every frame after the first.
+  - Evidence: NullDevice tests cover slot stability and reuse. A GPU test on
+    GL, Vulkan, and DX12 renders an 8-step sequence with caching on and
+    off: first frame, static, one caster moved, static, one light moved, camera
+    moved (the shadow selection changes), static, and every caster moved. Every frame is pixel-identical (tolerance 0) and
+    Vulkan/DX12 validation is clean in debug.
+  - Savings (`F4_POINT_LIGHT_BENCH=cache`: 1,024 lights, 1,024 pillars, static
+    scene, 7 interleaved rounds, min ms/frame, cached / uncached):
+
+    | Backend | 4 shadowed | 8 shadowed | 16 shadowed |
+    |---|---|---|---|
+    | OpenGL | 1.39 / 1.46 | 1.54 / 1.71 | 1.68 / 1.94 |
+    | Vulkan | 1.34 / 1.44 | 1.37 / 1.59 | 1.38 / 1.68 |
+    | DX12 | 1.81 / 1.91 | 1.83 / 2.07 | 1.92 / 2.05 |
+
+    With nothing dirty the atlas pass is skipped, so cached cost grows more
+    slowly with the shadowed-light count (flat on Vulkan); uncached grows by about 0.01-0.04 ms per light. A later rerun on a busier
+    machine (other apps using the CPU, everything ~1 ms slower) kept cached
+    ahead in 7 of 9 mins, but medians were within noise.
+- ✅ GPU light binning (2026-10-20, commits b66144a, 4316e62, d6e8949,
+  850ba8e, ea6fc66; rewritten in a5cce4e and 90d65af).
+  `PbrRenderSettings::gpuLightBinning` (default on, every backend) builds the
+  per-cluster light lists in a compute pass on OpenGL 4.3+, Vulkan, DX12, and
+  WebGPU. CPU binning stays as the fallback and the reference.
+  - CPU side (`buildClusteredLightBinningInput`): cull and write light records
+    with the same helpers as the CPU path (`gatherLightRanges`,
+    `writeLightRecords`). Per-cluster counts come from a 3D difference array
+    over the light boxes (+/-1 at 8 corners, then prefix sums along x, y, z),
+    which is O(lights + clusters) instead of visiting every cluster of every
+    box. The counts are capped to the 2^20 index budget in cluster order, so
+    the cluster records (list offset, count) and
+    `FrameStats::maxPointLightsPerCluster` are exact and uploaded with the
+    prefix. The CPU also uploads per-axis light masks, one bit per visible
+    light for each of the 16 tile columns, 9 tile rows, and 24 depth slices its
+    box covers. That is 49 x ceil(visible/32) words, or 25 KB at 4,096 lights.
+  - GPU side: one dispatch of max(clusters, ceil(prefixWords/64)) 64-lane
+    workgroups. Each workgroup copies 64 prefix words. Workgroup c ANDs cluster
+    c's column, row, and slice masks one word per lane, takes a workgroup prefix
+    sum of the popcounts to get each lane's write position, and writes the set
+    bits lowest first. Lists stay in ascending light order without atomics, so
+    the buffer matches the CPU path word for word.
+  - Shaders: `light_binning.comp` (GL, and Vulkan via `-DF4_VULKAN=1`),
+    `light_binning_dx12.hlsl` (cs_6_0), and `light_binning_webgpu.wgsl`. The
+    WGSL keeps its barriers in uniform control flow, with no early exit on
+    per-cluster counts. WebGPU `BeginRenderPass` ends an open compute pass.
+  - Fallbacks: Null, Metal (no shader yet), callers that use `record()`
+    directly, frames with no visible lights, grids or prefixes that would need
+    more than 65,535 workgroups, and pipeline failures all use CPU binning.
+    `FrameStats::pointLightBinningDispatches` is 1 on the GPU path and 0 on the
+    CPU path.
+  - Vulkan storage buffers that are neither HostWrite nor vertex/index/uniform
+    are DEVICE_LOCAL (with a host-visible fallback). `writeBuffer`/`readBuffer`
+    on them go through a staging copy.
+  - Evidence:
+    - A NullDevice emulation of the kernel reproduces the CPU buffer word for
+      word, including `maxLightsPerCluster`, with and without an index cap.
+    - A GPU test on GL, Vulkan, and DX12 compares CPU and GPU binning for 1,024
+      lights, 1,024 lights with an index cap of 20,000, and shadowed lights. It
+      finds 0 differing pixels (tolerance 0) and 0 differing buffer words,
+      equal max-per-cluster, and the same image with GPU timers on.
+    - Cross-backend parity stays within max delta 1.
+    - The Chromium WebGPU smoke requires the single dispatch and still matches
+      the point-light and point-shadow fixtures (max delta 1).
+- ✅ GPU timers (2026-10-20, commit e632531). `CommandBuffer::writeTimestamp(i)`
+  (outside render passes, up to 32 per submit) is backed by:
+  - GL `glQueryCounter(GL_TIMESTAMP)`
+  - Vulkan `vkCmdWriteTimestamp2` on a query pool reset inside the command
+    buffer, read only after the submission's fence signals
+  - DX12 `EndQuery` + `ResolveQueryData` into a readback buffer, read after the
+    fence
+
+  Each timestamped submit takes one of 4 query sets in a ring
+  (`graphics/device/gpu_timestamps.h`). `IDevice::latestGpuTimestamps()` never
+  waits; it returns the newest finished set, usually 1-2 frames old.
+  `RenderGraph::setGpuTimestamps` writes a timestamp before each pass and one
+  after the last. `PbrRenderSettings::gpuTimers` (off by default) fills
+  `FrameStats::gpuPasses[]` (name, ms), `gpuFrameMs`, `gpuLightBinningMs`,
+  `gpuMainPassMs`, and `gpuTimingLag`. Metal validates and ignores the
+  command. WebGPU support came later (next item).
+- ✅ WebGPU GPU timers (2026-10-20, commits 21ba949, 25bb9d2, 2156f8c).
+  - The device requests the optional `timestamp-query` feature when the
+    adapter offers it. WebGPU only writes timestamps at pass boundaries
+    (`timestampWrites`), so each RHI timestamp goes on the end of the pass
+    just before it, which is when that work finished. With no pass before
+    it, it goes on the start of the next pass. With no pass at all, it goes
+    on an empty compute pass.
+  - A timestamp also ends the open compute pass, so graph passes stay
+    separate native passes. Only when timers are on; otherwise encoding is
+    unchanged.
+  - One query set holds 4 ring sets of 64 queries: 32 RHI indices plus 32
+    scratch indices for pass ends that no RHI timestamp maps to.
+  - Each timed submit resolves its set into a resolve buffer and copies it
+    to that set's MapRead buffer. It then calls `mapAsync` in
+    `AllowProcessEvents` mode. `latestGpuTimestamps()` calls
+    `wgpuInstanceProcessEvents` and reads whichever sets have mapped, so it
+    never waits; results are 1-2 frames old. Values are already nanoseconds.
+  - If a set's map is still in flight when its turn comes again, that
+    submit goes untimed but still takes a serial.
+  - Without the feature, timers report unavailable: the new
+    `FrameStats::gpuTimersAvailable` is false, `gpuTimingValid` stays false,
+    and every GPU ms field is 0. The device logs this once, to the browser
+    console rather than stderr. The renderer also clears its cached timing
+    whenever timers are off or unsupported, so a stale timing never shows.
+  - The Chromium smoke turns timers on for the point-light frame. The image
+    must be byte-identical. If the adapter has `timestamp-query`, the
+    binning and main passes must come back timed: above 0, below the frame
+    time, frame under 50 ms, lag at least 1, passes summing to the frame.
+    Otherwise the result must say "unavailable". The harness adds only
+    `--enable-webgpu-developer-features`, which turns off Chrome's 100 us
+    timestamp quantization.
+  - Verified with real timestamps:
+    - Intel Iris Xe (the headless default): binning 0.092 ms, main 0.058 ms
+    - RTX 3070 Ti: binning 0.015 ms, main 0.011 ms
+    - Fallback: a temporary local build with the feature disabled reported
+      "unavailable" with no browser errors.
+- ✅ WebGPU point-light bench (`F4_WEBGPU_BENCH=<rounds>` with the smoke
+  harness, which opens the page as `?bench=<rounds>` and adds
+  `--force_high_performance_gpu`; without that flag Edge hands WebGPU the
+  Intel iGPU).
+  - Same night scene as the native bench: 1280x720, release wasm, CPU and GPU
+    binning alternating, frame time = 120 frames ending in `waitIdle`.
+  - GPU pass times come from one timed run per variant that drains every
+    third frame.
+  - RTX 3070 Ti, 9 rounds:
+
+  | Scene | CPU / GPU binning frame ms | render() CPU ms | binning pass | main pass (CPU / GPU binning) |
+  |---|---|---|---|---|
+  | stress 1,024 | 1.66 / 1.13 | 1.64 / 0.50 | 0.046 | 0.84 / 0.92 |
+  | stress 4,096 | 6.17 / 6.47 | 5.69 / 2.87 | 0.088 | 4.95 / 5.88 |
+  | scaled 1,024 | 1.20 / 0.89 | 1.18 / 0.50 | 0.045 | 0.57 / 0.59 |
+  | scaled 4,096 | 2.28 / 1.71 | 2.25 / 1.69 | 0.045 | 1.07 / 1.15 |
+
+  GPU binning wins 3 of 4 scenes by 25-32%. With CPU binning, WebGPU frames
+  are mostly CPU-bound: `render()` takes 1.2-5.7 ms of CPU time, against
+  0.5-2.9 ms with GPU binning. Stress 4,096 is within noise: +5% in this
+  run, but -11%, -3%, and -3% in three earlier runs. In all three timed runs that measured both variants, though, its
+  main pass read about 1 ms slower after GPU binning (4.9 to 5.9 ms). That
+  turned out to be clock drift between separate runs, not GPU binning: see
+  the overlap item below.
+- ✅ Where the binning time went, measured with the timers
+  (`F4_POINT_LIGHT_BENCH=binning`). The old 3-dispatch kernel cost 0.22-0.42
+  ms of GPU time at 1,024 lights and 0.72-1.62 ms at 4,096. Each of the 3,456
+  cluster threads (only 54 workgroups) tested every visible light twice (count
+  and fill), and one workgroup did the scan. The main pass took the same time
+  with either binning path, and no CPU stall showed up. Vulkan/DX12 `render()`
+  time tracks frame time only because `submit` waits on the 2-deep frame
+  fence. So the pass itself was the whole loss in GPU-bound frames. Some
+  scenes are CPU-bound: DX12 at 1,024 lights (GPU frame 0.6-1.2 ms against
+  1.4-1.6 ms wall), and Vulkan and OpenGL with 4,096 scaled lights (GPU frame
+  1.3 ms against 1.7-2.2 ms wall). There, CPU binning time removed from the
+  frame shows up directly.
+- ✅ Before/after, 1280x720, RTX 3070 Ti Laptop, ms/frame, CPU binning / GPU
+  binning frame time (median of interleaved rounds) and the GPU binning pass
+  (timed run). Before: commit e632531, 5 rounds. After: commit 90d65af, 9
+  rounds. The laptop warmed up during the session, and CPU-binning stress-4,096
+  frames drifted from about 6.5 to 7.3-9.1 ms. Compare CPU and GPU within one
+  run, not across runs.
+
+  | Backend | Scene | Before CPU / GPU | Before pass | After CPU / GPU | After pass |
+  |---|---|---|---|---|---|
+  | OpenGL | stress 1,024 | 1.20 / 1.28 | 0.220 | 1.42 / 1.36 | 0.035 |
+  | OpenGL | stress 4,096 | 6.50 / 7.23 | 1.009 | 8.03 / 8.12 | 0.147 |
+  | OpenGL | scaled 1,024 | 1.04 / 1.15 | 0.262 | 1.22 / 1.06 | 0.042 |
+  | OpenGL | scaled 4,096 | 2.24 / 2.06 | 0.722 | 2.28 / 1.85 | 0.039 |
+  | Vulkan | stress 1,024 | 1.47 / 1.78 | 0.410 | 1.32 / 1.29 | 0.047 |
+  | Vulkan | stress 4,096 | 6.34 / 6.84 | 1.615 | 7.31 / 7.84 | 0.171 |
+  | Vulkan | scaled 1,024 | 0.86 / 1.19 | 0.424 | 0.96 / 0.89 | 0.045 |
+  | Vulkan | scaled 4,096 | 1.74 / 2.34 | 1.146 | 2.03 / 1.61 | 0.050 |
+  | DX12 | stress 1,024 | 1.56 / 1.56 | 0.324 | 1.95 / 1.32 | 0.040 |
+  | DX12 | stress 4,096 | 6.79 / 6.92 | 1.099 | 9.10 / 9.48 | 0.145 |
+  | DX12 | scaled 1,024 | 1.43 / 1.10 | 0.288 | 1.53 / 0.95 | 0.035 |
+  | DX12 | scaled 4,096 | 2.38 / 2.13 | 0.813 | 2.47 / 2.04 | 0.038 |
+
+  The pass is 6-23x cheaper (0.035-0.05 ms except the stress-4,096 scene).
+  GPU binning is now faster in 9 of 12 rows. With OpenGL, `render()` CPU
+  time also drops from 1.18-5.65 to 0.51-1.76 ms. The exception is the
+  stress-4,096 scene, which is GPU-bound (main pass 7-9 ms) and close to the
+  2^20 index cap. There GPU binning adds its 0.15-0.17 ms of index writes to
+  the frame, and the medians are within run-to-run noise. In this run they
+  were +1% GL, +7% VK, and +4% DX12. In the previous run (90d65af, 5 rounds)
+  they were -1% GL, -6% VK, and -1% DX12. GPU binning stays the default on
+  every backend because no backend is slower in every scene.
+- ✅ Light-binning overlap / async compute (2026-10-20, commits 22e8609,
+  07b774c, b423cf9, 3c0b481, 07dfe71, e0bc723 and the defaults commit).
+  `PbrRenderSettings::lightBinningOverlap` (off by default, see below).
+  - RHI: `IDevice::supportsAsyncCompute()` / `submitAsyncCompute()`,
+    `CommandBuffer::waitAsyncCompute()` (marks where the graphics work must
+    wait), and `PassDesc::asyncCompute`. The render graph records async
+    passes into a second command buffer, submits it first, and falls back to
+    recording them inline when the device has no async queue.
+  - With overlap on, the binning pass only dispatches; a
+    "light-binning-wait" pass right before the main pass waits and holds the
+    compute-write -> fragment-read barrier, so the shadow and point-shadow
+    atlas passes need not wait for binning.
+  - Vulkan: the first queue family with COMPUTE and not GRAPHICS (family 2
+    on the RTX). Buffers are created `VK_SHARING_MODE_CONCURRENT` over the
+    graphics and compute families when that queue exists, so no ownership
+    transfers are needed. The compute command buffer signals a per-frame
+    semaphore; the graphics work is split at the wait point into two
+    submits, and the second waits on it. Clean under the validation layer
+    with synchronization validation on.
+  - DX12: a COMPUTE command queue with its own allocator and descriptor
+    heaps per frame slot. The graphics list is split at the wait point and
+    `ID3D12CommandQueue::Wait` on the compute fence sits between the two.
+    Buffers bound by the compute list start and end in COMMON (they decay
+    there between ExecuteCommandLists). Clean under the debug layer.
+  - OpenGL / WebGPU: no async queue; the dispatch stays first on the one
+    queue and only the barrier moves. Dawn inserts its own barrier anyway.
+  - `F4_NO_ASYNC_COMPUTE=1` forces the single-queue path on Vulkan/DX12.
+  - Parity: a 4,096-light scene joined the GPU-binning parity test, and every
+    scene also renders with overlap on: identical image and light buffer, the
+    async queue used exactly when the device has one. VK and DX12 match
+    exactly at 4,096 lights. GL differs from them by 41 fill-rule tie pixels
+    there (see the item below). Since then, that comparison is asserted.
+  - Bench (`F4_POINT_LIGHT_BENCH=overlap`): one renderer, CPU / GPU /
+    GPU+overlap alternating in blocks of 30 frames (6 settle frames, drained
+    with `waitIdle` before and after each block), median of 21 blocks. This
+    replaced separate runs per variant, whose results drifted with the
+    laptop's clocks (it throttles at ~89 C). RTX 3070 Ti Laptop, 1280x720,
+    ms/frame, overlap vs GPU binning:
+
+  | Backend | stress 1,024 | stress 4,096 | scaled 1,024 | scaled 4,096 | stress 4,096 + pillars + 8 shadowed |
+  |---|---|---|---|---|---|
+  | Vulkan | 0.98 / 1.07 (+9%) | 5.76 / 5.82 (+1%) | 0.86 / 0.86 (0%) | 1.56 / 1.63 (+5%) | 15.72 / 15.66 (-0.4%) |
+  | DX12 run 1 | 1.36 / 1.39 (+2%) | 7.50 / 6.58 (-12%) | 1.00 / 1.13 (+13%) | 2.05 / 2.08 (+2%) | 17.47 / 16.86 (-3.5%) |
+  | DX12 run 2 | 0.91 / 0.98 (+7%) | 5.64 / 5.65 (+0.2%) | 0.88 / 0.96 (+9%) | 1.81 / 1.87 (+4%) | 13.90 / 13.84 (-0.4%) |
+  | OpenGL | 1.71 / 1.72 (+1%) | 8.79 / 8.71 (-1%) | 1.10 / 1.10 (0%) | 2.20 / 2.15 (-2%) | 20.38 / 20.17 (-1%) |
+
+  An earlier 15-block run without the drain (GL then only timed command
+  submission) gave Vulkan +21% / +2% / +11% / +5% / -1% and DX12 +1% / -0.2%
+  / +16% / +2% / +1% in the same column order.
+  - Result: no real gain on any backend. The binning pass is only 0.05-0.17
+    ms, so that is the most overlap could hide, and the stress scenes have no
+    shadow passes to overlap with. In light scenes the extra submit plus the
+    cross-queue wait costs 0.05-0.15 ms on Vulkan and DX12. The shadowed
+    4,096 scene is the only consistent (small) gain, -0.4% to -3.5%, within
+    noise. DX12 stress 4,096's -12% in run 1 did not repeat (+0.2% in run
+    2). **`lightBinningOverlap` therefore defaults to off on every backend**;
+    the code path stays for scenes with long shadow/atlas work.
+  - WebGPU main-pass slowdown: not real. The WebGPU bench now runs the GPU
+    timers as the same in-renderer A/B (median of 11 blocks), and the
+    stress-4,096 main pass is 6.665 ms with CPU binning, 6.671 ms with GPU
+    binning, 6.664 ms with GPU binning + overlap order. The GPU and CPU light
+    buffers were also compared word for word on WebGPU (0 differences of
+    849,324 index words at 4,096 lights). The earlier 4.9 -> 5.9 ms came from
+    separate timed runs per variant on a GPU whose clock drifts with
+    temperature (735-915 MHz while throttling) and was shared with other GPU
+    apps. In the A/B the light scenes still show a 0.02-0.08 ms main-pass
+    difference (stress 1,024 1.09 / 1.14, scaled 4,096 1.34 / 1.41), small
+    enough to be the same effect.
+
+  WebGPU (Chromium, release wasm, 5 rounds frame time, A/B GPU timers):
+
+  | Scene | CPU / GPU / GPU+overlap frame ms | GPU frame (timers) | binning pass | main pass |
+  |---|---|---|---|---|
+  | stress 1,024 | 1.91 / 1.52 / 1.48 | 1.09 / 1.20 / 1.26 | 0.057 | 1.09 / 1.14 / 1.19 |
+  | stress 4,096 | 7.73 / 7.42 / 7.55 | 6.67 / 6.77 / 6.78 | 0.102 | 6.67 / 6.67 / 6.66 |
+  | scaled 1,024 | 1.37 / 1.07 / 0.99 | 0.67 / 0.76 / 0.78 | 0.053 | 0.67 / 0.71 / 0.69 |
+  | scaled 4,096 | 2.44 / 1.85 / 1.85 | 1.34 / 1.47 / 1.53 | 0.056 | 1.34 / 1.41 / 1.47 |
+- ✅ OpenGL vs Vulkan/DX12 in the 4,096-light parity scene (2026-10-20).
+  The 41 differing pixels (max delta 48) are all in image row 44, one per
+  visible lamp cube of light-grid row 31 (z = -0.22). The bottom-back edge of
+  those cubes (y = 0.54, z = -0.16, view depth 12.9) projects to row 44.4986,
+  0.0014 px from the pixel centre and inside the 1/256 px subpixel snap, so
+  it lies exactly on the centres: a fill-rule tie. Vulkan and DX12 (top-left
+  rule) leave those pixels to the ground; OpenGL gives them to the cube.
+  - Cause: f4 runs OpenGL with `glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)`,
+    so OpenGL stores images bottom-up while Vulkan (negative viewport height)
+    and DX12 store them top-down. The tie rule follows the storage order, so
+    a horizontal edge exactly through pixel centres is owned by the opposite
+    side. GL leaves the tie rule to the implementation, and ARB_clip_control
+    issue 9 says the origin choice can change it.
+  - Evidence: Vulkan and DX12 agree exactly. CPU and GPU binning give the
+    same 41 pixels. The tie pixels are lamp-cube coverage, not lighting.
+    Re-rendering the scene on OpenGL with `GL_UPPER_LEFT` (the Vulkan/DX12
+    storage order) gives 0 mismatching pixels, max delta 0, against Vulkan.
+  - Ruled out:
+    - Depth convention: all backends use `perspectiveRH_ZO` with ZERO_TO_ONE.
+    - Cluster lookup: tiles come from the interpolated clip position, not
+      `gl_FragCoord`. The tie point sits at slice 18.2 and tile row 4.8, far
+      from any boundary.
+    - Index cap and truncation: 0 references are dropped.
+    - Precision and range-window edges: the shading of covered pixels matches.
+  - New test, "Rasterization: edges exactly on pixel centres (fill-rule
+    ties)". It uses a camera-facing cube on a 16x16 target whose edges land
+    exactly on rows and columns 4.5 and 11.5:
+    - Vulkan and DX12 cover rows 4-10. OpenGL covers rows 5-11, and rows
+      4-10 with `GL_UPPER_LEFT`.
+    - Columns agree (4-10).
+    - Nudged by 1/16 px, every backend covers rows 5-11.
+    - The test asserts Vulkan == DX12, upper-left OpenGL == Vulkan, and
+      default OpenGL == Vulkan off the tie.
+  - The 4,096-light comparison is now asserted. Vulkan == DX12 within the usual
+    tolerance. Upper-left OpenGL == Vulkan within that tolerance (0
+    mismatches). Default OpenGL may differ only in tie pixels: at most 64, one
+    per lamp cube in the row; 41 here.
+  - Not changed: the OpenGL backend keeps the lower-left origin. Switching
+    it to upper-left would make ties resolve like Vulkan/DX12 everywhere.
+    But it would also flip the GL shadow and atlas UVs, the viewport and
+    scissor y, window presentation (or need a flip at present), the bloom
+    composite to the window, and every GL readback. That is a
+    backend-wide convention change for its own PR.
+- Still open:
+  - Metal has every shader and binding written but was not compiled or run
+    (no Apple hardware). It bins on the CPU and has no timer queries.
+  - WebGPU timers need frame pacing. The renderer keeps 8 timed frames, so
+    if the GPU falls more than about 8 submits behind (an unthrottled loop
+    that never presents), results stop matching their frames. rAF-paced
+    apps and the bench stay within 3.
+  - In GPU-bound scenes near the index cap, the binning pass's index writes
+    (0.15 ms) are still not hidden: async compute / overlap is implemented
+    but measured no real gain, so it is off by default. Larger shadow/atlas
+    work (many uncached shadowed lights) is where it could pay off; the
+    shadowed 4,096 bench gained 0.4-3.5%, within noise.
+  - OpenGL resolves fill-rule ties (edges exactly through pixel centres)
+    on the other side from Vulkan/DX12 because it stores images bottom-up
+    (see the item below). A GL_UPPER_LEFT origin would remove this, but it is
+    a backend-wide change.
+  - Bloom has no lens dirt or anamorphic options.
+  - The 1,024-per-type object stores crash on overflow instead of returning
+    an error, so two renderers cannot share one GL device.
+- ✅ Adapter selection (2026-10-20). Every backend now picks the strongest
+  GPU by default, using one ranking in `graphics/gpu_selection.*`: discrete,
+  then integrated, then virtual/other, with software rasterizers (WARP /
+  Microsoft Basic Render Driver, llvmpipe) used only when nothing else exists.
+  Ties go to more dedicated memory, then to enumeration order.
+  - DX12 ranks every FL11 DXGI adapter and uses `D3D12_FEATURE_ARCHITECTURE`
+    UMA to mark integrated parts. It previously took the first hardware
+    adapter, which DXGI lists as the iGPU on hybrid laptops.
+  - Vulkan ranks eligible devices by `deviceType`, then by device-local heap
+    size.
+  - OpenGL cannot enumerate adapters. Every Windows executable (`f4_tests`,
+    `demo_bench`, `f4_app`, `f4_vulkan_app`, `f4_dx12_app`) exports
+    `NvOptimusEnablement` / `AmdPowerXpressRequestHighPerformance` via
+    `f4_prefer_high_performance_gpu()`.
+  - WebGPU already requests `HighPerformance` (the browser decides).
+  - `F4_GPU=auto|discrete|integrated|<n>` overrides the pick. `<n>` is the
+    API enumeration index printed in the startup ranking log. OpenGL honours
+    `integrated` by clearing the exports before the first GL context and
+    ignores indices with a warning. An unmatched override falls back to auto
+    with a warning.
+  - Verified on the laptop: GL `GL_RENDERER` and the DX12 DXGI description
+    changed from Intel Iris Xe to the RTX 3070 Ti. `F4_GPU=integrated` moves
+    all three back to Iris Xe, and GL/VK/DX point-light parity holds on both
+    GPUs.
 
 ### Milestone 12 — Optimization
 - ✅ World-space AABB frustum culling with per-frame candidate/visible/culled

@@ -6,6 +6,11 @@
 
 namespace f4::gfx {
 
+void CommandBuffer::waitAsyncCompute() {
+    F4_ASSERT(recording_, "waitAsyncCompute while not recording");
+    if (asyncComputeWait_ == kNoAsyncComputeWait) asyncComputeWait_ = commands_.size();
+}
+
 void CommandBuffer::pushCommand(const Command& cmd) {
     F4_ASSERT(recording_, "recording command while not recording");
     commands_.push(cmd);
@@ -107,17 +112,21 @@ void CommandBuffer::textureBarrier(TextureHandle texture, ResourceState before,
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::setViewport(Extent viewport) {
+void CommandBuffer::setViewport(Extent viewport, std::uint32_t x, std::uint32_t y) {
     Command cmd;
     cmd.kind = CommandKind::SetViewport;
     cmd.viewport = viewport;
+    cmd.viewportX = x;
+    cmd.viewportY = y;
     pushCommand(std::move(cmd));
 }
 
-void CommandBuffer::setScissor(Extent scissor) {
+void CommandBuffer::setScissor(Extent scissor, std::uint32_t x, std::uint32_t y) {
     Command cmd;
     cmd.kind = CommandKind::SetScissor;
     cmd.scissor = scissor;
+    cmd.scissorX = x;
+    cmd.scissorY = y;
     pushCommand(std::move(cmd));
 }
 
@@ -163,6 +172,27 @@ void CommandBuffer::endRenderPass() {
     Command cmd;
     cmd.kind = CommandKind::EndRenderPass;
     pushCommand(std::move(cmd));
+}
+
+void CommandBuffer::writeTimestamp(std::uint32_t index) {
+    F4_ASSERT(index < kMaxGpuTimestamps, "timestamp index out of range");
+    Command cmd;
+    cmd.kind = CommandKind::WriteTimestamp;
+    cmd.timestampIndex = index;
+    pushCommand(std::move(cmd));
+}
+
+void CommandBuffer::timestampUsage(std::uint32_t& count, std::uint32_t& written) const {
+    count = 0;
+    written = 0;
+    for (const Command& command : commands_) {
+        if (command.kind != CommandKind::WriteTimestamp ||
+            command.timestampIndex >= kMaxGpuTimestamps) {
+            continue;
+        }
+        written |= 1u << command.timestampIndex;
+        if (command.timestampIndex + 1 > count) count = command.timestampIndex + 1;
+    }
 }
 
 } // namespace f4::gfx

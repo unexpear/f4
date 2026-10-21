@@ -205,12 +205,20 @@ async function run() {
 
     try {
         const extraFlags = (process.env.F4_WEBGPU_BROWSER_FLAGS ?? "").split(/\s+/).filter(Boolean);
+        // The bench runs on the discrete GPU (hybrid laptops otherwise hand the
+        // browser the integrated one); the smoke keeps the browser's default.
+        if (Number.parseInt(process.env.F4_WEBGPU_BENCH ?? "0", 10) > 0) {
+            extraFlags.push("--force_high_performance_gpu");
+        }
         child = spawn(
             browser,
             [
                 "--headless=new",
                 "--enable-gpu",
                 "--enable-unsafe-webgpu",
+                // Unquantized timestamp-query results (Chrome rounds them to
+                // 100 us otherwise), so the GPU-timer check sees real pass times.
+                "--enable-webgpu-developer-features",
                 "--disable-extensions",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -237,6 +245,36 @@ async function run() {
         await devTools.call("Runtime.enable");
         await devTools.call("Page.enable");
         await devTools.call("Log.enable");
+        // F4_WEBGPU_BENCH=<rounds>: run the point-light bench page instead of
+        // the smoke and print its report.
+        const benchRounds = Number.parseInt(process.env.F4_WEBGPU_BENCH ?? "0", 10) || 0;
+        if (benchRounds > 0) {
+            await devTools.call("Page.navigate", { url: `${url}?bench=${benchRounds}` });
+            await delay(500);
+            const adapterInfo = await evaluateJsonAsync(devTools, `(async () => {
+                const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+                const info = adapter?.info ?? {};
+                return [info.vendor, info.architecture, info.device, info.description].join(" / ");
+            })()`);
+            console.log(`[webgpu bench] adapter: ${adapterInfo}`);
+            const benchDeadline = Date.now() + 900000;
+            let bench;
+            while (Date.now() < benchDeadline) {
+                bench = await evaluateJson(devTools, `({
+                    done: document.body?.dataset.f4BenchDone ?? null,
+                    report: document.body?.dataset.f4Bench ?? null,
+                    output: document.getElementById("output")?.textContent ?? null
+                })`);
+                if (bench.done !== null || bench.output?.includes("Aborted")) break;
+                await delay(500);
+            }
+            console.log((bench?.report ?? "").split("|").join("\n"));
+            if (bench?.done !== "true") {
+                throw new Error(`WebGPU bench failed: ${JSON.stringify(bench)}\n` +
+                                browserErrors(devTools.events).join("\n"));
+            }
+            return;
+        }
         await devTools.call("Page.navigate", { url });
 
         const stateExpression = `({
@@ -251,6 +289,14 @@ async function run() {
             renderer: document.body?.dataset.f4Renderer ?? null,
             rendererPixels: document.body?.dataset.f4RendererPixels ?? null,
             rendererHash: document.body?.dataset.f4RendererHash ?? null,
+            pointLights: document.body?.dataset.f4PointLights ?? null,
+            pointLightGain: document.body?.dataset.f4PointLightGain ?? null,
+            pointShadows: document.body?.dataset.f4PointShadows ?? null,
+            pointShadowLoss: document.body?.dataset.f4PointShadowLoss ?? null,
+            bloom: document.body?.dataset.f4Bloom ?? null,
+            bloomStats: document.body?.dataset.f4BloomStats ?? null,
+            gpuTimers: document.body?.dataset.f4GpuTimers ?? null,
+            gpuTimerStats: document.body?.dataset.f4GpuTimerStats ?? null,
             validationScene: document.body?.dataset.f4ValidationScene ?? null,
             sceneIndex: document.body?.dataset.f4SceneIndex ?? null,
             resizeCount: document.body?.dataset.f4ResizeCount ?? null,
@@ -271,7 +317,9 @@ async function run() {
         const errors = browserErrors(devTools.events);
         if (!state?.webgpu) throw new Error("navigator.gpu is unavailable; WebGL fallback is forbidden");
         if (state.ready !== "true") {
-            throw new Error(`WebGPU app did not become ready: ${JSON.stringify(state)}\n${browserOutput}`);
+            throw new Error(
+                `WebGPU app did not become ready: ${JSON.stringify(state)}\n` +
+                `${errors.join("\n")}\n${browserOutput}`);
         }
         if (state.draws !== "130" || state.noiseParity !== "true" ||
             state.retirement !== "true" ||
@@ -281,11 +329,26 @@ async function run() {
             state.renderer !== "true" ||
             Number.parseInt(state.rendererPixels, 10) <= 100 ||
             !/^[0-9a-f]{8}$/.test(state.rendererHash ?? "") ||
+            state.pointLights !== "true" ||
+            state.pointShadows !== "true" ||
+            state.bloom !== "true" ||
             state.validationErrors !== "0") {
             throw new Error(`WebGPU conformance markers are invalid: ${JSON.stringify(state)}`);
         }
         if (state.output) errors.push(state.output.trim());
         if (errors.length !== 0) throw new Error(`Browser validation errors:\n${errors.join("\n")}`);
+
+        // GPU timers: with timestamp-query on the adapter the app must have
+        // timed the binning and main passes; without it, report unavailable.
+        const timestampQuery = await evaluateJsonAsync(devTools, `(async () => {
+            const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+            return adapter ? adapter.features.has("timestamp-query") : false;
+        })()`);
+        const expectedTimers = timestampQuery ? "true" : "unavailable";
+        if (state.gpuTimers !== expectedTimers) {
+            throw new Error(
+                `WebGPU GPU timers ${state.gpuTimers} (expected ${expectedTimers}): ${state.gpuTimerStats}`);
+        }
 
         const initialResizeCount = Number.parseInt(state.resizeCount, 10);
         await devTools.call("Emulation.setDeviceMetricsOverride", {
@@ -412,6 +475,40 @@ async function run() {
             );
         }
         writeFileSync(join(captureDirectory, "renderer.rgba"), rendererBytes);
+
+        // Point-light shadow and bloom frames, held to the references the
+        // native OpenGL / Vulkan / DX12 test locks (tests/engine/test_point_lights.cpp).
+        const effectSummaries = [];
+        for (const [which, name] of [[0, "point_shadow"], [1, "bloom"]]) {
+            const effectPixels = await evaluateJson(devTools, `(() => {
+                const address = Module._f4EffectCaptureData(${which});
+                return Array.from(HEAPU8.subarray(address, address + 64 * 64 * 4));
+            })()`);
+            const effectBytes = Buffer.from(effectPixels);
+            const effectReference = readFileSync(
+                new URL(`../tests/fixtures/renderer_${name}_reference.rgba`, import.meta.url));
+            if (effectReference.length !== effectBytes.length) {
+                throw new Error(`${name} reference size ${effectReference.length} != ${effectBytes.length}`);
+            }
+            let effectMismatch = 0;
+            let effectMaxDelta = 0;
+            for (let pixel = 0; pixel < 64 * 64; ++pixel) {
+                let mismatch = false;
+                for (let channel = 0; channel < 4; ++channel) {
+                    const index = pixel * 4 + channel;
+                    const delta = Math.abs(effectBytes[index] - effectReference[index]);
+                    effectMaxDelta = Math.max(effectMaxDelta, delta);
+                    if (delta > 2) mismatch = true;
+                }
+                if (mismatch) ++effectMismatch;
+            }
+            writeFileSync(join(captureDirectory, `renderer_${name}.rgba`), effectBytes);
+            if (effectMismatch !== 0) {
+                throw new Error(
+                    `WebGPU ${name} parity failed: ${effectMismatch} pixels, max channel delta ${effectMaxDelta}`);
+            }
+            effectSummaries.push(`${name} max=${effectMaxDelta}`);
+        }
         const hashes = [];
         for (let frame = 1; frame <= 3; ++frame) {
             const capture = await devTools.call("Page.captureScreenshot", {
@@ -528,7 +625,12 @@ async function run() {
         }
         console.log(
             `WebGPU ready; renderer=${state.rendererPixels} pixels/${state.rendererHash}; ` +
+            `point-light red/other gain=${state.pointLightGain}; ` +
+            `point-shadow red loss/brighter=${state.pointShadowLoss}; ` +
+            `bloom zero-delta/glow pixels=${state.bloomStats}; ` +
+            `GPU timers ${state.gpuTimers} (${state.gpuTimerStats}); ` +
             `M11 parity max=${parityMaxChannelDelta}; ` +
+            `effect parity ${effectSummaries.join(", ")}; ` +
             `PBR pixels=${visual.foreground}; colors=${visual.colorBins}; ` +
             `${validationScenes.length} demo scenes stable ` +
             `(${validationSummaries.join(", ")}); ` +

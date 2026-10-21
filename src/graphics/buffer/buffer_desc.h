@@ -12,6 +12,11 @@ enum class BufferUsage : std::uint32_t {
     Storage = 1u << 3,
     TransferSrc = 1u << 4,
     TransferDst = 1u << 5,
+    // Rewritten wholesale by the CPU (typically every frame) and only read by
+    // the GPU. Backends may keep it in host-visible memory and may discard the
+    // previous contents on write, so never write it partially. DX12 stages
+    // such writes in an upload-heap twin and copies them on the next submit.
+    HostWrite = 1u << 6,
 };
 
 [[nodiscard]] constexpr auto operator|(BufferUsage a, BufferUsage b) -> BufferUsage {
