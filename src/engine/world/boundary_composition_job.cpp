@@ -21,14 +21,21 @@ BoundaryCompositionJob::BoundaryCompositionJob(jobs::JobSystem& pool, StreamingB
 auto BoundaryCompositionJob::request(std::span<const StreamingBoundaryRequest> requests) -> bool {
     if (requests.empty() || requests.size() > buildLimits_.maxBoundaries || requests.size() > 256) return false;
     std::vector<StreamingBoundaryRequest> next(requests.begin(), requests.end());
-    clear(); requests_ = std::move(next);
+    // Keep result_ until a newer composition replaces it or it stops being current.
+    ++generation_;
+    retireRequested_ = false;
+    discoveryError_.reset();
+    failedInput_.clear();
+    requests_ = std::move(next);
+    acceptedRequests_.clear();
+    status_ = {};
     status_.state = BoundaryCompositionState::WaitingSources;
     return true;
 }
 void BoundaryCompositionJob::clear() {
     retireRequested_ = false;
     discoveryError_.reset();
-    ++generation_; requests_.clear(); result_.reset(); failedInput_.clear(); status_ = {};
+    ++generation_; requests_.clear(); acceptedRequests_.clear(); result_.reset(); failedInput_.clear(); status_ = {};
     // Keep the outstanding slot until its callback drains, even after clear.
 }
 void BoundaryCompositionJob::requestRetirement() {
@@ -76,7 +83,8 @@ auto BoundaryCompositionJob::requestResidentWindow(const WorldStreamer& world, P
         status_.state = BoundaryCompositionState::Failed; status_.discoveryError = discoveryError_;
         return discoveryError_;
     }
-    auto discovered = discoverTerrainBoundaries(world.regions(), *footprint,
+    const auto window = policyPairCompositionWindow(world.regions(), *footprint, first, second);
+    auto discovered = discoverTerrainBoundaries(world.regions(), window,
         {maxTiles, buildLimits_.maxBoundaries}, std::pair{first, second});
     if (!discovered) {
         clear(); discoveryError_ = discovered.error();
@@ -104,7 +112,9 @@ auto BoundaryCompositionJob::update(const WorldStreamer& world) -> BoundaryCompo
     const auto current = [&](const auto& snapshots) {
         return std::all_of(snapshots.begin(), snapshots.end(), [&](const auto& s) { return world.boundaryCurrent(s); });
     };
-    if (result_ && !world.boundaryCurrent(*result_)) { result_.reset(); status_ = {}; }
+    if (result_ && !world.boundaryCurrent(*result_)) {
+        result_.reset(); acceptedRequests_.clear(); status_ = {};
+    }
     if (!failedInput_.empty() && !current(failedInput_)) { failedInput_.clear(); status_ = {}; }
     if (ticket_) {
         if (!ticket_->done.load(std::memory_order_acquire)) {
@@ -124,6 +134,7 @@ auto BoundaryCompositionJob::update(const WorldStreamer& world) -> BoundaryCompo
             ++stats_.failed;
         } else {
             result_ = std::move(completed->composition);
+            acceptedRequests_ = requests_;
             status_.state = BoundaryCompositionState::Ready; ++stats_.accepted;
         }
     }
@@ -134,7 +145,14 @@ auto BoundaryCompositionJob::update(const WorldStreamer& world) -> BoundaryCompo
         } else if (retireRequested_) status_.state = BoundaryCompositionState::NoBoundaries;
         return status_;
     }
-    if (result_ || !failedInput_.empty()) return status_;
+    const auto sameRequest = [](const StreamingBoundaryRequest& a, const StreamingBoundaryRequest& b) {
+        return a.line.axis == b.line.axis && a.line.plane == b.line.plane &&
+            a.line.begin == b.line.begin && a.line.end == b.line.end &&
+            a.negative == b.negative && a.positive == b.positive;
+    };
+    const bool installed = result_ && requests_.size() == acceptedRequests_.size() &&
+        std::equal(requests_.begin(), requests_.end(), acceptedRequests_.begin(), sameRequest);
+    if (installed || !failedInput_.empty()) return status_;
     auto ticket = std::make_shared<Ticket>(); ticket->generation = generation_;
     // Bound retained copies during capture too, not only inside the worker.
     std::size_t bytes = 0;

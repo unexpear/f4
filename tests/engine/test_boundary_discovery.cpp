@@ -54,7 +54,15 @@ TEST_CASE("Boundary discovery: limits and unsupported transitions never return p
     CHECK(discoverTerrainBoundaries(map, {-32, 96, -32, 96}, {4097, 64}).error() == BoundaryDiscoveryError::InvalidLimits);
     CHECK(discoverTerrainBoundaries(map, {-32, 96, -32, 96}, {9, 257}).error() == BoundaryDiscoveryError::InvalidLimits);
     map.set({1, 0}, PolicyKind::Voxel);
-    CHECK(discoverTerrainBoundaries(map, {-32, 96, -32, 96}).error() == BoundaryDiscoveryError::UnsupportedTransition);
+    auto withVoxel = discoverTerrainBoundaries(map, {-32, 96, -32, 96});
+    REQUIRE(withVoxel);
+    bool sawHeightVoxel = false;
+    for (const auto& edge : withVoxel.value()) {
+        const bool heightVoxel = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                                 (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        if (heightVoxel) sawHeightVoxel = true;
+    }
+    CHECK(sawHeightVoxel);
     auto uniformVoxel = discoverTerrainBoundaries(map, {64, 96, 0, 64});
     REQUIRE(uniformVoxel); CHECK(uniformVoxel.value().empty());
     RegionMap uniform(1);
@@ -62,15 +70,68 @@ TEST_CASE("Boundary discovery: limits and unsupported transitions never return p
     CHECK(discoverTerrainBoundaries(uniform, {0, 65, 0, 64}).error() == BoundaryDiscoveryError::LimitExceeded);
 }
 
-TEST_CASE("Boundary discovery: explicit composition scope excludes unrelated policy edges") {
+TEST_CASE("Boundary discovery: scoped Height/Hex fails closed on unsupported edges") {
     RegionMap map(64); map.set({0, 0}, PolicyKind::Hex); map.set({1, 0}, PolicyKind::Voxel);
-    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}).error() == BoundaryDiscoveryError::UnsupportedTransition);
-    const auto scoped = discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {},
-                                                    std::pair{PolicyKind::Height, PolicyKind::Hex});
-    REQUIRE(scoped); REQUIRE(scoped.value().size() == 1);
-    checkEdge(scoped.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
-    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {},
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
+    const auto reversed = std::pair{PolicyKind::Hex, PolicyKind::Height};
+    const auto onlyHeightHex = discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {}, scope);
+    REQUIRE(onlyHeightHex); REQUIRE(onlyHeightHex.value().size() == 1);
+    checkEdge(onlyHeightHex.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
+    const auto reversedOnly = discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {}, reversed);
+    REQUIRE(reversedOnly); REQUIRE(reversedOnly.value().size() == 1);
+    checkEdge(reversedOnly.value()[0], TerrainBoundaryAxis::X, 0, 0, 64, PolicyKind::Height, PolicyKind::Hex);
+    const auto unscoped = discoverTerrainBoundaries(map, {-64, 192, 0, 64});
+    REQUIRE(unscoped);
+    bool returnedHeightVoxel = false;
+    for (const auto& edge : unscoped.value()) {
+        if ((edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+            (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height)) returnedHeightVoxel = true;
+    }
+    CHECK(returnedHeightVoxel);
+    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(map, {-64, 192, 0, 64}, {}, reversed).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    CHECK(discoverTerrainBoundaries(map, {-32, 32, 0, 64}, {},
                                     std::pair{PolicyKind::Height, PolicyKind::Voxel}).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    auto uniformVoxel = discoverTerrainBoundaries(map, {64, 128, 0, 64}, {}, scope);
+    REQUIRE(uniformVoxel); CHECK(uniformVoxel.value().empty());
+    auto perimeter = discoverTerrainBoundaries(map, {64, 128, 0, 64});
+    REQUIRE(perimeter); CHECK(perimeter.value().empty());
+}
+
+TEST_CASE("Boundary discovery: pair window covers height/hex edges and still fails a foreign tile") {
+    RegionMap corner(64); corner.set({0, 0}, PolicyKind::Hex); corner.set({-1, 0}, PolicyKind::Voxel);
+    const TerrainFootprint mesh{-128, 128, -128, 128};
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
+    CHECK(discoverTerrainBoundaries(corner, mesh, {}, scope).error() == BoundaryDiscoveryError::UnsupportedTransition);
+    const auto window = policyPairCompositionWindow(corner, mesh, PolicyKind::Height, PolicyKind::Hex);
+    const auto edges = discoverTerrainBoundaries(corner, window, {}, scope);
+    REQUIRE(edges);
+    bool east = false, north = false, south = false;
+    for (const auto& edge : edges.value()) {
+        const bool supported = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Hex) ||
+                               (edge.negative == PolicyKind::Hex && edge.positive == PolicyKind::Height);
+        CHECK(supported);
+        if (edge.line.axis == TerrainBoundaryAxis::X && edge.line.plane == 64) east = true;
+        if (edge.line.axis == TerrainBoundaryAxis::Z && edge.line.plane == 64) north = true;
+        if (edge.line.axis == TerrainBoundaryAxis::Z && edge.line.plane == 0) south = true;
+    }
+    CHECK(east); CHECK(north); CHECK(south);
+    const TerrainFootprint containingVoxel{std::min(window.minX, -32.0), window.maxX, window.minZ, window.maxZ};
+    CHECK(discoverTerrainBoundaries(corner, containingVoxel, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+
+    RegionMap split(64); split.set({-2, 0}, PolicyKind::Hex); split.set({0, 0}, PolicyKind::Hex); split.set({-1, 0}, PolicyKind::Voxel);
+    const auto splitWindow = policyPairCompositionWindow(split, mesh, PolicyKind::Height, PolicyKind::Hex);
+    CHECK(discoverTerrainBoundaries(split, splitWindow, {}, scope).error() == BoundaryDiscoveryError::UnsupportedTransition);
+
+    RegionMap heightBesideVoxel(64); heightBesideVoxel.set({-1, 0}, PolicyKind::Voxel);
+    const auto uniform = policyPairCompositionWindow(heightBesideVoxel, {-64, 64, 0, 64}, PolicyKind::Height, PolicyKind::Hex);
+    const auto noEdge = discoverTerrainBoundaries(heightBesideVoxel, uniform, {}, scope);
+    REQUIRE(noEdge); CHECK(noEdge.value().empty());
+    CHECK(discoverTerrainBoundaries(heightBesideVoxel, {-64, 64, 0, 64}, {}, scope).error() ==
           BoundaryDiscoveryError::UnsupportedTransition);
 }
 
@@ -124,6 +185,92 @@ TEST_CASE("Boundary discovery: all two-policy neighborhoods preserve ownership a
                 CHECK(snapshot.policyAt(t, p) == r.positive);
             }
         }
-        CHECK(discoverTerrainBoundaries(map, {-32, 64, -32, 64}).error() == BoundaryDiscoveryError::UnsupportedTransition);
+        bool unsupported = false;
+        std::size_t edges = 0;
+        const auto policyAt = [&](unsigned bit) {
+            if (bit == 4) return PolicyKind::Voxel;
+            return (mask & (1u << bit)) != 0 ? PolicyKind::Hex : PolicyKind::Height;
+        };
+        const auto consider = [&](unsigned a, unsigned b) {
+            const auto left = policyAt(a);
+            const auto right = policyAt(b);
+            if (left == right) return;
+            const bool voxelHex = (left == PolicyKind::Voxel && right == PolicyKind::Hex) ||
+                                  (left == PolicyKind::Hex && right == PolicyKind::Voxel);
+            const bool heightHex = (left == PolicyKind::Height && right == PolicyKind::Hex) ||
+                                   (left == PolicyKind::Hex && right == PolicyKind::Height);
+            const bool heightVoxel = (left == PolicyKind::Height && right == PolicyKind::Voxel) ||
+                                     (left == PolicyKind::Voxel && right == PolicyKind::Height);
+            if (!voxelHex && !heightHex && !heightVoxel) unsupported = true;
+            else ++edges;
+        };
+        for (unsigned bit = 0; bit < 9; ++bit) {
+            if (bit % 3 < 2) consider(bit, bit + 1);
+            if (bit / 3 < 2) consider(bit, bit + 3);
+        }
+        const auto withVoxel = discoverTerrainBoundaries(map, {-32, 64, -32, 64});
+        const auto heightHexScope = discoverTerrainBoundaries(map, {-32, 64, -32, 64}, {},
+                                                              std::pair{PolicyKind::Height, PolicyKind::Hex});
+        if (unsupported) {
+            CHECK(withVoxel.error() == BoundaryDiscoveryError::UnsupportedTransition);
+            CHECK(heightHexScope.error() == BoundaryDiscoveryError::UnsupportedTransition);
+        } else {
+            REQUIRE(withVoxel);
+            CHECK(withVoxel.value().size() == edges);
+            CHECK(heightHexScope.error() == BoundaryDiscoveryError::UnsupportedTransition);
+        }
     }
+}
+
+TEST_CASE("Boundary discovery: a window that contains voxel/hex returns that edge") {
+    RegionMap map(64);
+    map.set({0, 0}, PolicyKind::Hex);
+    map.set({1, 0}, PolicyKind::Voxel);
+    const TerrainFootprint window{0, 128, 0, 64};
+    const auto scope = std::pair{PolicyKind::Voxel, PolicyKind::Hex};
+    const auto found = discoverTerrainBoundaries(map, window, {}, scope);
+    REQUIRE(found);
+    REQUIRE(found.value().size() == 1);
+    checkEdge(found.value()[0], TerrainBoundaryAxis::X, 64, 0, 64, PolicyKind::Hex, PolicyKind::Voxel);
+    const auto unscoped = discoverTerrainBoundaries(map, window);
+    REQUIRE(unscoped);
+    REQUIRE(unscoped.value().size() == 1);
+    checkEdge(unscoped.value()[0], TerrainBoundaryAxis::X, 64, 0, 64, PolicyKind::Hex, PolicyKind::Voxel);
+    CHECK(discoverTerrainBoundaries(map, window, {}, std::pair{PolicyKind::Height, PolicyKind::Hex}).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    map.set({1, 1}, PolicyKind::Height);
+    CHECK(discoverTerrainBoundaries(map, {0, 128, 0, 128}, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    auto interior = discoverTerrainBoundaries(map, {64, 128, 0, 64}, {}, scope);
+    REQUIRE(interior);
+    CHECK(interior.value().empty());
+}
+
+TEST_CASE("Boundary discovery: a window that contains height/voxel returns that edge") {
+    RegionMap map(64);
+    map.set({1, 0}, PolicyKind::Voxel);
+    const TerrainFootprint window{0, 128, 0, 64};
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Voxel};
+    const auto found = discoverTerrainBoundaries(map, window, {}, scope);
+    REQUIRE(found);
+    REQUIRE(found.value().size() == 1);
+    checkEdge(found.value()[0], TerrainBoundaryAxis::X, 64, 0, 64, PolicyKind::Height, PolicyKind::Voxel);
+    const auto unscoped = discoverTerrainBoundaries(map, window);
+    REQUIRE(unscoped);
+    REQUIRE(unscoped.value().size() == 1);
+    checkEdge(unscoped.value()[0], TerrainBoundaryAxis::X, 64, 0, 64, PolicyKind::Height, PolicyKind::Voxel);
+    CHECK(discoverTerrainBoundaries(map, window, {}, std::pair{PolicyKind::Height, PolicyKind::Hex}).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    auto onlyVoxel = discoverTerrainBoundaries(map, {64, 128, 0, 64}, {}, scope);
+    REQUIRE(onlyVoxel);
+    CHECK(onlyVoxel.value().empty());
+    auto onlyHeight = discoverTerrainBoundaries(map, {0, 64, 0, 64});
+    REQUIRE(onlyHeight);
+    CHECK(onlyHeight.value().empty());
+    map.set({0, 0}, PolicyKind::Hex);
+    CHECK(discoverTerrainBoundaries(map, window, {}, scope).error() == BoundaryDiscoveryError::UnsupportedTransition);
+    const auto mixed = discoverTerrainBoundaries(map, window);
+    REQUIRE(mixed);
+    REQUIRE(mixed.value().size() == 1);
+    checkEdge(mixed.value()[0], TerrainBoundaryAxis::X, 64, 0, 64, PolicyKind::Hex, PolicyKind::Voxel);
 }

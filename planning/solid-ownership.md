@@ -1,8 +1,13 @@
 # Solid-Column Ownership (2026-09-28)
 
 Reference volume contract for the boundary and corner columns this tree can
-already describe. M16 stays partial. This does not install a new WorldStreamer
-query, change voxel DDA, or change bilinear height sampling.
+already describe. M16 stays partial. `WorldStreamer::classifyPublishedSolid`
+uses this contract for published Height/Hex columns and for interior voxel
+columns read from retained horizontal mesh faces. It does not change voxel
+DDA or bilinear height sampling. A single region plane with Voxel on one side
+is owned from those spans and the other side's upward top when the faces
+agree. A cell corner where they disagree is `AmbiguousSurface`. A corner that
+touches Voxel still has no owner.
 
 ## Contract
 
@@ -28,10 +33,14 @@ column and which sector owns it.
   `InconsistentSector`. Distinct heights that collapse to one float are
   `PrecisionLoss`. Alternating solid and empty sectors, including alternation
   caused by a hex floor, are `NonmanifoldCorner` for every sample on that corner.
-- Voxel columns are unsupported. `classifyVoxelStack` names `VoxelOverhang`
-  when a vertical stack has two solid runs and `VoxelCavity` when the only run
-  sits above air. A bottom-anchored run is still `UnsupportedVoxel`. None of
-  these return an owner.
+- `classifyVoxelStack` still names `VoxelOverhang` when a bool stack has two
+  solid runs and `VoxelCavity` when the only run sits above air. A
+  bottom-anchored bool stack is still `UnsupportedVoxel`. That function never
+  returns an owner and is not the streaming walker.
+- `classifyVoxelColumn` owns a published stack of closed solid spans. A sample
+  inside a span is solid Voxel. Air in that column, including the gap of a
+  cave or overhang, is an empty Voxel sample. A single top-and-floor
+  `TerrainSolidColumn` still rejects Voxel.
 
 Incomplete profiles, unrepresentable planes and float-collapsed transition
 pieces fail closed with the same errors as the wall builder. No epsilon weld
@@ -42,10 +51,56 @@ and no partial owner.
 `tests/engine/test_terrain_solid.cpp` covers wall-centroid agreement, crossing
 ownership, buried samples below the wall band, discontinuous breakpoints, hex
 floors, corner resolution, nonmanifold joins, inconsistent sectors, precision
-collapse, nonplanar tops versus bilinear height, and the named voxel failures.
+collapse, nonplanar tops versus bilinear height, the named voxel-stack
+refusals, and voxel span ownership for a solid run, an air gap, and an upper run.
+
+## Streaming query
+
+`classifyPublishedSolid` reads retained published meshes, including while a
+remesh is in flight. Interior Height/Hex samples use `sampleUpwardTriangleHeight`
+on the upward published triangle. A sample on one region plane uses
+`classifyTerrainBoundarySolid` over the paired profile of that region edge. A
+sample on both planes uses `classifyTerrainCornerSolid`. An interior voxel
+sample walks horizontal faces of the retained voxel meshes. An upward face
+closes a solid run and a downward face opens the next one. Solid runs are
+owned by Voxel. Air in the same column is an empty Voxel sample, including
+the gap punched through a published stack. A face stack that does not close,
+or two columns that disagree on a shared edge, stays unpublished or
+ambiguous. A single region plane with Voxel on one side uses that side's
+published horizontal spans against the other side's upward top. The greatest
+containing top owns the sample. A point below the voxel floor and inside the
+Height column or Hex prism is that other side. A point inside a voxel span
+whose top is greater is Voxel, including the wall band above the shorter top.
+Air above both is an empty success. A cell corner whose adjacent tops disagree
+is `AmbiguousSurface`. Missing faces are `NoPublishedSurface`. A corner that
+touches Voxel stays `UnsupportedVoxel`.
+`classifyVoxelStack` is unchanged.
 
 ## Still Open
 
-Full-world policy coverage, renderer use of the engine accepted-view slot,
-continuous moving coverage, budget acceptance, and a general voxel solid query
-remain open. Surface rays are not this contract.
+Full-world policy coverage remains open. Interior published voxel columns now
+have an owner. Displayed raycasts read the engine accepted-view slot. Plain
+sync does not draw a package that slot rejects. An opt-in hard deadline refuses
+the next streaming unit and the next copied entry of a shared region map. It
+does not preempt the unit already started, and overrun stays visible.
+`deterministicAdmission` ignores that deadline. The two-process gate hashes one residency row per world-update tick of
+the eight-step sweep, and one presented `sweep_tick_*.bmp` for each of those
+ticks. The present uses the view already installed for that tick. It does not
+advance world admission or the wall-clock upload budget. That verify path uses
+fixed work-unit admission (per-frame count caps), not a hard realtime deadline.
+Interactive pacing is unchanged. Discovery returns a Voxel/Hex edge that is inside the window. The published
+column on that edge is owned when the published faces agree. On the hex
+floor the owner is Hex. Inside the taller voxel span the owner is Voxel.
+An unscoped resident window that contains a Height/Voxel edge returns that
+edge. A sample inside one face of that edge is owned by Height below the
+voxel floor. A cell corner where adjacent tops disagree is
+`AmbiguousSurface` and is not given an owner. A Height/Hex
+scope of that window fails instead of dropping the edge. The full resident
+union returns the edge. Capture of a Height/Voxel or Voxel/Hex edge copies
+the published meshes and emits no wall. An isolated edge composes as those
+meshes. A retained edge that shares an endpoint is JunctionRejected, and a
+still-current prior composition is kept. A Height/Hex scope that still
+contains an unsupported corner fails closed. Scoped Height/Hex composition keeps the
+pair-adjacency rectangle, and a Height/Hex scope fails a window that
+actually contains the Voxel/Hex edge. `classifyVoxelStack` still returns no
+owner. Surface rays are not this contract.

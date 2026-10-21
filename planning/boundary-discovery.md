@@ -24,7 +24,8 @@ exact integer tile plane. Floating coordinates are validated before narrowing.
   form an interior crossing. Geometry composition still checks sector heights
   and rejects nonmanifold junctions; discovery is not geometry acceptance.
 - Only differing Height/Hex pairs are supported. Any required voxel transition
-  fails the entire selection. Uniform voxel ownership has no inter-policy edge
+  fails the entire selection, including when the caller scoped the query to
+  Height/Hex. Uniform voxel ownership has no inter-policy edge
   and may correctly return an empty set. Edges lying on the window perimeter
   are excluded because only one side is selected.
 - `BoundaryCompositionJob::requestWindow` discovers and selects the target.

@@ -53,8 +53,16 @@ struct TerrainSolidSample {
 struct TerrainSolidColumn {
     PolicyKind policy = PolicyKind::Height;
     double top = 0;
-    // Required for Hex, forbidden for Height. Voxel is never a column.
+    // Required for Hex, forbidden for Height. A voxel stack is not one top;
+    // classifyVoxelColumn owns its published solid spans.
     std::optional<double> floor;
+};
+
+// One closed solid run of a voxel column, bottom then top. Air between runs
+// is empty. The runs are the published stack, including a cave or overhang.
+struct VoxelSolidSpan {
+    double floor = 0;
+    double top = 0;
 };
 
 struct TerrainBoundarySolidQuery {
@@ -108,8 +116,32 @@ struct TerrainTopSample {
 // Names a vertical voxel stack and always fails closed. Bottom to top.
 // Two or more solid runs: VoxelOverhang. One run that starts above an air
 // cell: VoxelCavity. A bottom-anchored run, or no solid cells: UnsupportedVoxel.
-// Never returns an owner. That is the contract, not a completed voxel solid.
+// Never returns an owner. This is not a streaming column walker.
 [[nodiscard]] auto classifyVoxelStack(std::span<const bool> solidFromBottom)
+    -> Result<TerrainSolidSample, TerrainSolidError>;
+
+// Published voxel column. Spans are closed, ordered, and non-overlapping.
+// A sample inside a span is solid and owned by Voxel. A sample outside every
+// span is empty and still names Voxel. An empty span list is an all-air column.
+[[nodiscard]] auto classifyVoxelColumn(std::span<const VoxelSolidSpan> spans, double height)
+    -> Result<TerrainSolidSample, TerrainSolidError>;
+
+// One region plane. The voxel side is the published closed spans. The other
+// side is one Height column, open downward, or one Hex prism. Containing
+// columns compete by the greatest top; a voxel sample uses the top of the
+// span that contains it. Equal tops keep the negative side (sector 0). The
+// wall band runs from the greatest strictly shorter incident top through the
+// owner's top. With one other column that is the same band as a Height/Hex
+// boundary. Neither side containing the sample is an empty success. This does
+// not read meshes and does not turn a voxel stack into one top-and-floor.
+struct VoxelPlaneSolidQuery {
+    bool voxelOnNegative = true;
+    std::span<const VoxelSolidSpan> spans;
+    PolicyKind other = PolicyKind::Height;
+    double otherTop = 0;
+    std::optional<double> otherFloor;
+};
+[[nodiscard]] auto classifyVoxelPlaneSolid(const VoxelPlaneSolidQuery& query, double height)
     -> Result<TerrainSolidSample, TerrainSolidError>;
 
 } // namespace f4::world

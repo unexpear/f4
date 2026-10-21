@@ -20,18 +20,26 @@ enum class BoundaryDiscoveryError {
     NoResidentCoverage,
 };
 
-// Enumerate every Height/Hex ownership edge strictly inside the supplied XZ
-// window, clipped to its tangent range. Split at every region-grid vertex so
-// junctions only meet at endpoints. Deterministic Z/X tile order, X edge first.
-// An empty success means no transition INSIDE this window, not source coverage.
-// This pure snapshot operation neither examines residency nor selects a view.
-// Unsupported policy pairs fail the entire result, never return a partial set.
-// When scope is supplied, only that explicit policy pair is enumerated; this
-// is a caller-selected composition scope, not a claim that other transitions
-// in the window are supported or covered.
+// Enumerate Height/Hex, Voxel/Hex, and Height/Voxel ownership edges strictly
+// inside the supplied XZ window, clipped to its tangent range. Split at every
+// region-grid vertex so junctions only meet at endpoints. Deterministic Z/X
+// tile order, X edge first. An empty success means no such edge INSIDE this
+// window, not source coverage. This pure snapshot operation neither examines
+// residency nor selects a view. A scope enumerates only that pair and fails
+// the window if another enumerated pair is inside it. It does not omit that
+// edge, and it is not coverage outside the window. A returned edge that
+// touches Voxel is not by itself a voxel column owner.
 [[nodiscard]] auto discoverTerrainBoundaries(const RegionMap& regions, TerrainFootprint window,
                                             BoundaryDiscoveryLimits limits = {},
                                             std::optional<std::pair<PolicyKind, PolicyKind>> scope = {})
     -> Result<std::vector<StreamingBoundaryRequest>, BoundaryDiscoveryError>;
+
+// Rectangle of tiles that share a resident edge of this policy pair inside
+// meshBounds. A foreign tile in that rectangle is left inside it so discovery
+// fails closed. When the rectangle contains no pair edge, one in-pair tile is
+// returned so a uniform interior stays an empty success. meshBounds itself is
+// returned when it names no usable tile.
+[[nodiscard]] auto policyPairCompositionWindow(const RegionMap& regions, TerrainFootprint meshBounds,
+                                               PolicyKind first, PolicyKind second) -> TerrainFootprint;
 
 } // namespace f4::world

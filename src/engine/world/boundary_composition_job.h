@@ -30,6 +30,10 @@ public:
     auto operator=(const BoundaryCompositionJob&) -> BoundaryCompositionJob& = delete;
     // Invalid request counts leave the previous request untouched. Re-requesting
     // an accepted set explicitly retries an unchanged failed build.
+    // Staging a different set keeps a still-current composition. Capture or
+    // build failure of the new set leaves that composition in result() when
+    // boundaryCurrent still holds. Discovery failure, retirement, and clear()
+    // drop it.
     auto request(std::span<const StreamingBoundaryRequest> requests) -> bool;
     // Re-evaluate ownership in a caller-selected window. Repeating an unchanged
     // set preserves queued work and cached failures. Empty success retires;
@@ -42,9 +46,9 @@ public:
     // checked by update() before a composition is accepted.
     auto requestResidentWindow(const WorldStreamer& world, std::size_t maxTiles = 4096)
         -> std::optional<BoundaryDiscoveryError>;
-    // Restrict the derived resident bounds and discovery to a policy pair.
-    // This explicit composer scope does not claim that other transitions in
-    // the same geographic envelope are supported or covered.
+    // Discover the resident policy pair. The mesh rectangle can contain a
+    // foreign edge, so the request uses the pair-adjacency rectangle instead.
+    // Discovery still fails that rectangle when a foreign tile sits inside it.
     auto requestResidentWindow(const WorldStreamer& world, PolicyKind first, PolicyKind second,
                                std::size_t maxTiles = 4096) -> std::optional<BoundaryDiscoveryError>;
     // Explicitly target plain resident terrain. Unlike clear(), this asks the
@@ -66,6 +70,7 @@ private:
     bool retireRequested_ = false;
     std::optional<BoundaryDiscoveryError> discoveryError_;
     std::vector<StreamingBoundaryRequest> requests_;
+    std::vector<StreamingBoundaryRequest> acceptedRequests_;
     std::shared_ptr<Ticket> ticket_;
     std::vector<StreamingBoundarySnapshot> failedInput_;
     std::optional<StreamingBoundaryComposition> result_;

@@ -13,6 +13,7 @@
 #include "engine/world/terrain_regions.h"
 #include "engine/world/terrain_queries.h"
 #include "engine/world/terrain_boundaries.h"
+#include "engine/world/terrain_solid.h"
 #include "engine/world/boundary_replacement.h"
 #include "engine/world/world_data.h"
 
@@ -39,7 +40,11 @@ struct WorldStreamingConfig {
     std::size_t workerCount = 0;
     // Cooperative budget: a positive value admits at least one operation per
     // enabled stage. Individual topology/publication operations are not preemptible.
+    // deterministicAdmission skips the wall clock and stops at the per-frame
+    // count caps. That is a fixed work-unit cap, not a hard realtime deadline.
+    // A hard stop is the separate StreamingDeadline argument to update.
     std::chrono::microseconds frameBudget{2000};
+    bool deterministicAdmission = false;
     std::uint32_t maxLoadsPerFrame = 8;
     std::uint32_t maxUnloadsPerFrame = 16;
     std::uint32_t maxPublicationsPerFrame = 16;
@@ -74,6 +79,16 @@ struct StreamingStageTimes {
 
 struct StreamingFrameStats {
     bool planningPending = false;
+    // frameBudget <= 0 admits nothing. This is not a measured deadline.
+    bool budgetClosed = false;
+    // A later candidate was left queued because the cooperative budget elapsed
+    // or a hard deadline refused to start it. The operation already admitted
+    // in that stage was not preempted.
+    bool budgetDeferred = false;
+    // A unit started under a hard deadline finished after that deadline.
+    // The unit was kept. Cooperative admission and deterministicAdmission
+    // do not set this.
+    bool budgetOverrun = false;
     std::uint32_t loaded = 0;
     std::uint32_t unloaded = 0;
     std::uint32_t completionsProcessed = 0;
@@ -81,6 +96,16 @@ struct StreamingFrameStats {
     std::uint32_t meshJobs = 0;
     std::chrono::microseconds elapsed{};
     StreamingStageTimes timings{}; // Populated only when profileTimings is enabled.
+};
+
+// Opt-in hard admission clock for one update. Ignored while
+// deterministicAdmission is set, so the verify path stays a work-unit cap.
+// The clock refuses the next unload, load, publication, or mesh unit. It does
+// not preempt a unit that has already started. now == nullptr reads steady_clock.
+struct StreamingDeadline {
+    bool hard = false;
+    std::chrono::steady_clock::time_point (*now)(void*) = nullptr;
+    void* clock = nullptr;
 };
 
 struct StreamingStats {
@@ -196,6 +221,25 @@ private:
     friend class WorldStreamer;
 };
 
+// Coverage failures are distinct from the reference classifier errors, which
+// pass through with the same names and meanings as TerrainSolidError.
+enum class StreamingSolidError : std::uint8_t {
+    InvalidSample,
+    NoPublishedSurface,
+    AmbiguousSurface,
+    InvalidData,
+    IncompleteProfile,
+    PrecisionLoss,
+    DiscontinuousHeight,
+    NonmanifoldCorner,
+    InconsistentSector,
+    HexFloorInversion,
+    UnsupportedUnderside,
+    UnsupportedVoxel,
+    VoxelCavity,
+    VoxelOverhang,
+};
+
 enum class StreamingSurfaceViewError {
     InvalidData,
     DuplicateSource,
@@ -260,7 +304,9 @@ public:
     [[nodiscard]] auto identityToken() const -> std::shared_ptr<const std::byte>;
     [[nodiscard]] auto blocks() -> BlockRegistry&;
 
-    auto update(math::Vec3 cameraPosition) -> StreamingFrameStats;
+    auto update(math::Vec3 cameraPosition, StreamingDeadline deadline = {}) -> StreamingFrameStats;
+    // True when update admits by count caps and does not read the wall clock.
+    [[nodiscard]] auto deterministicAdmission() const -> bool;
     void waitForIdle();
     [[nodiscard]] auto hasPendingWork() const -> bool;
 
@@ -271,7 +317,8 @@ public:
     [[nodiscard]] auto residentTerrainFootprint() const -> std::optional<TerrainFootprint>;
     // Same union restricted to the two policies that a transition composer
     // can consume, using their published mesh bounds after ownership clipping.
-    // This is a caller-selected composition scope, not full-world coverage.
+    // The rectangle can still contain an unsupported edge; discovery fails
+    // closed on that edge. This is not full-world coverage.
     [[nodiscard]] auto residentTerrainFootprint(PolicyKind first, PolicyKind second) const
         -> std::optional<TerrainFootprint>;
     // Accepted render/query publication. Publishing validates the complete
@@ -294,7 +341,9 @@ public:
         -> std::optional<ChunkSnapshot>;
     [[nodiscard]] auto stats() const -> StreamingStats;
 
-    // Main-thread reference capture of a uniform Height/Hex region boundary.
+    // Main-thread reference capture of a Height/Hex, Height/Voxel, or Voxel/Hex
+    // region boundary. The snapshot copies published meshes. It does not
+    // generate transition triangles.
     // Requires regionalSurfaceOwnership, an integer region plane, <=4096 tiles,
     // and current published meshes for all resident footprint contributors.
     // Missing residents are recorded by the membership set/profile gaps, not
@@ -325,6 +374,23 @@ public:
         -> std::optional<VoxelRayHit>;
     [[nodiscard]] auto sampleHeightTerrain(float worldX, float worldZ) const
         -> std::optional<HeightSample>;
+
+    // Published-column volume query for the solid-ownership contract.
+    // Height and Hex interiors use the upward published triangle
+    // (sampleUpwardTriangleHeight), not bilinear sampling. A sample on one
+    // region plane uses classifyTerrainBoundarySolid; a sample on both planes
+    // uses classifyTerrainCornerSolid. An interior voxel sample walks the
+    // horizontal faces of the retained published meshes: each closed solid
+    // run is owned by Voxel, and air in that column is an empty Voxel sample.
+    // A single region plane with Voxel on one side uses those spans against
+    // the other side's upward top (classifyVoxelPlaneSolid). Disagreeing or
+    // missing faces at that point are AmbiguousSurface or NoPublishedSurface.
+    // A corner that touches Voxel stays UnsupportedVoxel.
+    // Does not change raycastVoxelTerrain, sampleHeightTerrain, or voxel DDA.
+    // Uses the retained published mesh, including while a remesh is in flight.
+    // A Height or Hex non-solid success leaves policy at Height and sector at 0.
+    [[nodiscard]] auto classifyPublishedSolid(double x, double y, double z) const
+        -> Result<TerrainSolidSample, StreamingSolidError>;
 
 private:
     class Impl;

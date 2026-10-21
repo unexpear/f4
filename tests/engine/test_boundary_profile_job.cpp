@@ -68,12 +68,24 @@ TEST_CASE("Composed jobs: discovered windows retain queued work and fail closed"
     REQUIRE_FALSE(job.requestWindow(world.regions(), {0, 96, 0, 96}));
     CHECK(job.result(world) == accepted);
     CHECK(job.stats().discarded == 0);
-    // Reject even an unrelated unsupported edge in the selected window. It
-    // must not silently return the earlier valid subset or retire the view.
+    // A region edit publishes Height/Voxel edges in this window. The previous
+    // composition is no longer current, so it must not stay visible.
     world.regions().set({1, 0}, PolicyKind::Voxel);
-    CHECK(job.requestWindow(world.regions(), {0, 96, 0, 96}) == BoundaryDiscoveryError::UnsupportedTransition);
-    CHECK(job.update(world).state == BoundaryCompositionState::Failed);
-    CHECK(job.status().discoveryError == BoundaryDiscoveryError::UnsupportedTransition);
+    const auto returned = discoverTerrainBoundaries(world.regions(), {0, 96, 0, 96});
+    REQUIRE(returned);
+    const bool returnedHeightVoxel = std::any_of(returned.value().begin(), returned.value().end(),
+        [](const StreamingBoundaryRequest& edge) {
+            return (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                   (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+        });
+    CHECK(returnedHeightVoxel);
+    // The region revision makes the earlier composition stale. Capture of the
+    // new Height/Voxel edge waits for republished sources instead of
+    // InvalidBoundary, and the stale result stays hidden.
+    CHECK_FALSE(job.requestWindow(world.regions(), {0, 96, 0, 96}));
+    const auto staged = job.update(world);
+    CHECK(staged.state == BoundaryCompositionState::WaitingSources);
+    CHECK(staged.captureError == StreamingBoundaryError::SourcesPending);
     CHECK_FALSE(job.result(world));
     REQUIRE_FALSE(job.requestWindow(world.regions(), {512, 608, 512, 608}));
     CHECK(job.update(world).state == BoundaryCompositionState::NoBoundaries);
@@ -96,6 +108,104 @@ TEST_CASE("Composed jobs: discovered windows retain queued work and fail closed"
     REQUIRE_FALSE(job.requestWindow(world.regions(), {0, 96, 0, 96}));
     job.update(world); pool.waitIdle();
     CHECK(job.update(world).state == BoundaryCompositionState::Ready);
+}
+
+TEST_CASE("Composed jobs: isolated height/voxel capture copies published meshes and emits no walls") {
+    auto config = settings();
+    WorldStreamer world(config);
+    world.regions().set({1, 0}, PolicyKind::Voxel);
+    REQUIRE(settle(world, {64, 0, 32}));
+    const TerrainFootprint window{0, 128, 0, 64};
+    const auto discovered = discoverTerrainBoundaries(world.regions(), window);
+    REQUIRE(discovered);
+    REQUIRE(discovered.value().size() == 1);
+    const auto& edge = discovered.value()[0];
+    CHECK(edge.line.axis == TerrainBoundaryAxis::X);
+    CHECK(edge.line.plane == 64);
+    CHECK(edge.line.begin == 0);
+    CHECK(edge.line.end == 64);
+    const bool heightVoxel = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Voxel) ||
+                             (edge.negative == PolicyKind::Voxel && edge.positive == PolicyKind::Height);
+    CHECK(heightVoxel);
+    const auto captured = world.captureBoundary(edge);
+    REQUIRE(captured);
+    CHECK(captured.value().meshBytes() > 0);
+    jobs::JobSystem pool(1);
+    BoundaryCompositionJob job(pool);
+    CHECK_FALSE(job.requestWindow(world.regions(), window));
+    REQUIRE(job.update(world).state == BoundaryCompositionState::Queued);
+    pool.waitIdle();
+    REQUIRE(job.update(world).state == BoundaryCompositionState::Ready);
+    const auto* composition = job.result(world);
+    REQUIRE(composition);
+    const auto* geometry = composition->geometry();
+    REQUIRE(geometry);
+    std::size_t sourceTriangles = 0;
+    bool sawHeight = false, sawVoxel = false, wall = false;
+    for (const auto& source : composition->sources()) {
+        const auto* mesh = world.mesh(source.key);
+        REQUIRE(mesh);
+        sourceTriangles += mesh->indices.size() / 3;
+        if (source.key.policy == PolicyKind::Height) sawHeight = true;
+        if (source.key.policy == PolicyKind::Voxel) sawVoxel = true;
+    }
+    CHECK(sawHeight);
+    CHECK(sawVoxel);
+    CHECK(geometry->triangles.size() == sourceTriangles);
+    for (const auto& triangle : geometry->triangles) if (triangle.wall) wall = true;
+    CHECK_FALSE(wall);
+    const auto column = world.classifyPublishedSolid(64.0, -8.0, 32.5);
+    REQUIRE(column);
+    CHECK(column.value().solid);
+    CHECK(column.value().policy == PolicyKind::Height);
+    CHECK(column.value().sector == 0);
+}
+
+TEST_CASE("Composed jobs: a height/voxel corner keeps the previous height/hex composition") {
+    auto config = settings();
+    config.regionalHexCutWalls = true;
+    WorldStreamer world(config);
+    world.regions().set({0, 0}, PolicyKind::Hex);
+    world.regions().set({1, 0}, PolicyKind::Voxel);
+    REQUIRE(settle(world, {32, 0, 32}));
+    const TerrainFootprint heightHex{-64, 64, -64, 64};
+    const auto supported = discoverTerrainBoundaries(world.regions(), heightHex);
+    REQUIRE(supported);
+    CHECK_FALSE(supported.value().empty());
+    bool foreign = false;
+    for (const auto& edge : supported.value()) {
+        const bool heightHexPair = (edge.negative == PolicyKind::Height && edge.positive == PolicyKind::Hex) ||
+                                   (edge.negative == PolicyKind::Hex && edge.positive == PolicyKind::Height);
+        if (!heightHexPair) foreign = true;
+    }
+    CHECK_FALSE(foreign);
+    jobs::JobSystem pool(1);
+    BoundaryCompositionJob job(pool);
+    CHECK_FALSE(job.requestWindow(world.regions(), heightHex));
+    REQUIRE(job.update(world).state == BoundaryCompositionState::Queued);
+    pool.waitIdle();
+    REQUIRE(job.update(world).state == BoundaryCompositionState::Ready);
+    const auto* accepted = job.result(world);
+    REQUIRE(accepted);
+    const TerrainFootprint mixed{-64, 128, -64, 64};
+    const auto mixedEdges = discoverTerrainBoundaries(world.regions(), mixed);
+    REQUIRE(mixedEdges);
+    bool sawVoxel = false;
+    for (const auto& edge : mixedEdges.value()) {
+        if (edge.negative == PolicyKind::Voxel || edge.positive == PolicyKind::Voxel) sawVoxel = true;
+    }
+    CHECK(sawVoxel);
+    CHECK_FALSE(job.requestWindow(world.regions(), mixed));
+    auto status = job.update(world);
+    if (status.state == BoundaryCompositionState::Queued || status.state == BoundaryCompositionState::WaitingSources) {
+        pool.waitIdle();
+        status = job.update(world);
+    }
+    CHECK(status.state == BoundaryCompositionState::Failed);
+    CHECK_FALSE(status.captureError.has_value());
+    CHECK(status.buildError == BoundaryReplacementError::JunctionRejected);
+    CHECK(job.result(world) == accepted);
+    CHECK(world.boundaryCurrent(*accepted));
 }
 
 TEST_CASE("Composed jobs: resident coverage derives the discovery window and fails without coverage") {
@@ -122,6 +232,32 @@ TEST_CASE("Composed jobs: resident coverage derives the discovery window and fai
     REQUIRE(pairJob.update(world).state == BoundaryCompositionState::Queued);
     pool.waitIdle(); REQUIRE(pairJob.update(world).state == BoundaryCompositionState::Ready);
     REQUIRE(pairJob.result(world));
+}
+
+TEST_CASE("Composed jobs: scoped resident window keeps the height/hex corner and rejects a voxel edge") {
+    auto config = settings();
+    WorldStreamer world(config);
+    world.regions().set({0, 0}, PolicyKind::Hex);
+    world.regions().set({-1, 0}, PolicyKind::Voxel);
+    REQUIRE(settle(world));
+    const auto mesh = world.residentTerrainFootprint(PolicyKind::Height, PolicyKind::Hex);
+    REQUIRE(mesh);
+    const auto scope = std::pair{PolicyKind::Height, PolicyKind::Hex};
+    CHECK(discoverTerrainBoundaries(world.regions(), *mesh, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    const auto window = policyPairCompositionWindow(world.regions(), *mesh, PolicyKind::Height, PolicyKind::Hex);
+    const auto edges = discoverTerrainBoundaries(world.regions(), window, {}, scope);
+    REQUIRE(edges);
+    CHECK_FALSE(edges.value().empty());
+    const TerrainFootprint containingVoxel{std::min(window.minX, -32.0), std::max(window.maxX, 96.0),
+                                           std::min(window.minZ, 0.0), std::max(window.maxZ, 64.0)};
+    CHECK(discoverTerrainBoundaries(world.regions(), containingVoxel, {}, scope).error() ==
+          BoundaryDiscoveryError::UnsupportedTransition);
+    jobs::JobSystem pool(1);
+    BoundaryCompositionJob job(pool);
+    CHECK_FALSE(job.requestResidentWindow(world, PolicyKind::Height, PolicyKind::Hex));
+    CHECK(job.status().state != BoundaryCompositionState::Failed);
+    CHECK(job.status().discoveryError == std::nullopt);
 }
 
 TEST_CASE("Composed jobs: resident scope retargets across camera residency movement") {

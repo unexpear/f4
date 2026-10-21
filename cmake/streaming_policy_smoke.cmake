@@ -26,9 +26,12 @@ foreach(run RANGE 1 2)
         message(FATAL_ERROR "Policy diagnostics failed (${result}):\n${stdout}\n${stderr}")
     endif()
     file(GLOB images "${root}/run-${run}/*.bmp")
+    file(GLOB sweep_frames "${root}/run-${run}/sweep_tick_*.bmp")
     list(LENGTH images count)
-    if(NOT count EQUAL 112)
-        message(FATAL_ERROR "Expected 112 policy captures; found ${count}")
+    list(LENGTH sweep_frames sweep_count)
+    math(EXPR expected_images "112 + ${sweep_count}")
+    if(NOT count EQUAL expected_images)
+        message(FATAL_ERROR "Expected 112 policy captures plus ${sweep_count} sweep presents; found ${count}")
     endif()
     foreach(checkpoint IN LISTS checkpoints)
         file(SHA256 "${root}/run-${run}/${checkpoint}.bmp" original)
@@ -70,11 +73,35 @@ file(SHA256 "${root}/run-2/owned_surface_probes.csv" owned_repeated)
 if(NOT owned_original STREQUAL owned_repeated)
     message(FATAL_ERROR "Regional surface probes differ across processes")
 endif()
-foreach(evidence capped_surface_probes capped_wall_probes voxel_cut_probes corner_display_queries corner_reuse corner_motion_residency)
+foreach(evidence capped_surface_probes capped_wall_probes voxel_cut_probes corner_display_queries corner_reuse corner_motion_residency voxel_hex_column)
     file(SHA256 "${root}/run-1/${evidence}.csv" original)
     file(SHA256 "${root}/run-2/${evidence}.csv" repeated)
     if(NOT original STREQUAL repeated)
         message(FATAL_ERROR "Hex cut wall evidence differs across processes: ${evidence}")
+    endif()
+endforeach()
+file(GLOB sweep_run_1 "${root}/run-1/sweep_tick_*.bmp")
+file(GLOB sweep_run_2 "${root}/run-2/sweep_tick_*.bmp")
+list(SORT sweep_run_1)
+list(SORT sweep_run_2)
+list(LENGTH sweep_run_1 sweep_count_1)
+list(LENGTH sweep_run_2 sweep_count_2)
+if(NOT sweep_count_1 EQUAL sweep_count_2 OR sweep_count_1 LESS 17)
+    message(FATAL_ERROR "Sweep presents differ across processes: ${sweep_count_1} versus ${sweep_count_2}")
+endif()
+math(EXPR sweep_last "${sweep_count_1} - 1")
+foreach(index RANGE ${sweep_last})
+    list(GET sweep_run_1 ${index} sweep_a)
+    list(GET sweep_run_2 ${index} sweep_b)
+    get_filename_component(sweep_name_a "${sweep_a}" NAME)
+    get_filename_component(sweep_name_b "${sweep_b}" NAME)
+    if(NOT sweep_name_a STREQUAL sweep_name_b)
+        message(FATAL_ERROR "Sweep present names differ: ${sweep_name_a} versus ${sweep_name_b}")
+    endif()
+    file(SHA256 "${sweep_a}" sweep_hash_a)
+    file(SHA256 "${sweep_b}" sweep_hash_b)
+    if(NOT sweep_hash_a STREQUAL sweep_hash_b)
+        message(FATAL_ERROR "Sweep present differs across processes: ${sweep_name_a}")
     endif()
 endforeach()
 foreach(evidence height_hex_profiles.csv height_hex_profile_summary.csv height_hex_profiles.svg
@@ -114,7 +141,8 @@ The <a href='run-1/height_hex_profiles.svg'>height/hex boundary charts</a> measu
 <a href='run-1/height_hex_profiles.csv'>Exact breakpoints and triangle provenance</a>,
 <a href='run-1/height_hex_profile_summary.csv'>gap/overlap lengths</a> and
 <a href='run-1/height_hex_profile_sources.csv'>local mesh-version stamps</a> expose the remaining transition inputs.
-The disk-save demo remains height-only. All 224 captures repeat exactly within/across two processes.
+The disk-save demo remains height-only. All 224 checkpoint captures repeat exactly within/across two processes.
+Each corner-sweep world-update tick also presents one <code>sweep_tick_*.bmp</code>. Those presents are hashed across processes. They use the view already installed for that tick and are not a hard realtime deadline.
 CPU mesh digests match across processes and on mixed home/return.</p>
 <p>The <a href='run-1/height_hex_walls.svg'>isolated connecting-wall diagram</a> draws generated triangles,
 with <a href='run-1/height_hex_wall_triangles.csv'>float geometry and span ownership</a> and
@@ -156,11 +184,17 @@ Plain retirement stages resident terrain before removing the corner. The
 <a href='run-1/corner_away_plain.bmp'>away terrain</a> becomes the displayed/query view only after commit.
 <a href='run-1/corner_return_pending.bmp'>Return staging</a> retains that view until the home corner is ready,
 then <a href='run-1/corner_returned.bmp'>home restoration</a> is exact. Windows are caller-selected and sources settle
-at route endpoints; this is not residency-derived window selection or continuous-motion coverage acceptance.</p>
+at route endpoints; this is not residency-derived window selection. One presented frame is hashed for each world-update tick of that sweep.</p>
 <figure><img src='run-1/height_hex_profiles.svg' alt='Measured height and hex boundary profiles; transitions remain open'></figure>
 <figure><img src='run-1/height_hex_walls.svg' alt='Isolated connecting wall triangles, not published terrain'></figure><main>")
 foreach(checkpoint IN LISTS checkpoints)
     file(APPEND "${root}/index.html" "<figure><a href='run-1/${checkpoint}.bmp'><img src='run-1/${checkpoint}.bmp' alt='${checkpoint}'></a><figcaption>${checkpoint}</figcaption></figure>\n")
+endforeach()
+file(GLOB sweep_gallery "${root}/run-1/sweep_tick_*.bmp")
+list(SORT sweep_gallery)
+foreach(frame IN LISTS sweep_gallery)
+    get_filename_component(sweep_leaf "${frame}" NAME)
+    file(APPEND "${root}/index.html" "<figure><a href='run-1/${sweep_leaf}'><img src='run-1/${sweep_leaf}' alt='${sweep_leaf}'></a><figcaption>${sweep_leaf}</figcaption></figure>\n")
 endforeach()
 file(APPEND "${root}/index.html" "</main></html>")
 message(STATUS "Policy diagnostics passed: 224 repeatable captures; corner retirement/retargeting, incremental upload/edit/restoration and GPU lifecycle. General transitions remain OPEN.")

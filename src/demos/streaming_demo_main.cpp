@@ -549,6 +549,9 @@ public:
         config.chunkCapacityPerPolicy = 25;
         config.regionalSurfaceOwnership = true;
         config.regionalHexCutWalls = cutWalls;
+        // Corner-sweep residency ticks use the per-frame work caps. Interactive
+        // pacing keeps the wall-clock cooperative budget. Not a hard deadline.
+        if (cutWalls) config.deterministicAdmission = true;
         world_ = std::make_unique<world::WorldStreamer>(config);
         demo::setStreamingMixedRegions(world_->regions());
         expectedResidents_ = 22; // 14 height, four voxel, four intersecting hex bounds.
@@ -591,6 +594,7 @@ public:
         probes.flush();
         require(probes.good(), "Cannot write regional surface evidence");
         if (cutWalls) {
+            recordVoxelHexColumn();
             auditHeightHexProfiles();
             std::ofstream walls(output_ / "capped_wall_probes.csv");
             walls.precision(17);
@@ -613,6 +617,129 @@ public:
             require(walls.good(), "Cannot write cut wall evidence");
             verifyCornerPublication();
         }
+    }
+
+    void recordVoxelHexColumn() {
+        const auto meshes = world_->residentTerrainFootprint(world::PolicyKind::Voxel, world::PolicyKind::Hex);
+        require(meshes.has_value(), "Resident world has no voxel/hex mesh bounds");
+        const auto window = world::policyPairCompositionWindow(
+            world_->regions(), *meshes, world::PolicyKind::Voxel, world::PolicyKind::Hex);
+        const auto edges = world::discoverTerrainBoundaries(
+            world_->regions(), window, {}, std::pair{world::PolicyKind::Voxel, world::PolicyKind::Hex});
+        require(edges.hasValue() && !edges.value().empty(), "Voxel/Hex window did not return the resident edge");
+        require(world::discoverTerrainBoundaries(world_->regions(), window, {},
+                    std::pair{world::PolicyKind::Height, world::PolicyKind::Hex}).error() ==
+                world::BoundaryDiscoveryError::UnsupportedTransition,
+            "Height/Hex scope omitted the voxel/hex edge");
+        const auto full = world_->residentTerrainFootprint();
+        require(full.has_value(), "Resident world has no footprint");
+        const auto unionEdges = world::discoverTerrainBoundaries(world_->regions(), *full);
+        require(unionEdges.hasValue() && !unionEdges.value().empty(),
+            "Full resident union dropped an edge");
+        std::ofstream csv(output_ / "voxel_hex_column.csv");
+        csv.precision(17);
+        csv << "record,axis,plane,begin,end,negative,positive,sample_x,sample_z,sample_y,status\n";
+        const auto solidStatus = [](const f4::Result<world::TerrainSolidSample, world::StreamingSolidError>& sample) {
+            if (!sample.hasValue()) {
+                switch (sample.error()) {
+                case world::StreamingSolidError::AmbiguousSurface: return std::string("AmbiguousSurface");
+                case world::StreamingSolidError::NoPublishedSurface: return std::string("NoPublishedSurface");
+                case world::StreamingSolidError::InvalidData: return std::string("InvalidData");
+                case world::StreamingSolidError::DiscontinuousHeight: return std::string("DiscontinuousHeight");
+                case world::StreamingSolidError::NonmanifoldCorner: return std::string("NonmanifoldCorner");
+                case world::StreamingSolidError::UnsupportedVoxel: return std::string("UnsupportedVoxel");
+                default: return std::string("error");
+                }
+            }
+            if (!sample.value().solid) return std::string("empty");
+            return std::string("solid,") + std::to_string(static_cast<unsigned>(sample.value().policy)) + ',' +
+                   std::to_string(sample.value().sector) + ',' + (sample.value().wallBand ? "1" : "0");
+        };
+        const auto writeColumn = [&](const char* record, const world::StreamingBoundaryRequest& edge,
+                                      double sampleX, double sampleZ, double sampleY) {
+            const auto sample = world_->classifyPublishedSolid(sampleX, sampleY, sampleZ);
+            require(sample.hasValue() || sample.error() != world::StreamingSolidError::UnsupportedVoxel,
+                "Plane column stayed a blanket UnsupportedVoxel");
+            csv << record << ',' << static_cast<unsigned>(edge.line.axis) << ',' << edge.line.plane << ','
+                << edge.line.begin << ',' << edge.line.end << ','
+                << static_cast<unsigned>(edge.negative) << ',' << static_cast<unsigned>(edge.positive) << ','
+                << sampleX << ',' << sampleZ << ',' << sampleY << ',' << solidStatus(sample) << '\n';
+            return sample;
+        };
+        bool sawPlane = false;
+        for (const auto& edge : edges.value()) {
+            const bool voxelHex = (edge.negative == world::PolicyKind::Voxel && edge.positive == world::PolicyKind::Hex) ||
+                                  (edge.negative == world::PolicyKind::Hex && edge.positive == world::PolicyKind::Voxel);
+            require(voxelHex, "Voxel/Hex window returned a different pair");
+            const bool contains = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? window.minX < edge.line.plane && window.maxX > edge.line.plane
+                : window.minZ < edge.line.plane && window.maxZ > edge.line.plane;
+            require(contains, "Voxel/Hex edge fell outside its window");
+            if (edge.line.axis == world::TerrainBoundaryAxis::X && edge.line.plane == 0.0) sawPlane = true;
+            const double mid = (edge.line.begin + edge.line.end) * 0.5;
+            const auto at = [&](double tangent) {
+                return edge.line.axis == world::TerrainBoundaryAxis::X
+                    ? std::pair{edge.line.plane, tangent} : std::pair{tangent, edge.line.plane};
+            };
+            const auto midpoint = at(mid);
+            const auto interior = at(mid + 0.5);
+            const auto below = writeColumn("edge", edge, midpoint.first, midpoint.second, -8.0);
+            const std::uint8_t sector = edge.positive == world::PolicyKind::Hex ? 1 : 0;
+            require(below.hasValue() && below.value().solid && below.value().policy == world::PolicyKind::Hex &&
+                    below.value().sector == sector && !below.value().wallBand,
+                "Voxel/Hex column on the hex floor is not the hex side");
+            if (edge.line.axis == world::TerrainBoundaryAxis::X && edge.line.plane == 0.0) {
+                const auto low = writeColumn("edge_face", edge, interior.first, interior.second, 1.0);
+                const bool incident = low.hasValue() && low.value().solid &&
+                    (low.value().policy == world::PolicyKind::Voxel || low.value().policy == world::PolicyKind::Hex);
+                require(incident, "Voxel/Hex face column has no incident owner");
+                const auto sky = writeColumn("edge_sky", edge, interior.first, interior.second, 80.0);
+                require(sky.hasValue() && !sky.value().solid, "Voxel/Hex sky invented a solid owner");
+            }
+        }
+        require(sawPlane, "Resident voxel/hex edge at x=0 was not inside the window");
+        bool sawHeightVoxel = false;
+        for (const auto& edge : unionEdges.value()) {
+            const bool heightVoxel = (edge.negative == world::PolicyKind::Height && edge.positive == world::PolicyKind::Voxel) ||
+                                     (edge.negative == world::PolicyKind::Voxel && edge.positive == world::PolicyKind::Height);
+            if (!heightVoxel) continue;
+            const bool contains = edge.line.axis == world::TerrainBoundaryAxis::X
+                ? full->minX < edge.line.plane && full->maxX > edge.line.plane
+                : full->minZ < edge.line.plane && full->maxZ > edge.line.plane;
+            require(contains, "Height/Voxel edge fell outside the resident union");
+            sawHeightVoxel = true;
+            const double mid = (edge.line.begin + edge.line.end) * 0.5;
+            const double face = mid + 0.5;
+            const auto at = [&](double tangent) {
+                return edge.line.axis == world::TerrainBoundaryAxis::X
+                    ? std::pair{edge.line.plane, tangent} : std::pair{tangent, edge.line.plane};
+            };
+            const auto midpoint = at(mid);
+            const auto interior = at(face);
+            const auto below = writeColumn("height_voxel", edge, midpoint.first, midpoint.second, -8.0);
+            const std::uint8_t sector = edge.negative == world::PolicyKind::Height ? 0 : 1;
+            if (below.hasValue()) {
+                require(below.value().solid && below.value().policy == world::PolicyKind::Height &&
+                        below.value().sector == sector && !below.value().wallBand,
+                    "Height/Voxel column below the voxel floor is not the height side");
+            } else {
+                require(below.error() == world::StreamingSolidError::AmbiguousSurface,
+                    "Height/Voxel corner refused without naming the disagreeing faces");
+            }
+            const auto belowFace = writeColumn("height_voxel_below", edge, interior.first, interior.second, -8.0);
+            require(belowFace.hasValue() && belowFace.value().solid && belowFace.value().policy == world::PolicyKind::Height &&
+                    belowFace.value().sector == sector && !belowFace.value().wallBand,
+                "Height/Voxel face below the voxel floor is not the height side");
+            const auto low = writeColumn("height_voxel_face", edge, interior.first, interior.second, 1.0);
+            const bool incident = low.hasValue() && low.value().solid &&
+                (low.value().policy == world::PolicyKind::Height || low.value().policy == world::PolicyKind::Voxel);
+            require(incident, "Height/Voxel face column has no incident owner");
+            const auto sky = writeColumn("height_voxel_sky", edge, interior.first, interior.second, 80.0);
+            require(sky.hasValue() && !sky.value().solid, "Height/Voxel sky invented a solid owner");
+        }
+        require(sawHeightVoxel, "Resident union did not return a Height/Voxel edge");
+        csv.flush();
+        require(csv.good(), "Cannot write voxel/hex column evidence");
     }
 
     void verifyCornerPublication() {
@@ -652,7 +779,7 @@ public:
             for (int t = 4; t < 64; t += 4) {
                 const math::Vec3 eye = axis == 0 ? math::Vec3{62, 10, float(t)} : math::Vec3{float(t), 10, 62};
                 const math::Vec3 direction = axis == 0 ? math::Vec3{1, 0, 0} : math::Vec3{0, 0, 1};
-                const auto hit = view_->raycastDisplayedTerrain(eye, direction, 4, true);
+                const auto hit = view_->raycastDisplayedTerrain(*world_, eye, direction, 4, true);
                 require(hit && hit->boundary == axis && std::abs(hit->source.surface.distance - 2) < 0.00001,
                         "Displayed transition disagrees with the installed query geometry");
                 probes << axis << ',' << t << ',' << hit->composedTriangle << ',' << hit->source.surface.triangleIndex << ','
@@ -748,7 +875,7 @@ public:
         verifyReuse("edited");
         const auto after = checkpoint(camera, "corner_live_edited");
         require(different(before, after) > 100, "Live corner edit did not change the displayed geometry");
-        const auto hit = view_->raycastDisplayedTerrain({56, 100, 64}, {0, -1, 0}, 200);
+        const auto hit = view_->raycastDisplayedTerrain(*world_, {56, 100, 64}, {0, -1, 0}, 200);
         require(hit && std::abs(hit->source.surface.position.y - 45) < 0.00001,
             "Live corner query did not follow the displayed edit");
         require(world_->edit(key, index, original), "Cannot restore live corner edit");
@@ -766,11 +893,77 @@ public:
         demo::FreeCamera camera, const Bytes& original) {
         std::ofstream movement(output_ / "corner_motion_residency.csv");
         require(bool(movement), "Cannot write continuous corner residency evidence");
-        movement << "direction,step,anchor_x,anchor_z,residents,accepted_current,job_state\n";
-        const auto settleSources = [&](math::Vec3 anchor) {
+        movement << "direction,step,anchor_x,anchor_z,residents,accepted_current,job_state,"
+                    "probe_x,probe_z,probe_y,probe_status,probe_policy,probe_solid,record,tick\n";
+        require(world_->deterministicAdmission(),
+            "Corner residency ticks require fixed work-unit admission");
+        const auto probeText = [&](double x, double y, double z) {
+            const auto sample = world_->classifyPublishedSolid(x, y, z);
+            if (!sample.hasValue()) {
+                return std::to_string(static_cast<unsigned>(sample.error())) + ",,";
+            }
+            return std::string("ok,") + std::to_string(static_cast<unsigned>(sample.value().policy)) + "," +
+                (sample.value().solid ? "1" : "0");
+        };
+        std::optional<std::pair<double, double>> hexColumn;
+        for (int z = 4; z < 60 && !hexColumn; z += 8) {
+            for (int x = 4; x < 60; x += 8) {
+                const auto sample = world_->classifyPublishedSolid(x + 0.2, -8.0, z + 0.2);
+                if (sample.hasValue() && sample.value().solid && sample.value().policy == world::PolicyKind::Hex) {
+                    hexColumn = {x + 0.2, z + 0.2};
+                    break;
+                }
+            }
+        }
+        require(hexColumn.has_value(), "Home travel has no stable published hex column");
+        int stableHex = 0, droppedHex = 0, tickRows = 0, sweepPresents = 0, unadoptedEdit = 0, unadoptedRegion = 0;
+        bool hexDropped = false;
+        const auto presentTick = [&](double ax, double az) {
+            auto eye = homeCamera();
+            eye.position = {static_cast<float>(ax) + 24.f, 80.f, static_cast<float>(az) + 24.f};
+            eye.pitch = std::atan2(70.f, std::sqrt(24.f * 24.f * 2.f));
+            eye.yaw = std::atan2(24.f, 24.f);
+            char name[32];
+            std::snprintf(name, sizeof(name), "sweep_tick_%04d", sweepPresents);
+            presentSweepFrame(eye, name);
+            ++sweepPresents;
+        };
+        const auto noteHexColumn = [&](const char* direction, bool anchorRow) {
+            const auto sample = world_->classifyPublishedSolid(hexColumn->first, -8.0, hexColumn->second);
+            const bool outboundTravel = std::string(direction) == "outbound" || std::string(direction) == "away";
+            const bool countAnchor = anchorRow &&
+                (std::string(direction) == "outbound" || std::string(direction) == "home");
+            if (!sample.hasValue()) {
+                require(sample.error() == world::StreamingSolidError::NoPublishedSurface,
+                    "Travel tick lost the hex column without unloading its published surface");
+                if (outboundTravel) hexDropped = true;
+                if (countAnchor) ++droppedHex;
+            } else {
+                require(sample.value().solid && sample.value().policy == world::PolicyKind::Hex,
+                    "Resident hex column changed owner during a travel tick");
+                if (outboundTravel) require(!hexDropped, "Outbound travel reloaded a column after unloading it");
+                if (countAnchor) ++stableHex;
+            }
+            return probeText(hexColumn->first, -8.0, hexColumn->second);
+        };
+        const auto recordHexTick = [&](const char* direction, unsigned step, unsigned tick, double ax, double az) {
+            presentTick(ax, az);
+            const auto probe = noteHexColumn(direction, false);
+            movement << direction << ',' << step << ',' << ax << ',' << az << ','
+                << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
+                << static_cast<unsigned>(job.status().state) << ','
+                << hexColumn->first << ',' << hexColumn->second << ",-8," << probe
+                << ",tick," << tick << '\n';
+            ++tickRows;
+        };
+        movement << "home,0,0,0," << world_->residentCount() << ','
+            << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ",,"
+            << hexColumn->first << ',' << hexColumn->second << ",-8," << noteHexColumn("home", true) << ",anchor,\n";
+        const auto settleSources = [&](math::Vec3 anchor, const char* direction, unsigned step, unsigned& tick) {
             diagnosticAnchor_ = anchor;
-            for (unsigned tick = 0; tick < 128; ++tick) {
+            for (unsigned n = 0; n < 128; ++n) {
                 world_->update(anchor); world_->waitForIdle();
+                recordHexTick(direction, step, tick++, anchor.x, anchor.z);
                 if (!world_->hasPendingWork() &&
                     world_->residentTerrainFootprint(world::PolicyKind::Height, world::PolicyKind::Hex).has_value()) return;
             }
@@ -800,7 +993,9 @@ public:
                 }
                 pool.waitIdle();
                 world_->waitForIdle();
-                settleSources(anchor);
+                unsigned tick = 0;
+                recordHexTick(direction, step, tick++, anchor.x, anchor.z);
+                settleSources(anchor, direction, step, tick);
                 const auto settledDiscovery = job.requestResidentWindow(*world_, world::PolicyKind::Height, world::PolicyKind::Hex);
                 require(!settledDiscovery, "Settled continuous boundary discovery failed");
                 if (job.status().state != world::BoundaryCompositionState::NoBoundaries) {
@@ -809,11 +1004,16 @@ public:
                 }
                 movement << direction << ',' << step << ',' << anchor.x << ',' << anchor.z << ','
                     << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
-                    << static_cast<unsigned>(job.status().state) << '\n';
+                    << static_cast<unsigned>(job.status().state) << ','
+                    << hexColumn->first << ',' << hexColumn->second << ",-8," << noteHexColumn(direction, true)
+                    << ",anchor,\n";
             }
         };
         walkSources({}, {512, 0, 512}, "outbound");
-        settleSources({512, 0, 512});
+        require(stableHex >= 2, "Travel did not keep a resident hex column across camera steps");
+        require(droppedHex >= 1, "Travel did not drop the hex column when its chunk unloaded");
+        unsigned awayTick = 0;
+        settleSources({512, 0, 512}, "away", 8, awayTick);
         require(!job.requestResidentWindow(*world_, world::PolicyKind::Height, world::PolicyKind::Hex),
             "Away resident boundary discovery failed");
         bool departureStaged = false;
@@ -828,11 +1028,113 @@ public:
         converge(false);
         auto away = homeCamera(); away.position.x += 512; away.position.z += 512;
         const auto plain = checkpoint(away, "corner_away_plain");
-        const auto hit = view_->raycastDisplayedTerrain({544, 100, 544}, {0, -1, 0}, 200);
+        const auto hit = view_->raycastDisplayedTerrain(*world_, {544, 100, 544}, {0, -1, 0}, 200);
         require(hit && !hit->boundary && hit->source.key.policy == world::PolicyKind::Height,
             "Departed view did not publish plain height query geometry");
+        const math::Vec3 awayAnchor{512, 0, 512};
+        const world::StreamingChunkKey awayKey{world::PolicyKind::Height, {8, 0, 8}};
+        require(world_->chunk(awayKey).has_value(), "Away travel is missing the height column chunk");
+        const auto readHeight = [&](std::uint32_t index) {
+            const auto snapshot = world_->snapshot(awayKey);
+            require(snapshot.has_value(), "Away height column is not readable");
+            const auto* tile = std::get_if<world::HeightTile>(&snapshot->base);
+            require(tile != nullptr, "Away column chunk is not a height tile");
+            auto value = world::CellValue::heightValue(tile->samples[index]);
+            for (const auto& delta : snapshot->deltas) if (delta.index == index) value = delta.value;
+            return value;
+        };
+        const std::uint32_t quad[]{world::heightSampleIndex(8, 8), world::heightSampleIndex(9, 8),
+                                   world::heightSampleIndex(8, 9), world::heightSampleIndex(9, 9)};
+        world::CellValue originalSamples[4];
+        for (int i = 0; i < 4; ++i) originalSamples[i] = readHeight(quad[i]);
+        const auto above = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(above.hasValue() && !above.value().solid && above.value().policy == world::PolicyKind::Height,
+            "Away height column was not an empty sample above its published top");
+        for (int i = 0; i < 4; ++i) {
+            auto raised = originalSamples[i];
+            raised.height.height = 400.f;
+            require(world_->edit(awayKey, quad[i], raised), "Cannot edit the away height column");
+        }
+        const auto retained = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(retained.hasValue() && retained.value().solid == above.value().solid &&
+                retained.value().policy == above.value().policy,
+            "Height edit changed the published column before republication");
+        ++unadoptedEdit;
+        movement << "edit,retained,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,200," << probeText(520.2, 200.0, 520.7) << ",held,\n";
+        // 0 raised height, 1 restored height, 2 hex owner, 3 height owner.
+        const auto holdsPrevious = [](const auto& sample, int gate) {
+            const bool height = sample.hasValue() && sample.value().policy == world::PolicyKind::Height;
+            const bool hex = sample.hasValue() && sample.value().policy == world::PolicyKind::Hex;
+            const bool heightSolid = height && sample.value().solid;
+            if (gate == 0) return !heightSolid;
+            if (gate == 1) return !sample.hasValue() || heightSolid;
+            if (gate == 2) return !hex;
+            return !height;
+        };
+        const auto waitColumn = [&](double x, double y, double z, world::PolicyKind policy, bool solid,
+                                     const char* failure, const char* direction, int gate) {
+            for (unsigned tick = 0; tick < 128; ++tick) {
+                world_->update(awayAnchor); world_->waitForIdle();
+                const auto sample = world_->classifyPublishedSolid(x, y, z);
+                const bool published = sample.hasValue() && sample.value().policy == policy && sample.value().solid == solid;
+                if (!published) {
+                    require(holdsPrevious(sample, gate),
+                        "In-flight edit or region change adopted the new owner before republication");
+                    if (std::string(direction) == "edit") ++unadoptedEdit;
+                    else ++unadoptedRegion;
+                }
+                presentTick(512.0, 512.0);
+                movement << direction << ',' << (published ? "published" : "inflight") << ",512,512,"
+                    << world_->residentCount() << ',' << (view_->acceptedSurfaceCurrent(*world_) ? 1 : 0) << ','
+                    << static_cast<unsigned>(job.status().state) << ','
+                    << x << ',' << z << ',' << y << ',' << probeText(x, y, z)
+                    << ",tick," << tick << '\n';
+                ++tickRows;
+                if (!world_->hasPendingWork() && published) return;
+            }
+            throw std::runtime_error(failure);
+        };
+        waitColumn(520.2, 200.0, 520.7, world::PolicyKind::Height, true,
+            "Republished height edit did not raise the published column", "edit", 0);
+        movement << "edit,republished,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,200," << probeText(520.2, 200.0, 520.7) << ",anchor,\n";
+        for (int i = 0; i < 4; ++i) require(world_->edit(awayKey, quad[i], originalSamples[i]), "Cannot restore the away height edit");
+        const auto stillRaised = world_->classifyPublishedSolid(520.2, 200.0, 520.7);
+        require(stillRaised.hasValue() && stillRaised.value().solid,
+            "Restoring the height edit changed the published column before republication");
+        ++unadoptedEdit;
+        movement << "edit,restore,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,200," << probeText(520.2, 200.0, 520.7) << ",held,\n";
+        waitColumn(520.2, 200.0, 520.7, world::PolicyKind::Height, false,
+            "Restoring the height edit did not return the published column", "edit", 1);
+        world_->regions().set({8, 8}, world::PolicyKind::Hex);
+        const auto transitioning = world_->classifyPublishedSolid(520.2, -1000.0, 520.7);
+        require(!(transitioning.hasValue() && transitioning.value().policy == world::PolicyKind::Height),
+            "Region change kept the previous height owner");
+        ++unadoptedRegion;
+        movement << "region,transition,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-1000," << probeText(520.2, -1000.0, 520.7) << ",held,\n";
+        waitColumn(520.2, -8.0, 520.7, world::PolicyKind::Hex, true,
+            "Region change did not publish the new hex owner", "region", 2);
+        const auto belowFloor = world_->classifyPublishedSolid(520.2, -9.0, 520.7);
+        require(belowFloor.hasValue() && !belowFloor.value().solid, "Changed hex column stayed solid below its floor");
+        movement << "region,settled,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-8," << probeText(520.2, -8.0, 520.7) << ",anchor,\n";
+        require(world_->regions().erase({8, 8}), "Cannot restore the away height region");
+        const auto reverting = world_->classifyPublishedSolid(520.2, -1000.0, 520.7);
+        require(!(reverting.hasValue() && reverting.value().policy == world::PolicyKind::Hex),
+            "Restoring the region kept the hex owner on the old mesh");
+        ++unadoptedRegion;
+        movement << "region,reverting,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-1000," << probeText(520.2, -1000.0, 520.7) << ",held,\n";
+        waitColumn(520.2, -1000.0, 520.7, world::PolicyKind::Height, true,
+            "Restored region did not publish the height column again", "region", 3);
+        movement << "region,restored,512,512," << world_->residentCount() << ",,,"
+            << "520.2,520.7,-1000," << probeText(520.2, -1000.0, 520.7) << ",anchor,\n";
         walkSources({512, 0, 512}, {}, "inbound");
-        settleSources({});
+        unsigned homeTick = 0;
+        settleSources({}, "inbound", 8, homeTick);
         require(!job.requestResidentWindow(*world_, world::PolicyKind::Height, world::PolicyKind::Hex),
                 "Home resident boundary discovery failed");
         for (unsigned tick = 0; tick < 128 && !view_->boundaryUploadPending(); ++tick) {
@@ -845,6 +1147,10 @@ public:
         converge(true);
         require(different(original, checkpoint(camera, "corner_returned")) == 0,
             "Retargeted home corner failed exact image restoration");
+        require(tickRows > 16, "Corner sweep did not record a world-update tick between the settled anchors");
+        require(sweepPresents == tickRows, "Sweep presents diverged from world-update ticks");
+        require(unadoptedEdit >= 1, "In-flight height edit was not recorded before republication");
+        require(unadoptedRegion >= 1, "In-flight region change was not recorded before republication");
         movement.flush(); require(movement.good(), "Cannot finish continuous corner residency evidence");
     }
 
@@ -1518,6 +1824,22 @@ private:
         commands.endRenderPass(); commands.end();
         require(window_.device()->submit(commands) == gfx::GfxError::None, "HUD submit failed");
         hudUs_ = micros(Clock::now() - beforeHud);
+    }
+
+    // One presented frame of the view already installed for this sweep tick.
+    // Does not advance world admission or the wall-clock upload budget.
+    void presentSweepFrame(const demo::FreeCamera& camera, const char* name) {
+        draw(camera, true);
+        (void)captureImage(name);
+        window_.window()->swap();
+        require(world_->stats().failedCompletions == 0, "Streaming worker failure");
+        const auto gpu = window_.device()->stats();
+        require(gpu.pipelineCount == preparedPipelineCount_,
+                "Terrain created an unprepared pipeline during verification");
+        require(gpu.shaderFailed == 0 && gpu.shaderWarnings == 0, "Shader diagnostics are not clean");
+        require(glGetError() == GL_NO_ERROR, "OpenGL error during streaming frame");
+        ++frames_;
+        window_.device()->resetFrameStats();
     }
 
     auto captureImage(const char* name) -> Bytes {

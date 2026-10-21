@@ -41,6 +41,9 @@ struct TerrainBoundaryRequest {
     TerrainBoundaryLine line;
     std::span<const std::size_t> negative, positive; // Indices in the shared source table.
     std::uint16_t negativeMaterial = 0, positiveMaterial = 0;
+    // Copy published sources and do not trim or emit walls. A retained boundary
+    // that shares an endpoint with any other boundary is JunctionRejected.
+    bool retainSources = false;
 };
 struct BoundaryCompositionLimits {
     BoundaryReplacementLimits mesh;
@@ -66,6 +69,8 @@ struct TerrainBoundaryComposition {
 // Alternating solid/empty sectors (nonmanifold vertical edges) are rejected.
 // Generated vertical wall edges are split at all incident sector heights. This
 // validates endpoint column limits, not a general volumetric neighborhood.
+// retainSources copies that boundary's published meshes and emits no wall.
+// A retained boundary that shares an endpoint is JunctionRejected first.
 // Processes lines in canonical axis/plane/begin/end order; preserves earlier cuts
 // and original source provenance, emits each modified source once, then walls.
 // Material ranges never cross source identities. Output is zero-origin; callers

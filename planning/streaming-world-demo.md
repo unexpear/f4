@@ -276,8 +276,11 @@ direct shared validation instead of scratch generation/serialization, and
 reload GPU cleanup is bounded across frames. Next is stress coverage beyond
 25 height chunks to voxel/hex and live regional changes, with further profiling
 of non-preemptible overruns.
-The earlier 50,000-region copy-on-write edit spike remains open. Do not call
-this a hard 2 ms frame budget, a full game, or complete general-world persistence.
+The interactive demo still uses the cooperative deadline. A separate opt-in
+clock stops the next streaming unit, and `RegionMap::setBudgeted` stops the
+next entry of a shared-map copy. Admitted work is kept when that clock expires.
+`set` remains an eager full copy. Do not call this a hard 2 ms frame budget,
+a full game, or complete general-world persistence.
 
 ## API Research
 

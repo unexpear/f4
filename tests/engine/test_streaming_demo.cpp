@@ -401,6 +401,64 @@ TEST_CASE("Streaming demo: invalid overlays do not partially edit the live world
     CHECK(streamer.sampleHeightTerrain(32.f, 32.f)->height == 38.f);
 }
 
+TEST_CASE("Streaming demo: displayed raycast reads the accepted-view slot") {
+    gfx::NullDevice device;
+    auto config = demo::streamingDemoConfig();
+    config.horizontalRadius = 1;
+    world::WorldStreamer streamer(config);
+    REQUIRE(settle(streamer, {}, 9));
+    demo::StreamingDemoView view(device);
+    REQUIRE(view.init());
+    const math::Vec3 probe{32, 100, 32};
+    const math::Vec3 down{0, -1, 0};
+    std::optional<world::StreamingBoundaryHit> partial;
+    for (unsigned step = 0; step < 9 && !partial; ++step) {
+        REQUIRE(view.sync(streamer, 1));
+        partial = view.raycastDisplayedTerrain(streamer, probe, down, 200);
+    }
+    REQUIRE(partial);
+    CHECK(view.residentCount() < 9);
+    const auto partialSlot = streamer.raycastAcceptedTerrain(probe, down, 200);
+    REQUIRE(partialSlot);
+    CHECK(partial->source.key == partialSlot->source.key);
+    CHECK(partial->source.meshVersion == partialSlot->source.meshVersion);
+    CHECK(partial->source.surface.distance == partialSlot->source.surface.distance);
+    REQUIRE(streamer.acceptedSurfaceView());
+    CHECK(streamer.acceptedSurfaceView()->current(streamer));
+    const auto partialVersion = partial->source.meshVersion;
+    const auto drawn = view.residentCount();
+
+    // The remaining meshed chunks are ready, but the edited resident is not.
+    // Sync keeps the drawn package instead of publishing a newer picture.
+    REQUIRE(demo::applyStreamingDemoEdits(streamer, demo::streamingDemoPatch()));
+    const auto bytesBeforeHold = device.stats().bufferBytes;
+    REQUIRE(view.sync(streamer, 25));
+    CHECK(view.uploadStats().uploaded == 0);
+    CHECK(view.uploadStats().retired == 0);
+    CHECK(view.residentCount() == drawn);
+    CHECK(device.stats().bufferBytes == bytesBeforeHold);
+    const auto held = view.raycastDisplayedTerrain(streamer, probe, down, 200);
+    const auto heldSlot = streamer.raycastAcceptedTerrain(probe, down, 200);
+    REQUIRE(held);
+    REQUIRE(heldSlot);
+    CHECK(held->source.meshVersion == partialVersion);
+    CHECK(heldSlot->source.meshVersion == partialVersion);
+    CHECK(held->source.key == heldSlot->source.key);
+    CHECK(held->source.surface.distance == heldSlot->source.surface.distance);
+
+    REQUIRE(settle(streamer, {}, 9));
+    REQUIRE(view.sync(streamer, 25));
+    REQUIRE(view.caughtUp(streamer));
+    const auto published = view.raycastDisplayedTerrain(streamer, probe, down, 200);
+    const auto publishedSlot = streamer.raycastAcceptedTerrain(probe, down, 200);
+    REQUIRE(published);
+    REQUIRE(publishedSlot);
+    CHECK(published->source.key == publishedSlot->source.key);
+    CHECK(published->source.meshVersion == publishedSlot->source.meshVersion);
+    const bool republished = published->source.meshVersion != partialVersion;
+    CHECK(republished);
+}
+
 TEST_CASE("Streaming demo: upload caps, dirty-version retention, and GPU retirement") {
     gfx::NullDevice device;
     const auto baseline = device.stats();
@@ -471,6 +529,7 @@ TEST_CASE("Streaming demo: shared deadline bounds uploads without starving progr
         auto config = demo::streamingDemoConfig();
         CHECK(config.frameBudget > std::chrono::microseconds::zero());
         CHECK(config.frameBudget + demo::kStreamingDemoUploadReserve == demo::kStreamingDemoFrameBudget);
+        CHECK_FALSE(config.deterministicAdmission);
         config.horizontalRadius = 1;
         world::WorldStreamer streamer(config);
         REQUIRE(settle(streamer, {}, 9));
@@ -608,10 +667,10 @@ TEST_CASE("Streaming demo: reload detaches drawing immediately and bounds GPU re
         REQUIRE(view.render(target.value(), camera, 1.f) == gfx::GfxError::None);
         CHECK(view.renderStats().draws > 0);
         const auto beforeDetach = device.stats().bufferBytes;
-        REQUIRE(view.raycastDisplayedTerrain({32, 100, 32}, {0, -1, 0}, 200));
+        REQUIRE(view.raycastDisplayedTerrain(world, {32, 100, 32}, {0, -1, 0}, 200));
         REQUIRE(world.raycastAcceptedTerrain({32, 100, 32}, {0, -1, 0}, 200));
         REQUIRE(view.beginReload(world));
-        CHECK_FALSE(view.raycastDisplayedTerrain({32, 100, 32}, {0, -1, 0}, 200));
+        CHECK_FALSE(view.raycastDisplayedTerrain(world, {32, 100, 32}, {0, -1, 0}, 200));
         CHECK_FALSE(world.raycastAcceptedTerrain({32, 100, 32}, {0, -1, 0}, 200));
         CHECK_FALSE(view.acceptedSurfaceCurrent(world));
         CHECK(view.residentCount() == 0);
@@ -828,7 +887,7 @@ TEST_CASE("Streaming demo: composed corner dependencies and GPU/query installati
             c = mesh->mesh.vertices[mesh->mesh.indices[wall * 3 + 2]];
         const auto point = (a.position + b.position + c.position) / 3.f;
         const auto eye = point + a.normal * 0.25f;
-        const auto old = view.raycastDisplayedTerrain(eye, -a.normal, 0.5f, true);
+        const auto old = view.raycastDisplayedTerrain(streamer, eye, -a.normal, 0.5f, true);
         for (const std::size_t successfulBuffers : {0u, 1u, 2u, 3u}) {
             // Two canonical buffers/policy: count 2 fails after the first complete mesh is staged.
             device.failBufferCreationAfter(successfulBuffers);
@@ -836,13 +895,13 @@ TEST_CASE("Streaming demo: composed corner dependencies and GPU/query installati
             CHECK_FALSE(view.hasBoundaryComposition()); CHECK(view.caughtUp(streamer));
             CHECK(device.stats().bufferCount == ordinary.bufferCount);
             CHECK(device.stats().bufferBytes == ordinary.bufferBytes);
-            const auto retained = view.raycastDisplayedTerrain(eye, -a.normal, 0.5f, true);
+            const auto retained = view.raycastDisplayedTerrain(streamer, eye, -a.normal, 0.5f, true);
             CHECK(retained.has_value() == old.has_value());
             if (old && retained) CHECK(retained->source.surface.distance == old->source.surface.distance);
         }
         REQUIRE(view.installBoundaryComposition(streamer, *packet)); CHECK(view.hasBoundaryComposition());
         CHECK(view.acceptedSurfaceCurrent(streamer));
-        const auto installed = view.raycastDisplayedTerrain(eye, -a.normal, 0.5f, true);
+        const auto installed = view.raycastDisplayedTerrain(streamer, eye, -a.normal, 0.5f, true);
         REQUIRE(installed); CHECK(installed->boundary.has_value());
         CHECK(installed->source.surface.distance == doctest::Approx(0.25));
         CHECK(installed->source.surface.triangleIndex == mesh->triangles[installed->composedTriangle].sourceTriangle);
@@ -864,7 +923,7 @@ TEST_CASE("Streaming demo: composed corner dependencies and GPU/query installati
         const auto rebuilt = world::StreamingBoundaryComposition::build(freshUnion);
         REQUIRE(rebuilt.hasValue()); CHECK(streamer.boundaryCurrent(rebuilt.value()));
         CHECK(device.stats().bufferBytes == acceptedBytes);
-        const auto frozen = view.raycastDisplayedTerrain(eye, -a.normal, 0.5f, true); REQUIRE(frozen);
+        const auto frozen = view.raycastDisplayedTerrain(streamer, eye, -a.normal, 0.5f, true); REQUIRE(frozen);
         CHECK(frozen->source.meshVersion == installed->source.meshVersion);
         CHECK(frozen->source.surface.distance == installed->source.surface.distance);
         device.resetFrameStats(); REQUIRE(view.render(target.value(), camera, 1) == gfx::GfxError::None);
@@ -898,12 +957,12 @@ TEST_CASE("Streaming demo: live composed replacement rolls back all stages and f
         REQUIRE(sync()); REQUIRE(view.caughtUp(streamer));
         REQUIRE(view.hasBoundaryComposition());
         const auto originalBytes = device.stats().bufferBytes;
-        const auto old = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(old);
+        const auto old = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(old);
         const world::StreamingChunkKey key{world::PolicyKind::Height, {0, 0, 1}};
         REQUIRE(streamer.edit(key, world::heightSampleIndex(32, 0), world::CellValue::heightValue({45, 0, {255, 0, 0, 0}})));
         CHECK_FALSE(view.caughtUp(streamer));
         REQUIRE(sync());
-        CHECK(view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200)->source.surface.distance == old->source.surface.distance);
+        CHECK(view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200)->source.surface.distance == old->source.surface.distance);
         REQUIRE(settle(streamer, {}, 22));
         job.update(streamer); pool.waitIdle(); REQUIRE(job.update(streamer).state == world::BoundaryCompositionState::Ready);
         const auto stable = device.stats();
@@ -914,12 +973,12 @@ TEST_CASE("Streaming demo: live composed replacement rolls back all stages and f
             device.failBufferCreationAfter(count); CHECK_FALSE(sync());
             CHECK(view.hasBoundaryComposition()); CHECK_FALSE(view.caughtUp(streamer));
             CHECK(device.stats().bufferCount == stable.bufferCount); CHECK(device.stats().bufferBytes == stable.bufferBytes);
-            const auto hit = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(hit);
+            const auto hit = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(hit);
             CHECK(hit->source.surface.distance == old->source.surface.distance);
             CHECK(hit->source.meshVersion == old->source.meshVersion);
         }
         REQUIRE(sync()); CHECK(view.caughtUp(streamer));
-        const auto changed = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(changed);
+        const auto changed = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(changed);
         CHECK(changed->source.surface.position.y == doctest::Approx(45));
         const auto currentBytes = device.stats().bufferBytes;
         for (unsigned i = 0; i < 3; ++i) REQUIRE(sync());
@@ -966,7 +1025,7 @@ TEST_CASE("Streaming demo: incremental corner uploads stay hidden and stale resi
             return device.stats().vertices;
         };
         const auto oldVertices = render(); const auto oldCandidates = view.renderStats().candidates;
-        const auto old = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(old);
+        const auto old = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(old);
         REQUIRE(streamer.edit({world::PolicyKind::Height, {0, 0, 1}}, world::heightSampleIndex(32, 0),
             world::CellValue::heightValue({45, 0, {255, 0, 0, 0}})));
         REQUIRE(settle(streamer, {}, 22)); job.update(streamer); pool.waitIdle();
@@ -1011,13 +1070,13 @@ TEST_CASE("Streaming demo: incremental corner uploads stay hidden and stale resi
             CHECK(view.uploadStats().uploaded <= 1); CHECK(view.uploadStats().retired == 0);
             if (view.boundaryUploadPending()) {
                 CHECK(render() == oldVertices); CHECK(view.renderStats().candidates == oldCandidates);
-                const auto hit = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(hit);
+                const auto hit = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(hit);
                 CHECK(hit->source.surface.distance == old->source.surface.distance);
             }
         } while (view.boundaryUploadPending() && ticks < 32);
         CHECK(ticks == 25); // 22 resident units plus three policy-group units.
         CHECK_FALSE(view.boundaryUploadPending()); REQUIRE(view.pendingRetirements() > 0);
-        const auto changed = view.raycastDisplayedTerrain({32, 100, 64}, {0, -1, 0}, 200); REQUIRE(changed);
+        const auto changed = view.raycastDisplayedTerrain(streamer, {32, 100, 64}, {0, -1, 0}, 200); REQUIRE(changed);
         CHECK(changed->source.surface.position.y == doctest::Approx(45));
         const auto newVertices = render(); const auto newCandidates = view.renderStats().candidates;
         while (view.pendingRetirements()) {
@@ -1062,7 +1121,7 @@ TEST_CASE("Streaming demo: reused residents survive composed staging failure and
         // Rendering may lazily create frame resources; compare after that
         // initialization, not against the pre-render device snapshot.
         const auto original = device.stats();
-        const auto old = view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true);
+        const auto old = view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true);
         // All original GPU meshes are borrowed; the empty voxel group consumes
         // the first work unit. No allocation or visibility change is permitted.
         REQUIRE(view.syncBoundaryComposition(streamer, job, {1, 0, {}}));
@@ -1074,13 +1133,13 @@ TEST_CASE("Streaming demo: reused residents survive composed staging failure and
         CHECK_FALSE(view.boundaryUploadPending()); CHECK_FALSE(view.hasBoundaryComposition());
         CHECK(device.stats().bufferBytes == original.bufferBytes); CHECK(view.pendingRetirements() == 0);
         CHECK(render() == oldVertices);
-        const auto retained = view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true);
+        const auto retained = view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true);
         CHECK(retained.has_value() == old.has_value());
         if (retained && old) CHECK(retained->source.surface.distance == old->source.surface.distance);
         REQUIRE(view.syncBoundaryComposition(streamer, job, {32, 32, {}}));
         CHECK(view.uploadStats().reused == 22); CHECK(view.uploadStats().uploaded == 3);
         CHECK(view.uploadStats().retired == 0); REQUIRE(view.hasBoundaryComposition());
-        const auto wall = view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true);
+        const auto wall = view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true);
         REQUIRE(wall); CHECK(wall->boundary.has_value());
         // Retirement needs no original upload when all versions already match.
         job.requestRetirement(); REQUIRE(view.syncBoundaryComposition(streamer, job, {1, 0, {}}));
@@ -1129,7 +1188,7 @@ TEST_CASE("Streaming demo: recycled world stamps cannot reuse a resident or its 
         engine::Camera camera; camera.eye = origin + math::Vec3{0, 200, 50}; camera.center = origin; camera.farPlane = 500;
         REQUIRE(view.render(target.value(), camera, 1) == gfx::GfxError::None);
         CHECK(view.renderStats().visible == 1); // An old origin is outside this camera's far plane.
-        CHECK(view.raycastDisplayedTerrain(origin + math::Vec3{0, 100, 0}, {0, -1, 0}, 200).has_value());
+        CHECK(view.raycastDisplayedTerrain(second, origin + math::Vec3{0, 100, 0}, {0, -1, 0}, 200).has_value());
         CHECK_FALSE(view.caughtUp(third));
         REQUIRE(view.syncBoundaryComposition(third, job, {1, 1, {}}));
         CHECK(view.uploadStats().reused == 0); CHECK(view.uploadStats().uploaded == 1);
@@ -1158,9 +1217,9 @@ TEST_CASE("Streaming demo: staged moving terrain reuses current residents but ne
             })) ++expectedReuse;
         }
         REQUIRE(expectedReuse > 0); REQUIRE(expectedReuse < 25);
-        const auto old = view.raycastDisplayedTerrain({32, 100, 32}, {0, -1, 0}, 200); REQUIRE(old);
+        const auto old = view.raycastDisplayedTerrain(streamer, {32, 100, 32}, {0, -1, 0}, 200); REQUIRE(old);
         REQUIRE(view.syncBoundaryComposition(streamer, job, {1, 0, {}})); REQUIRE(view.boundaryUploadPending());
-        CHECK(view.raycastDisplayedTerrain({32, 100, 32}, {0, -1, 0}, 200)->source.meshVersion == old->source.meshVersion);
+        CHECK(view.raycastDisplayedTerrain(streamer, {32, 100, 32}, {0, -1, 0}, 200)->source.meshVersion == old->source.meshVersion);
         unsigned uploaded = view.uploadStats().uploaded, reused = view.uploadStats().reused;
         unsigned ticks = 1;
         while (view.boundaryUploadPending() && ticks < 32) {
@@ -1208,13 +1267,13 @@ TEST_CASE("Streaming demo: explicit retirement and retargeting preserve transact
             return false;
         };
         REQUIRE(converge(streamer)); REQUIRE(view.hasBoundaryComposition());
-        const auto wall = view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true); REQUIRE(wall);
+        const auto wall = view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true); REQUIRE(wall);
         REQUIRE(wall->boundary.has_value()); const auto stableBytes = device.stats().bufferBytes;
         job.clear(); REQUIRE(view.syncBoundaryComposition(streamer, job)); CHECK(view.hasBoundaryComposition());
         // Force full reupload to retain a partially allocated retirement target.
         job.requestRetirement(); REQUIRE(view.syncBoundaryComposition(streamer, job, {1, 0, {}, false}));
         REQUIRE(view.boundaryUploadPending()); CHECK(view.hasBoundaryComposition());
-        REQUIRE(view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true)->boundary.has_value());
+        REQUIRE(view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true)->boundary.has_value());
         // Retarget while plain uploads are pending: discard those hidden handles.
         REQUIRE(job.request(requests)); REQUIRE(view.syncBoundaryComposition(streamer, job, {0, 0, {}}));
         CHECK_FALSE(view.boundaryUploadPending()); CHECK(view.pendingRetirements() > 0);
@@ -1229,7 +1288,7 @@ TEST_CASE("Streaming demo: explicit retirement and retargeting preserve transact
         device.failBufferCreationAfter(0); CHECK_FALSE(view.syncBoundaryComposition(streamer, job, {32, 32, {}}));
         CHECK(view.hasBoundaryComposition()); REQUIRE(converge(streamer)); CHECK_FALSE(view.hasBoundaryComposition());
         CHECK(view.caughtUp(streamer));
-        const auto plain = view.raycastDisplayedTerrain({62, 10, 32}, {1, 0, 0}, 4, true);
+        const auto plain = view.raycastDisplayedTerrain(streamer, {62, 10, 32}, {1, 0, 0}, 4, true);
         CHECK_FALSE((plain && plain->boundary.has_value()));
         REQUIRE(job.request(requests)); REQUIRE(converge(streamer)); CHECK(view.hasBoundaryComposition());
         // A different world can recycle the same chunk handles/versions. Identity

@@ -21,10 +21,24 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    ASan and native endpoint gates. Old-view retention, cancellation, failed
    uploads, distinct world identities and immediate region changes are covered.
 2. Automatic bounded discovery: region-map enumeration and caller-window
-   selection are implemented. A scoped Height/Hex path now derives its active
-   window from current camera-selected residency and clipped published meshes;
-   full-world policy coverage and caller-independent multi-policy route
-   selection remain open. Derive required boundaries from actual region
+   selection are implemented. A Height/Hex scope still derives its active
+   window from current camera-selected residency and clipped published meshes.
+   An unscoped window that contains a Height/Voxel edge returns that edge.
+   A sample inside one face of that edge is owned by Height below the voxel
+   floor. A cell corner where the published tops disagree is `AmbiguousSurface`.
+   A Height/Hex scope of a window that also contains that edge fails instead of
+   dropping it. A resident Voxel/Hex window contains that edge. Discovery
+   returns it. On the hex floor the column is Hex, and inside the taller voxel
+   span it is Voxel.
+   A Height/Hex scope fails that window instead of dropping the edge. Scoped
+   resident composition still submits the Height/Hex pair-adjacency rectangle
+   for the corner sweep. The full resident union returns its Height/Voxel
+   edges. Capture of a Height/Voxel or Voxel/Hex edge copies published meshes
+   and emits no wall. An isolated edge composes as those meshes. A retained
+   edge that shares an endpoint is JunctionRejected, and a still-current prior
+   composition is kept. Uniform voxel interiors with no inter-policy edge stay an empty
+   success.
+   Derive required boundaries from actual region
    ownership and residency, split endpoints/crossings consistently, and
    distinguish no boundaries from unsupported, incomplete or failed discovery.
    Never silently drop a required transition on failure or truncate a boundary
@@ -43,10 +57,17 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
 4. Solid ownership: a reference column contract now specifies and tests policy
    boundary/corner behavior, including nonplanar triangle tops, finite hex floors,
    precision limits, discontinuous breakpoints and unsupported intersections.
-   Voxel cavities and overhangs are named and fail closed; a bottom-anchored voxel
-   stack is still unsupported. Surface rays remain a different API and do not
-   establish this volume contract. Installing the classifier as the streaming
-   collision query, and any general voxel solid query, remain open.
+   Voxel cavities and overhangs are named by `classifyVoxelStack` and that
+   function still returns no owner. A bottom-anchored bool stack is still
+   unsupported. Surface rays remain a different API and do not establish this
+   volume contract. `WorldStreamer::classifyPublishedSolid` installs the
+   Height/Hex classifier on published columns, including boundary planes and
+   corners. An interior voxel column is owned from retained horizontal faces:
+   a solid span, an empty span, and a cave or overhang the published stack
+   contains. A single region plane with Voxel on one side is owned from those
+   spans and the other side's upward top when the faces agree. A cell corner
+   where adjacent tops disagree is `AmbiguousSurface`. A corner that touches
+   Voxel stays `UnsupportedVoxel` with no owner.
 5. Moving coverage: test continuous camera/residency changes, edits, region changes,
    stale jobs and source arrivals/unloads. The resident-scope controller now has a
    focused queued-retarget regression across three outbound and two return
@@ -56,14 +77,39 @@ authoritative. Passing a new fixture does not close unrelated acceptance gaps.
    surface freshness and job state, retains the last accepted composed view when
    source coverage is temporarily unavailable, stages plain terrain before
    departure, and restores the corner exactly. The two-process gate passed with
-   byte-identical movement evidence and 112 captures per run. Continuous
-   frame-by-frame native coverage, edits during travel, and region changes during
-   travel remain open.
-6. Budget acceptance: profile integrated snapshot/planning, copy-on-write map edits,
-   publication, conversion/upload and retirement. Count limits do not bound the
-   cost of one operation. Large shared-map edits and continuous-movement planning
-   need explicit progress and budget evidence. Do not claim a universal hard 2 ms
-   deadline from a cooperative scheduler or one favorable local run.
+   byte-identical movement evidence and 112 captures per run. After scoped
+   discovery stopped omitting unsupported edges, the Height/Hex request uses
+   the pair-adjacency rectangle. The eight-step native sweep now also records
+   a published hex column that stays solid across the home and first outbound
+   anchors, drops with `NoPublishedSurface` once that chunk unloads, an away
+   height edit that stays on the old mesh until republication, and a region
+   change that does not keep the previous owner. The edit and region are
+   restored before the return image. The two-process gate was re-run on this
+   checkout and passed: 112 captures per run, and `corner_motion_residency.csv`
+   matches across processes. A window that contains the Voxel/Hex edge still
+   fails closed. The corner-sweep world on this verify path sets
+   `deterministicAdmission`: the wall clock is skipped and each world update
+   stops at the per-frame count caps. That is a fixed work-unit cap, not a
+   hard realtime deadline. The interactive demo config does not set the flag
+   and still uses the cooperative wall-clock budget. `corner_motion_residency.csv`
+   is hashed across the two processes. It records one row per world-update tick
+   of the eight-step sweep. Held samples taken before the republishing update
+   keep the previous published owner; the new owner appears on a later tick
+   only after republication. Each of those world-update ticks also presents
+   one `sweep_tick_*.bmp` of the view already installed for that tick. The
+   two-process gate hashes those presents. They do not advance world admission
+   or the wall-clock upload budget, and they are not a hard realtime deadline.
+   A separate opt-in deadline can refuse the next streaming unit, and
+   `RegionMap::setBudgeted` can refuse the next copied entry of a shared map.
+   Work already started is kept and overrun is visible. The verify path ignores
+   that deadline. The interactive demo stays cooperative.
+6. Budget acceptance: an opt-in hard deadline refuses the next unload, load,
+   publication, or mesh unit. `RegionMap::setBudgeted` refuses the next copied
+   entry of a shared map and keeps entries already copied. Overrun is visible
+   when a started unit finishes late. `deterministicAdmission` ignores the
+   deadline and stays a work-unit cap. `set` and `erase` stay eager. The
+   interactive demo stays on the cooperative budget. This clock does not bound
+   the unit already started. Do not claim a universal hard 2 ms finish time.
 7. Final regression/plan audit: rerun applicable native build, sanitizer,
    determinism and visual gates; check existing fixtures and assets; reconcile
    every remaining M16 claim with actual code and evidence. Hardware/toolchain
@@ -74,12 +120,27 @@ No completion box is checked merely because this checklist or a fixture exists.
 
 ## Current Increment
 
-[Solid-column ownership](solid-ownership.md) classifies Height/Hex boundary and
-corner volume against the existing paired-profile walls. Higher tops own the
-transition band. Discontinuous breakpoints, nonmanifold corners, inconsistent
-sectors, precision collapse, hex floors at or above the top, voxel cavities and
-voxel overhangs fail closed with no owner. Voxel DDA and bilinear sampling are
-unchanged. M16 remains partial.
+[Solid-column ownership](solid-ownership.md) is now the streaming collision
+query. `classifyPublishedSolid` classifies published Height/Hex interiors from
+the upward triangle, and boundary or corner samples through the reference
+classifiers. A cooperative frame can report `budgetClosed` when admission is
+off and `budgetDeferred` when a later candidate waits. A separate hard
+deadline sets `budgetOverrun` when a unit already started finishes late,
+and it does not tear that unit down. Cooperative admission still has a
+progress exception. `deterministicAdmission` ignores the hard deadline. Discovery fails closed
+when a window contains an unsupported transition, including a Height/Hex scope.
+Focused tests cover triangle-top
+disagreement with bilinear sampling, an edit that stays on the retained mesh
+until republication, camera travel that keeps then drops a resident column, a
+region change that does not keep the previous owner, hex floor closure, a
+published voxel column that owns a solid span, the air above it, and an
+overhang punched through the retained mesh, and Height/Hex boundary agreement
+with the reference classifier. Voxel/Hex and Height/Voxel plane samples are
+owned from the published faces when those faces agree, and
+`AmbiguousSurface` when adjacent tops disagree. A corner that touches Voxel
+stays `UnsupportedVoxel`. Capture of an isolated Height/Voxel edge copies the
+published meshes and emits no wall. A retained edge that shares an endpoint is
+`JunctionRejected` and keeps a still-current prior composition. M16 remains partial.
 
 [Bounded boundary discovery](boundary-discovery.md) adds ownership-driven request
 selection within caller-supplied windows. [Resident reuse](boundary-resident-reuse.md)
@@ -87,16 +148,22 @@ reduces staged GPU work without changing accepted visibility or weakening
 freshness checks. [Resident-coverage discovery](resident-coverage-discovery.md)
 now derives a conservative window from the current camera-selected resident
 set and fails closed when coverage is absent or includes unsupported required
-transitions. The explicit Height/Hex scope uses clipped published mesh bounds
-and passes the native corner departure/return route; broad unscoped coverage
-still fails closed when it includes an unsupported required transition. The
-native mixed-policy corner route uses that explicit scope because its full
-resident union includes an unsupported Voxel/Hex edge.
-The queued-retarget regression passes 1 case / 31 assertions in both Release and
-MSVC ASan. The native stepped-residency route is covered by
-`corner_motion_residency.csv` in the repeated policy gate. Subsequent increments
-must update this checklist and the architecture plan without weakening the
-acceptance requirements.
+transitions. The explicit Height/Hex scope uses clipped published mesh bounds.
+Discovery of those bounds fails closed when they contain an unsupported edge.
+`policyPairCompositionWindow` selects the resident pair-adjacency rectangle for
+the composition request. The eight-step native sweep in that gate now records one residency row per
+world-update tick under fixed work-unit admission, plus held samples for edit
+retention and region-change ownership, and presents one frame per recorded
+tick. The two-process gate hashes `corner_motion_residency.csv` and every
+`sweep_tick_*.bmp`. That admission cap is not a hard realtime deadline.
+A separate opt-in deadline refuses the next streaming unit and the next
+copied entry of a shared region map. It keeps work already started.
+Interactive pacing is unchanged. MSVC ASan was not re-run. Displayed raycasts
+read the engine accepted-view slot. Plain sync does not replace the drawn
+meshes until that package can be published, so a stale resident keeps the
+picture on the publication the query hits.
+Subsequent increments must update this checklist and the architecture plan
+without weakening the acceptance requirements.
 
 ## 2026-09-23 Verification And Reload Fix
 

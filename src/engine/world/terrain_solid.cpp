@@ -277,6 +277,91 @@ auto sampleUpwardTriangleHeight(const TerrainTopSample& a, const TerrainTopSampl
     return height;
 }
 
+auto validateVoxelSpans(std::span<const VoxelSolidSpan> spans) -> std::optional<TerrainSolidError> {
+    double previousTop = -std::numeric_limits<double>::infinity();
+    for (const VoxelSolidSpan& span : spans) {
+        if (!representable(span.floor) || !representable(span.top) || !(span.top > span.floor) ||
+            !(span.floor >= previousTop)) {
+            return TerrainSolidError::InvalidData;
+        }
+        previousTop = span.top;
+    }
+    return {};
+}
+
+auto classifyVoxelColumn(std::span<const VoxelSolidSpan> spans, double height)
+    -> Result<TerrainSolidSample, TerrainSolidError> {
+    using Error = TerrainSolidError;
+    if (!std::isfinite(height)) return Error::InvalidData;
+    if (auto error = validateVoxelSpans(spans)) return *error;
+    bool inside = false;
+    for (const VoxelSolidSpan& span : spans) {
+        if (height >= span.floor && height <= span.top) inside = true;
+    }
+    TerrainSolidSample sample;
+    sample.solid = inside;
+    sample.policy = PolicyKind::Voxel;
+    return sample;
+}
+
+auto classifyVoxelPlaneSolid(const VoxelPlaneSolidQuery& query, double height)
+    -> Result<TerrainSolidSample, TerrainSolidError> {
+    using Error = TerrainSolidError;
+    if (!std::isfinite(height)) return Error::InvalidData;
+    if (auto error = validateVoxelSpans(query.spans)) return *error;
+    if (query.other == PolicyKind::Voxel) return Error::UnsupportedVoxel;
+    if (query.other == PolicyKind::Height) {
+        if (query.otherFloor.has_value() || !representable(query.otherTop)) return Error::InvalidData;
+    } else if (query.other == PolicyKind::Hex) {
+        if (!query.otherFloor || !representable(*query.otherFloor) || !representable(query.otherTop))
+            return Error::InvalidData;
+        if (!(query.otherTop > *query.otherFloor)) return Error::HexFloorInversion;
+    } else {
+        return Error::InvalidData;
+    }
+
+    const std::uint8_t voxelSector = query.voxelOnNegative ? 0 : 1;
+    const std::uint8_t otherSector = query.voxelOnNegative ? 1 : 0;
+    struct Candidate {
+        double top = 0;
+        PolicyKind policy = PolicyKind::Height;
+        std::uint8_t sector = 0;
+        bool contains = false;
+    };
+    std::vector<Candidate> incident;
+    incident.reserve(query.spans.size() + 1);
+    for (const VoxelSolidSpan& span : query.spans) {
+        incident.push_back({span.top, PolicyKind::Voxel, voxelSector,
+                            height >= span.floor && height <= span.top});
+    }
+    bool otherContains = height <= query.otherTop;
+    if (query.other == PolicyKind::Hex) otherContains = otherContains && height >= *query.otherFloor;
+    incident.push_back({query.otherTop, query.other, otherSector, otherContains});
+
+    int owner = -1;
+    for (std::size_t i = 0; i < incident.size(); ++i) {
+        if (!incident[i].contains) continue;
+        if (owner < 0 || incident[i].top > incident[static_cast<std::size_t>(owner)].top ||
+            (incident[i].top == incident[static_cast<std::size_t>(owner)].top &&
+             incident[i].sector < incident[static_cast<std::size_t>(owner)].sector)) {
+            owner = static_cast<int>(i);
+        }
+    }
+    if (owner < 0) return TerrainSolidSample{};
+    const Candidate& chosen = incident[static_cast<std::size_t>(owner)];
+    std::optional<double> nearestShorter;
+    for (std::size_t i = 0; i < incident.size(); ++i) {
+        if (static_cast<int>(i) == owner || !(incident[i].top < chosen.top)) continue;
+        if (!nearestShorter || incident[i].top > *nearestShorter) nearestShorter = incident[i].top;
+    }
+    TerrainSolidSample sample;
+    sample.solid = true;
+    sample.policy = chosen.policy;
+    sample.sector = chosen.sector;
+    sample.wallBand = nearestShorter.has_value() && height >= *nearestShorter && height <= chosen.top;
+    return sample;
+}
+
 // UnsupportedVoxel, VoxelCavity, and VoxelOverhang never return an owner.
 auto classifyVoxelStack(std::span<const bool> solidFromBottom) -> Result<TerrainSolidSample, TerrainSolidError> {
     using Error = TerrainSolidError;

@@ -196,7 +196,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
-| M16 World streaming | ⚠ Partial | Camera rings, priority workers, versioned publication, collision hooks, sparse edits, resource references and palettes are implemented. CPU profiling removed planning snapshot copies, resident-wide neighbor scans and unload base copies. The native OpenGL height-world demo integrates 25 GPU chunks, travel, edits, disk/process reload and visual gates. Terrain pipelines prepare at startup; CPU/upload admission shares a cooperative deadline. Save/load/old CPU world retirement use a bounded worker. Replay uses direct shared validation and reload GPU cleanup is spread across frames. Optional meter-based center footprints retain legacy chunk-count defaults. The 224-capture policy gate covers the full voxel half-region, simultaneous boundaries, rapid mutations, opt-in regional surfaces, hex prism cut walls, cell-aligned voxel cuts and composed-corner display/edit/restoration. Intersecting chunk bounds plus CPU clipping fill the tested hex interior; optional walls close hex cuts to their existing floor. Optional voxel cell masking exposes cut faces while preserving cavities. Published-surface rays share these triangles and region provenance. Explicit boundary requests now support worker-built compositions and incrementally staged whole-view GPU/query replacement, explicit retirement/retargeting and failure retention. Fresh-reference gates cover one/four workers and edit restoration. Scoped Height/Hex residency-derived discovery now drives the native corner route. Paired-profile walls remain the cross-policy height-transition geometry. A reference solid-column contract now assigns Height/Hex boundary and corner ownership, including finite hex floors and nonplanar triangle tops, and fails closed on discontinuous breakpoints, nonmanifold corners, voxel cavities, voxel overhangs and any voxel column. Full-world policy coverage, non-preemptible transition work, general voxel solid queries, hard budgets and large shared-map edits remain open. |
+| M16 World streaming | ⚠ Partial | Camera rings, priority workers, versioned publication, collision hooks, sparse edits, resource references and palettes are implemented. CPU profiling removed planning snapshot copies, resident-wide neighbor scans and unload base copies. The native OpenGL height-world demo integrates 25 GPU chunks, travel, edits, disk/process reload and visual gates. Terrain pipelines prepare at startup; CPU/upload admission shares a cooperative deadline. Save/load/old CPU world retirement use a bounded worker. Replay uses direct shared validation and reload GPU cleanup is spread across frames. Optional meter-based center footprints retain legacy chunk-count defaults. The 224-capture policy gate covers the full voxel half-region, simultaneous boundaries, rapid mutations, opt-in regional surfaces, hex prism cut walls, cell-aligned voxel cuts and composed-corner display/edit/restoration. Intersecting chunk bounds plus CPU clipping fill the tested hex interior; optional walls close hex cuts to their existing floor. Optional voxel cell masking exposes cut faces while preserving cavities. Published-surface rays share these triangles and region provenance. Explicit boundary requests now support worker-built compositions and incrementally staged whole-view GPU/query replacement, explicit retirement/retargeting and failure retention. Fresh-reference gates cover one/four workers and edit restoration. Discovery returns a Voxel/Hex edge inside its window. On the hex floor that column is Hex, and inside the taller voxel span it is Voxel. An unscoped window that contains a Height/Voxel edge returns that edge. A sample inside one face is Height below the voxel floor. A cell corner where adjacent tops disagree is AmbiguousSurface. A corner that touches Voxel stays UnsupportedVoxel. Capture of a Height/Voxel or Voxel/Hex edge copies the published meshes and emits no wall. An isolated edge composes as those meshes. A retained edge that shares an endpoint is JunctionRejected, and a still-current prior composition is kept. Scoped resident composition submits the Height/Hex pair-adjacency rectangle, and the two-process policy gate hashes that column evidence with the existing residency CSV and sweep presents. The gate's eight-step sweep records a resident hex column across camera steps, an unload that drops it, an away height edit retained until republication, and a region change that does not keep the previous owner. The corner-sweep verify path uses fixed work-unit admission (per-frame count caps, not a hard realtime deadline). The two-process gate hashes one residency row per world-update tick, including held samples that keep the previous owner until republication, and one presented frame per those ticks (`sweep_tick_*.bmp`). Those presents draw the view already installed and do not spend the wall-clock upload budget. Interactive frame pacing still uses the wall-clock cooperative budget. Paired-profile walls remain the cross-policy height-transition geometry. A reference solid-column contract now assigns Height/Hex boundary and corner ownership, including finite hex floors and nonplanar triangle tops, and fails closed on discontinuous breakpoints, nonmanifold corners, and bool-stack voxel cavities and overhangs. Interior published voxel columns are owned from retained horizontal faces. A corner that touches Voxel stays UnsupportedVoxel. Full-world policy coverage, non-preemptible transition work, hard budgets and large shared-map edits remain open. |
 | M17 Native Metal | ⚠ Partial | The direct Objective-C++ Metal device, SDL `CAMetalLayer`, queue/replay, resources, pipelines, metallib build rules, presentation, readback, retirement, M11/M13 shader families, 130-draw regression, locked M11 image gate, and nine-scene repeated capture runner are implemented. Hosted Apple Clang Debug/Release builds and CPU/build conformance pass, but M17 cannot be accepted until Metal-capable Apple hardware passes diagnostics, parity, presentation/resize, and visual review of all 27 captures. |
 | M18 Browser WebGPU | ✅ Complete | Emscripten 6.0.9 and Emdawnwebgpu provide a browser-native WebGPU RHI with asynchronous setup/pipeline admission, device-loss reporting, negotiated limits/features/formats, canvas resize/presentation, complete resource/binding/render/compute command paths, readback, and deferred reclamation. Native WGSL covers M11, M13, Cornell, all six focused rendering validations, and terrain. Chromium gates zero errors, 130 draws, indexed-strip format conformance, M13 CPU/GPU parity, byte-exact M11 full-frame parity, resize stability, and three identical captures from each of the seven validation scenes plus terrain; every capture was visually inspected. |
 
@@ -825,8 +825,9 @@ Completed delivery and acceptance gates:
   fixture uses this selection path. Scoped resident-derived windows now use
   clipped published mesh bounds for the Height/Hex route; a queued-retarget
   regression covers three outbound and two return residency positions under
-  Release and MSVC ASan. Unscoped full-world discovery and continuous native
-  visual coverage remain open.
+  Release and MSVC ASan. An unsupported edge inside a scoped Height/Hex window
+  fails the selection instead of being omitted. Full-world policy coverage
+  and continuous native visual coverage remain open.
 - [Unchanged resident reuse](boundary-resident-reuse.md) avoids copying/uploading
   current originals during staged publication. Pending views borrow validated
   handles without changing their visibility; cancellation leaves their ownership
@@ -836,24 +837,44 @@ Completed delivery and acceptance gates:
   conservative boundary-discovery window from the authoritative current
   resident chunk footprints and fails closed for absent coverage or unsupported
   required transitions. An explicit Height/Hex scope uses clipped published
-  mesh bounds and passes the native corner departure/return route; the mixed
-  policy native fixture remains scoped because its full resident union also
-  contains Voxel/Hex. The [accepted surface view](accepted-surface-views.md)
+  mesh bounds and fails closed when that rectangle contains an unsupported
+  edge, including Voxel/Hex. Scoped resident composition submits the
+  pair-adjacency rectangle so the native corner does not put that edge in the
+  window. The [accepted surface view](accepted-surface-views.md)
   packages the demo's accepted resident/composition geometry, routes its
   displayed query through the same immutable inputs, and adds an explicit
   WorldStreamer publication/query slot. Successful current demo commits publish
-  into it, but renderer consumers still maintain a parallel local surface owner;
-  the native policy gate now records a deterministic eight-step outbound and
-  inbound residency sweep, retaining the accepted composed view through a
-  temporary no-coverage state and staging plain terrain before departure. Full
-  frame-by-frame movement, travel-time edits/region changes, and full policy
-  coverage remain open.
+  into it. Displayed raycasts read that slot. Plain sync keeps the drawn meshes
+  until the same package can be published. The two-process native policy
+  gate was re-run after the pair-window selection and passed with 112 captures
+  per run. That sweep now also records a resident hex column across camera
+  steps, an unload that drops it, an away height edit that stays on the old
+  published mesh until republication, and a region change that does not keep
+  the previous owner. The edit and region are restored before the return
+  image. The corner-sweep verify path skips the wall clock and stops at the
+  per-frame count caps. That is a fixed work-unit cap, not a hard realtime
+  deadline. Interactive pacing is unchanged. A separate opt-in deadline can
+  refuse the next streaming unit and the next copied region-map entry. It
+  keeps the unit already started. The verify path does not use it. The two-process gate hashes
+  `corner_motion_residency.csv`: one row per world-update tick, with held
+  samples that keep the previous owner until republication, plus one presented
+  `sweep_tick_*.bmp` per tick. Those presents draw the view already installed
+  for that tick and do not spend the wall-clock upload budget. Full policy
+  coverage remains open.
 - The [solid-column contract](solid-ownership.md) classifies reference volume
   ownership for Height and Hex boundary planes and corners. Higher tops own the
   transition band, including the lower edge of the existing paired-profile walls.
-  Discontinuous breakpoints, nonmanifold corners, voxel cavities and voxel
-  overhangs fail closed. Voxel DDA and bilinear sampling are unchanged, and this
-  is not a general voxel solid query or a new WorldStreamer ray API.
+  Discontinuous breakpoints, nonmanifold corners, and the bool-stack names
+  `VoxelCavity` and `VoxelOverhang` fail closed. `classifyVoxelStack` still
+  returns no owner. `WorldStreamer::classifyPublishedSolid` uses the Height/Hex
+  contract and, for an interior voxel sample, the horizontal faces of the
+  retained published meshes. A closed solid run is owned by Voxel. Air in that
+  column is an empty Voxel sample, including a cave or overhang the mesh
+  actually contains. A single region plane with Voxel on one side is owned
+  from those spans and the other side's upward top. A cell corner where
+  adjacent tops disagree is `AmbiguousSurface`. A corner that touches Voxel
+  stays `UnsupportedVoxel`. Voxel DDA and bilinear sampling are unchanged. This is
+  not a surface-ray API.
 - ✅ Generated voxel bases with at most 16 ids store 4-bit indices; 17–256 ids
   use 8-bit indices; more diverse chunks retain the dense u16 representation.
   Packing order and round trips are deterministic.
@@ -1215,12 +1236,43 @@ capture acceptance is claimed by this local increment.
    classifies boundary and corner volume for Height and Hex columns, including
    finite hex floors and nonplanar triangle tops, and fails closed for
    discontinuous breakpoints, nonmanifold corners, inconsistent sectors,
-   precision collapse, voxel cavities, voxel overhangs and any voxel column.
-   It does not change voxel-DDA or bilinear sampling, and it is not installed
-   as a WorldStreamer query. Still open: full-world policy coverage, renderer
-   consumption of the engine accepted-view slot, continuous frame-by-frame
-   coverage (including edits and region changes during travel), and budget
-   acceptance for non-preemptible work and large shared-map edits. The opt-in
+   precision collapse, and the bool-stack names for a voxel cavity or overhang.
+   `classifyVoxelStack` still returns no owner. `WorldStreamer::classifyPublishedSolid`
+   installs that classifier for published Height/Hex columns, boundary planes
+   and corners. An interior voxel column is owned from the retained horizontal
+   faces: solid spans and the air of that column, including a cave or overhang
+   the published stack contains. It does not change voxel-DDA or bilinear
+   sampling. A single region plane with Voxel on one side is owned from that
+   side's published spans and the other side's upward top. On the hex floor
+   the Voxel/Hex column is Hex, and inside the taller voxel span it is Voxel.
+   A Height/Voxel sample inside one face is Height below the voxel floor. A
+   cell corner where adjacent tops disagree is `AmbiguousSurface`. A corner
+   that touches Voxel stays `UnsupportedVoxel`. Discovery returns both edges.
+   An unscoped window that contains a Height/Voxel edge returns that edge. A
+   Height/Hex scope fails that window instead of dropping the edge. Capture of
+   that edge, and of Voxel/Hex, copies the published meshes and does not emit
+   a wall. An isolated edge composes as those meshes. A retained edge that
+   shares an endpoint is JunctionRejected, and a still-current prior
+   composition is kept. A region revision still hides a stale composition.
+   AmbiguousSurface cell corners, voxel corners, and classifyVoxelStack stay
+   refused. The full
+   resident union returns the edge. Scoped resident composition
+   uses the Height/Hex pair-adjacency rectangle. The eight-step native sweep
+   records one residency row per world-update tick under fixed work-unit
+   admission, including held samples that keep the previous owner until
+   republication, and presents one frame per those ticks. That cap is not a
+   hard realtime deadline. A separate opt-in deadline refuses the next
+   streaming unit and the next copied region-map entry, keeps the unit already
+   started, and reports overrun. The verify path ignores that deadline. The
+   interactive demo stays cooperative. The presents draw the view already installed and
+   do not spend the wall-clock upload budget. The two-process policy gate
+   hashes `corner_motion_residency.csv` and every `sweep_tick_*.bmp`. Displayed
+   raycasts read the engine accepted-view slot, and plain sync does not draw a
+   package that slot rejects. Still
+   open: full-world policy
+   coverage. One
+   streaming unit or one copied map entry can still finish after the deadline.
+   The opt-in
    [regional surface mode](regional-surfaces.md) now clips published CPU
    triangles after edit replay and admits intersecting chunk bounds. It fills
    the tested hex interior. A separate [hex cut-wall option](hex-cut-walls.md)
@@ -1284,10 +1336,11 @@ capture acceptance is claimed by this local increment.
    a miss at the hex gap; the opt-in comparison hits there and at 64 interior
    probes. Neither the static grid nor image repeatability proves watertightness.
    Composed transition meshes feed the accepted-view ray query. The solid-column
-   classifier is a separate reference contract and does not change cell-DDA or
+   classifier is installed as `classifyPublishedSolid` and does not change cell-DDA or
    bilinear sampling.
-   Continue profiling non-preemptible operations and large shared-map edits;
-   cooperative progress exceptions still prevent a hard budget claim. M16
+   An opt-in hard deadline refuses the next streaming unit and the next copied
+   region entry. Cooperative progress exceptions remain on the interactive path,
+   and the unit already started is not preempted. M16
    remains partial; existing height save/upload/reload gates are preserved.
 2. Continue independent M12 work on the available Windows PC: profile the
    renderer to select the next occlusion, multithreaded recording, or SIMD
@@ -1373,7 +1426,9 @@ chosen simple and safe; each carries a documented upgrade path.
   the CPU surface contract; GPU upload may lag publication. Interior Height
   columns are solid at and below that triangle top. Boundary and corner volume
   rules, including their fail-closed cases, are in [solid ownership](solid-ownership.md).
-  That reference contract is not a general voxel solid query.
+  Interior voxel columns are a separate published-face query. A single region
+  plane with Voxel on one side uses those spans against the other policy's
+  upward top. A corner that touches Voxel is still `UnsupportedVoxel`.
 - **LOD**: fixed 2-triangle quads v1, CDLOD-style skirts to hide level
   cracks (M15); no dynamic tessellation.
 - **Overhangs/caves**: impossible inside a height tile BY DESIGN — such
