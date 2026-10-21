@@ -48,6 +48,11 @@ struct PassDesc {
     // writes a framebuffer resource; otherwise called outside any pass (e.g. compute).
     // Keep it small; capture by value where possible.
     std::function<void(CommandBuffer&)> record;
+    // Compute-only pass (no framebuffer, no declared accesses) that may run
+    // on the device's async compute queue; see RenderGraph::setAsyncCompute.
+    // A later pass must call CommandBuffer::waitAsyncCompute() before using
+    // what it writes.
+    bool asyncCompute = false;
 };
 
 struct FrameContext {
@@ -85,6 +90,15 @@ public:
     void setGpuTimestamps(bool enabled) { gpuTimestamps_ = enabled; }
     [[nodiscard]] auto gpuTimestampsWritten() const -> bool { return timestampsWritten_; }
 
+    // When on and the device supportsAsyncCompute(), execute() records the
+    // passes marked asyncCompute into a second CommandBuffer and submits it
+    // with IDevice::submitAsyncCompute() ahead of the graphics submit. They
+    // keep their timestamp slots on the graphics timeline (reading ~0 ms).
+    // Off, or without an async queue, they are recorded inline as usual.
+    void setAsyncCompute(bool enabled) { asyncCompute_ = enabled; }
+    // Whether the last execute() used the async compute queue.
+    [[nodiscard]] auto asyncComputeUsed() const -> bool { return asyncComputeUsed_; }
+
     // Materializes all declared resources (createTexture/createBuffer/createFramebuffer).
     // Persistent handles are reused; missing transient handles are recreated.
     [[nodiscard]] auto realize(IDevice& dev) -> GfxError;
@@ -111,6 +125,8 @@ private:
     IDevice* owner_ = nullptr;
     bool gpuTimestamps_ = false;
     bool timestampsWritten_ = false;
+    bool asyncCompute_ = false;
+    bool asyncComputeUsed_ = false;
 };
 
 } // namespace f4::gfx

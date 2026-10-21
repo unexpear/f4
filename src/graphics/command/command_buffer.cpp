@@ -6,6 +6,11 @@
 
 namespace f4::gfx {
 
+void CommandBuffer::waitAsyncCompute() {
+    F4_ASSERT(recording_, "waitAsyncCompute while not recording");
+    if (asyncComputeWait_ == kNoAsyncComputeWait) asyncComputeWait_ = commands_.size();
+}
+
 void CommandBuffer::pushCommand(const Command& cmd) {
     F4_ASSERT(recording_, "recording command while not recording");
     commands_.push(cmd);

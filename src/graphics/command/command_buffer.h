@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -89,7 +90,11 @@ struct Command {
 class CommandBuffer {
 public:
     // Recording lifecycle.
-    void begin() { recording_ = true; commands_.clear(); }
+    void begin() {
+        recording_ = true;
+        commands_.clear();
+        asyncComputeWait_ = kNoAsyncComputeWait;
+    }
     void end() { recording_ = false; }
 
     [[nodiscard]] auto isRecording() const -> bool { return recording_; }
@@ -128,6 +133,16 @@ public:
     // Highest timestamp index + 1 and a bit mask of written indices (0/0 when
     // the buffer writes none). Backends use it to size the query set.
     void timestampUsage(std::uint32_t& count, std::uint32_t& written) const;
+    // Async compute (IDevice::submitAsyncCompute): commands recorded after
+    // this point wait until the compute work submitted ahead of this buffer
+    // has finished; the commands before it may run alongside that work.
+    // Outside render passes; the first call wins. Devices without an async
+    // compute queue ignore it (their compute work ran inline, in order).
+    void waitAsyncCompute();
+    static constexpr std::size_t kNoAsyncComputeWait = static_cast<std::size_t>(-1);
+    // Index of the first command after waitAsyncCompute(), or
+    // kNoAsyncComputeWait (the wait then applies to the whole buffer).
+    [[nodiscard]] auto asyncComputeWaitIndex() const -> std::size_t { return asyncComputeWait_; }
 
     // Test/observability surface — a recorded command log (NullDevice submits
     // a validated replay of this).
@@ -139,6 +154,7 @@ private:
 
     bool recording_ = false;
     Array<Command> commands_;
+    std::size_t asyncComputeWait_ = kNoAsyncComputeWait;
 };
 
 } // namespace f4::gfx

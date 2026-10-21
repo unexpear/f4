@@ -83,6 +83,20 @@ public:
     [[nodiscard]] virtual auto lastGpuTimestampSerial() const -> std::uint64_t { return 0; }
     // Newest finished timestamp set, without waiting for the GPU.
     virtual auto latestGpuTimestamps() -> GpuTimestampFrame { return {}; }
+
+    // Async compute: a second, compute-only queue (Vulkan: a dedicated
+    // compute queue family; DX12: a COMPUTE command queue) that runs work
+    // alongside the graphics queue. submitAsyncCompute() submits compute-only
+    // commands (pipelines, resource binds, dispatches; buffers only, no
+    // timestamps) ahead of the next submit(), which waits for them at its
+    // CommandBuffer::waitAsyncCompute() point. Buffers it writes are visible
+    // to the graphics commands after that wait. Devices without such a queue
+    // return false / BackendUnavailable; callers then record the same work
+    // inline (see RenderGraph::setAsyncCompute).
+    [[nodiscard]] virtual auto supportsAsyncCompute() const -> bool { return false; }
+    virtual auto submitAsyncCompute(CommandBuffer&) -> GfxError {
+        return GfxError::BackendUnavailable;
+    }
 };
 
 // Factory. The compiled-in backend (F4_GRAPHICS_BACKEND) decides the concrete

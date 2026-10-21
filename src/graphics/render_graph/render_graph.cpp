@@ -303,10 +303,30 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
     Array<ResourceState> nextStates = states_;
     timestampsWritten_ = gpuTimestamps_ && !passes_.isEmpty() &&
                          passes_.size() < kMaxGpuTimestamps;
+    // Async compute passes: compute-only, so no framebuffer and no barriers.
+    asyncComputeUsed_ = false;
+    if (asyncCompute_ && dev.supportsAsyncCompute()) {
+        for (const PassDesc& p : passes_) {
+            if (!p.asyncCompute) continue;
+            asyncComputeUsed_ = true;
+            if (!p.accesses.isEmpty()) return GfxError::BadDescriptor;
+            for (std::uint32_t rid : p.writes) {
+                if (resources_[rid].type == ResourceType::Framebuffer) {
+                    return GfxError::BadDescriptor;
+                }
+            }
+        }
+    }
+    CommandBuffer asyncCb;
+    if (asyncComputeUsed_) asyncCb.begin();
     std::uint32_t passIndex = 0;
     for (const PassDesc& p : passes_) {
         if (timestampsWritten_) cb.writeTimestamp(passIndex);
         ++passIndex;
+        if (asyncComputeUsed_ && p.asyncCompute) {
+            if (p.record) p.record(asyncCb);
+            continue;
+        }
         for (const PassResourceAccess& access : p.accesses) {
             const ResourceId id = access.resource;
             if (nextStates[id] == access.state) continue;
@@ -336,7 +356,12 @@ auto RenderGraph::execute(IDevice& dev, CommandBuffer& cb) -> GfxError {
     }
     if (timestampsWritten_) cb.writeTimestamp(passIndex);
     cb.end();
-    const GfxError submitError = dev.submit(cb);
+    GfxError submitError = GfxError::None;
+    if (asyncComputeUsed_) {
+        asyncCb.end();
+        submitError = dev.submitAsyncCompute(asyncCb);
+    }
+    if (submitError == GfxError::None) submitError = dev.submit(cb);
     if (submitError == GfxError::None) states_ = static_cast<Array<ResourceState>&&>(nextStates);
     // Synchronous backends can release immediately. Explicit backends retire
     // native objects against their submission fence while invalidating the RHI
