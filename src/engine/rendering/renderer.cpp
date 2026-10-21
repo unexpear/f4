@@ -68,6 +68,13 @@ static_assert(sizeof(BloomUbo) == 32, "BloomUbo must match std140/HLSL layout");
 
 constexpr std::uint32_t kBloomMaxLevels = 8;
 
+// PbrRenderSettings::lightBinningOverlap default per backend, from the
+// on/off benches in planning/architecture-plan.md.
+[[nodiscard]] auto defaultLightBinningOverlap(gfx::Backend backend, bool asyncCompute) -> bool {
+    (void)backend;
+    return asyncCompute;
+}
+
 [[nodiscard]] auto floatWord(float value) -> std::uint32_t {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -394,7 +401,10 @@ void drawMesh(gfx::CommandBuffer& commandBuffer, const resources::Mesh& mesh,
 } // namespace
 
 Renderer::Renderer(ecs::Registry& registry, gfx::IDevice& device)
-    : registry_(registry), device_(device), meshArena_(64), textureArena_(128) {}
+    : registry_(registry), device_(device), meshArena_(64), textureArena_(128) {
+    pbrSettings_.lightBinningOverlap = defaultLightBinningOverlap(device.backend(),
+                                                                  device.supportsAsyncCompute());
+}
 
 void Renderer::releaseInitializationResources() {
     if (shadowFramebuffer_.isValid()) (void)device_.destroyFramebuffer(shadowFramebuffer_);
@@ -1191,6 +1201,8 @@ void Renderer::recordLightBinning(gfx::CommandBuffer& commandBuffer) {
                                framePointLights_.generation);
     // Workgroup c bins cluster c; every workgroup also copies 64 prefix words.
     commandBuffer.dispatch(std::max(p.clusterCount, groups(p.copyWords)));
+    // Overlap order: the "light-binning-wait" pass holds this barrier.
+    if (frameBinningOverlap_) return;
     commandBuffer.bufferBarrier(
         framePointLights_, written,
         {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});
@@ -1947,6 +1959,7 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         frameBloomActive_ = false;
         pointLightsGathered_ = false;
         framePointLightsReady_ = false;
+        frameBinningOverlap_ = false;
         recordColorFormat_ = gfx::TextureFormat::RGBA8_UNORM;
         return error;
     };
@@ -1960,10 +1973,14 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         bloomConstants_.beginFrame();
     }
 
-    // GPU light binning runs first; record() then binds its output.
+    // GPU light binning runs first; record() then binds its output. With
+    // lightBinningOverlap it may run on the async compute queue, and its
+    // barrier moves to a "light-binning-wait" pass right before the main pass.
     if (preparePointLightsGpu(*camera, aspect)) {
+        frameBinningOverlap_ = pbrSettings_.lightBinningOverlap;
         gfx::PassDesc binningPass;
         binningPass.name = containers::String("light-binning");
+        binningPass.asyncCompute = frameBinningOverlap_;
         binningPass.record = [this](gfx::CommandBuffer& commandBuffer) {
             recordLightBinning(commandBuffer);
         };
@@ -2035,6 +2052,19 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(atlasPass));
     }
 
+    if (frameBinningOverlap_) {
+        gfx::PassDesc waitPass;
+        waitPass.name = containers::String("light-binning-wait");
+        waitPass.record = [this](gfx::CommandBuffer& commandBuffer) {
+            commandBuffer.waitAsyncCompute();
+            commandBuffer.bufferBarrier(
+                framePointLights_,
+                {gfx::PipelineStageMask::ComputeShader, gfx::ResourceAccessMask::ShaderWrite},
+                {gfx::PipelineStageMask::FragmentShader, gfx::ResourceAccessMask::ShaderRead});
+        };
+        (void)graph_.declarePass(static_cast<gfx::PassDesc&&>(waitPass));
+    }
+
     const auto target = graph_.importFramebuffer(containers::String("main-target"), framebuffer);
     gfx::RenderGraph::ResourceId hdrImage = 0;
     gfx::PassDesc mainPass;
@@ -2083,7 +2113,10 @@ auto Renderer::render(gfx::FramebufferHandle framebuffer, ecs::Entity cameraEnti
         bloom ? gfx::TextureFormat::RGBA16_FLOAT : gfx::TextureFormat::RGBA8_UNORM;
     gfx::CommandBuffer commandBuffer;
     graph_.setGpuTimestamps(pbrSettings_.gpuTimers && device_.supportsGpuTimestamps());
+    graph_.setAsyncCompute(frameBinningOverlap_);
     const gfx::GfxError submitError = graph_.execute(device_, commandBuffer);
+    stats_.lightBinningAsyncCompute = submitError == gfx::GfxError::None &&
+                                      graph_.asyncComputeUsed();
     ++renderFrameCount_;
     if (submitError == gfx::GfxError::None && graph_.gpuTimestampsWritten()) {
         const std::uint64_t serial = device_.lastGpuTimestampSerial();

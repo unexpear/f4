@@ -38,6 +38,9 @@ struct FrameStats {
     // Compute dispatches that binned the point lights this frame: 0 means the
     // CPU binned them (PbrRenderSettings::gpuLightBinning).
     std::uint32_t pointLightBinningDispatches = 0;
+    // The binning dispatch ran on the device's async compute queue
+    // (PbrRenderSettings::lightBinningOverlap on Vulkan/DX12).
+    bool lightBinningAsyncCompute = false;
     // Point-light shadows: lights given an atlas slot this frame and the face
     // draws recorded for them.
     std::uint32_t pointShadowLights = 0;
@@ -61,7 +64,10 @@ struct FrameStats {
     std::uint32_t gpuPassCount = 0;
     GpuPassTime gpuPasses[kMaxGpuPasses]{};
     double gpuFrameMs = 0.0;
-    double gpuLightBinningMs = 0.0; // "light-binning" pass (0 when the CPU binned)
+    // "light-binning" pass (0 when the CPU binned, ~0 when it ran on the
+    // async compute queue: its time is then off the graphics timeline, and
+    // the "light-binning-wait" pass shows how long graphics waited for it).
+    double gpuLightBinningMs = 0.0;
     double gpuMainPassMs = 0.0;     // "main" pass (PBR shading)
     std::uint32_t gpuTimingLag = 0;  // render() calls since the timed frame
     bool gpuTimingValid = false;
@@ -122,6 +128,17 @@ struct PbrRenderSettings {
     // called on its own always bins on the CPU. false forces the CPU path
     // (the reference).
     bool gpuLightBinning = true;
+    // Overlap the GPU light binning with other GPU work. The binning pass
+    // only signals; a "light-binning-wait" pass right before the main pass
+    // holds the compute-write -> fragment-read barrier, so the shadow and
+    // point-shadow atlas passes in between (and, across frames, the previous
+    // frame's main pass) need not wait for it. On Vulkan and DX12 with a
+    // separate compute queue the dispatch runs on that queue and the wait is
+    // a cross-queue semaphore / fence wait; elsewhere (no such queue, OpenGL,
+    // WebGPU) it stays on the one queue and only the barrier moves. Same
+    // image either way. The default comes from the backend (see the
+    // Renderer constructor); no effect when the CPU bins.
+    bool lightBinningOverlap = false;
     // Time every render-graph pass with GPU timestamp queries and report the
     // results in FrameStats::gpu*. Off by default (each pass boundary then
     // waits for the previous pass to drain).
@@ -273,6 +290,7 @@ private:
     gfx::PipelineHandle lightBinningPipeline_{};
     bool lightBinningUnavailable_ = false;
     bool framePointLightsReady_ = false; // render() already prepared them on the GPU path
+    bool frameBinningOverlap_ = false;   // this frame's binning uses the overlap order
     gfx::BufferHandle framePointLightInput_{};
     ClusteredLightGpuParams frameBinning_{};
     ClusteredLightStats frameLightStats_{};
