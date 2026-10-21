@@ -192,7 +192,7 @@ written acceptance gate is still open; ❌ means no milestone implementation.
 | M9 Vulkan | ✅ Complete | Vulkan 1.3 now covers SDL surface/presentation, resources, descriptors, build-time SPIR-V, dynamic-rendering pipelines, synchronization2 barriers, fenced frames in flight, swapchain recreation, and deferred retirement. Windows and Linux validation/synchronization-validation runs are clean, and OpenGL/Vulkan float and RGBA8 parity tests pass. |
 | M10 DX12 | ✅ Complete | Native D3D12 covers hardware/WARP device selection, queues and fenced frames in flight, resources, barriers, render targets, root signatures, dynamically sized descriptor heaps, DXC-built Shader Model 6 pipelines, deferred retirement, and SDL/DXGI presentation/recreation. Focused pixel, stability, 130-draw binding, swapchain, and seeded parity tests pass alongside the full suite. |
 | M11 PBR | ✅ Complete | Engine materials implement glTF metallic-roughness factors and texture slots, strict glTF-to-renderer mapping, GGX direct lighting, equirectangular mip-chain IBL, derivative normal mapping, filtered directional shadows, ACES tone mapping, alpha modes, and unlit materials. Native OpenGL GLSL, Vulkan SPIR-V, and DX12 HLSL/DXIL paths pass full-frame parity and clean validation gates, including position-only mesh fallbacks. Clustered forward point lights (hundreds to thousands per frame) now shade on OpenGL/Vulkan/DX12/WebGPU with GL/VK/DX image parity; Metal point lights are written but unverified. |
-| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, graph scheduling, and async compute remain open. |
+| M12 Optimization | ⚠ Partial | The renderer now computes authoritative mesh bounds, rejects camera-frustum misses, sorts a deterministic complete opaque batch key, and collapses compatible opaque items into native instanced draws on OpenGL, Vulkan, and DX12. Transparent items remain depth-sorted and unbatched. M16's distance-priority job system is complete; occlusion culling, multithreaded recording, SIMD paths, and graph scheduling remain open. Async compute exists for light binning on Vulkan/DX12 (off by default: no measured gain). |
 | M13 Deterministic noise | ✅ Complete | Complete for OpenGL/Vulkan/DX12 and the current WebGPU backend: seeded value/perlin/simplex, FBM, and domain warp APIs retain bit-exact GCC/MSVC/Clang CPU vectors. API-neutral compute pipelines, dispatch, synchronization, storage bindings, and readback run equivalent GLSL/SPIR-V, HLSL/DXIL, and paired-`u32` WGSL kernels. Every implemented CPU/GPU probe passes the centralized float tolerance with at least a 4x margin. Metal parity remains an M17 admission gate. |
 | M14 World data model | ✅ Complete | Handle-keyed chunks, negative-safe coordinates, regional policy selection, synchronized lifecycle/version snapshots, sparse deterministic delta saves, and monomorphic voxel/height/hex policies implement §11. Golden generation and persistence digests match GCC, MSVC, and Clang; focused topology, seam, DDA, stale-work, corruption, and concurrency tests pass under Clang ASan+UBSan. |
 | M15 Terrain meshing | ✅ Complete | All policies emit one `MeshData` record and convert through the canonical M11 mesh/RHI path. Voxel greedy culling includes material ranges, a 34³ border, baked AO, AO-aware diagonals, and deterministic transparent-interface ownership; height tiles include neighbor-fed normals, fixed tessellation, four-way biome color splatting, skirts, and a transition floor; hex tiles emit colored closed prisms from the shared corner lattice. Version-safe snapshot builds, live-neighbor border invalidation/mirroring, cross-toolchain golden dumps, and a visually captured gallery are present. |
@@ -811,8 +811,9 @@ Completed delivery and acceptance gates:
   are mostly CPU-bound: `render()` takes 1.2-5.7 ms of CPU time, against
   0.5-2.9 ms with GPU binning. Stress 4,096 is within noise: +5% in this
   run, but -11%, -3%, and -3% in three earlier runs. In all three timed runs that measured both variants, though, its
-  main pass read about 1 ms slower after GPU binning (4.9 to 5.9 ms). The
-  native backends do not show this, and the cause is not known yet.
+  main pass read about 1 ms slower after GPU binning (4.9 to 5.9 ms). That
+  turned out to be clock drift between separate runs, not GPU binning: see
+  the overlap item below.
 - ✅ Where the binning time went, measured with the timers
   (`F4_POINT_LIGHT_BENCH=binning`). The old 3-dispatch kernel cost 0.22-0.42
   ms of GPU time at 1,024 lights and 0.72-1.62 ms at 4,096. Each of the 3,456
@@ -856,20 +857,99 @@ Completed delivery and acceptance gates:
   were +1% GL, +7% VK, and +4% DX12. In the previous run (90d65af, 5 rounds)
   they were -1% GL, -6% VK, and -1% DX12. GPU binning stays the default on
   every backend because no backend is slower in every scene.
+- ✅ Light-binning overlap / async compute (2026-10-20, commits 22e8609,
+  07b774c, b423cf9, 3c0b481, 07dfe71, e0bc723 and the defaults commit).
+  `PbrRenderSettings::lightBinningOverlap` (off by default, see below).
+  - RHI: `IDevice::supportsAsyncCompute()` / `submitAsyncCompute()`,
+    `CommandBuffer::waitAsyncCompute()` (marks where the graphics work must
+    wait), and `PassDesc::asyncCompute`. The render graph records async
+    passes into a second command buffer, submits it first, and falls back to
+    recording them inline when the device has no async queue.
+  - With overlap on, the binning pass only dispatches; a
+    "light-binning-wait" pass right before the main pass waits and holds the
+    compute-write -> fragment-read barrier, so the shadow and point-shadow
+    atlas passes need not wait for binning.
+  - Vulkan: the first queue family with COMPUTE and not GRAPHICS (family 2
+    on the RTX). Buffers are created `VK_SHARING_MODE_CONCURRENT` over the
+    graphics and compute families when that queue exists, so no ownership
+    transfers are needed. The compute command buffer signals a per-frame
+    semaphore; the graphics work is split at the wait point into two
+    submits, and the second waits on it. Clean under the validation layer
+    with synchronization validation on.
+  - DX12: a COMPUTE command queue with its own allocator and descriptor
+    heaps per frame slot. The graphics list is split at the wait point and
+    `ID3D12CommandQueue::Wait` on the compute fence sits between the two.
+    Buffers bound by the compute list start and end in COMMON (they decay
+    there between ExecuteCommandLists). Clean under the debug layer.
+  - OpenGL / WebGPU: no async queue; the dispatch stays first on the one
+    queue and only the barrier moves. Dawn inserts its own barrier anyway.
+  - `F4_NO_ASYNC_COMPUTE=1` forces the single-queue path on Vulkan/DX12.
+  - Parity: a 4,096-light scene joined the GPU-binning parity test, and every
+    scene also renders with overlap on: identical image and light buffer, the
+    async queue used exactly when the device has one. VK and DX12 match
+    exactly at 4,096 lights; GL differs from them by 41 px (max delta 48) in
+    that scene with CPU and GPU binning alike, so it is not binning-related
+    and the GL/VK comparison is informational there.
+  - Bench (`F4_POINT_LIGHT_BENCH=overlap`): one renderer, CPU / GPU /
+    GPU+overlap alternating in blocks of 30 frames (6 settle frames, drained
+    with `waitIdle` before and after each block), median of 21 blocks. This
+    replaced separate runs per variant, whose results drifted with the
+    laptop's clocks (it throttles at ~89 C). RTX 3070 Ti Laptop, 1280x720,
+    ms/frame, overlap vs GPU binning:
+
+  | Backend | stress 1,024 | stress 4,096 | scaled 1,024 | scaled 4,096 | stress 4,096 + pillars + 8 shadowed |
+  |---|---|---|---|---|---|
+  | Vulkan | 0.98 / 1.07 (+9%) | 5.76 / 5.82 (+1%) | 0.86 / 0.86 (0%) | 1.56 / 1.63 (+5%) | 15.72 / 15.66 (-0.4%) |
+  | DX12 run 1 | 1.36 / 1.39 (+2%) | 7.50 / 6.58 (-12%) | 1.00 / 1.13 (+13%) | 2.05 / 2.08 (+2%) | 17.47 / 16.86 (-3.5%) |
+  | DX12 run 2 | 0.91 / 0.98 (+7%) | 5.64 / 5.65 (+0.2%) | 0.88 / 0.96 (+9%) | 1.81 / 1.87 (+4%) | 13.90 / 13.84 (-0.4%) |
+  | OpenGL | 1.71 / 1.72 (+1%) | 8.79 / 8.71 (-1%) | 1.10 / 1.10 (0%) | 2.20 / 2.15 (-2%) | 20.38 / 20.17 (-1%) |
+
+  An earlier 15-block run without the drain (GL then only timed command
+  submission) gave Vulkan +21% / +2% / +11% / +5% / -1% and DX12 +1% / -0.2%
+  / +16% / +2% / +1% in the same column order.
+  - Result: no real gain on any backend. The binning pass is only 0.05-0.17
+    ms, so that is the most overlap could hide, and the stress scenes have no
+    shadow passes to overlap with. In light scenes the extra submit plus the
+    cross-queue wait costs 0.05-0.15 ms on Vulkan and DX12. The shadowed
+    4,096 scene is the only consistent (small) gain, -0.4% to -3.5%, within
+    noise. DX12 stress 4,096's -12% in run 1 did not repeat (+0.2% in run
+    2). **`lightBinningOverlap` therefore defaults to off on every backend**;
+    the code path stays for scenes with long shadow/atlas work.
+  - WebGPU main-pass slowdown: not real. The WebGPU bench now runs the GPU
+    timers as the same in-renderer A/B (median of 11 blocks), and the
+    stress-4,096 main pass is 6.665 ms with CPU binning, 6.671 ms with GPU
+    binning, 6.664 ms with GPU binning + overlap order. The GPU and CPU light
+    buffers were also compared word for word on WebGPU (0 differences of
+    849,324 index words at 4,096 lights). The earlier 4.9 -> 5.9 ms came from
+    separate timed runs per variant on a GPU whose clock drifts with
+    temperature (735-915 MHz while throttling) and was shared with other GPU
+    apps. In the A/B the light scenes still show a 0.02-0.08 ms main-pass
+    difference (stress 1,024 1.09 / 1.14, scaled 4,096 1.34 / 1.41), small
+    enough to be the same effect.
+
+  WebGPU (Chromium, release wasm, 5 rounds frame time, A/B GPU timers):
+
+  | Scene | CPU / GPU / GPU+overlap frame ms | GPU frame (timers) | binning pass | main pass |
+  |---|---|---|---|---|
+  | stress 1,024 | 1.91 / 1.52 / 1.48 | 1.09 / 1.20 / 1.26 | 0.057 | 1.09 / 1.14 / 1.19 |
+  | stress 4,096 | 7.73 / 7.42 / 7.55 | 6.67 / 6.77 / 6.78 | 0.102 | 6.67 / 6.67 / 6.66 |
+  | scaled 1,024 | 1.37 / 1.07 / 0.99 | 0.67 / 0.76 / 0.78 | 0.053 | 0.67 / 0.71 / 0.69 |
+  | scaled 4,096 | 2.44 / 1.85 / 1.85 | 1.34 / 1.47 / 1.53 | 0.056 | 1.34 / 1.41 / 1.47 |
 - Still open:
   - Metal has every shader and binding written but was not compiled or run
     (no Apple hardware). It bins on the CPU and has no timer queries.
-  - WebGPU stress 4,096: the main pass runs about 1 ms slower after GPU
-    binning than after CPU binning (see above). Candidates are Dawn's
-    barrier between the compute write and the fragment read, or the buffer's
-    placement.
   - WebGPU timers need frame pacing. The renderer keeps 8 timed frames, so
     if the GPU falls more than about 8 submits behind (an unthrottled loop
     that never presents), results stop matching their frames. rAF-paced
     apps and the bench stay within 3.
   - In GPU-bound scenes near the index cap, the binning pass's index writes
-    (0.15 ms) are not hidden. Async compute or overlapping the pass with the
-    shadow passes could hide them.
+    (0.15 ms) are still not hidden: async compute / overlap is implemented
+    but measured no real gain, so it is off by default. Larger shadow/atlas
+    work (many uncached shadowed lights) is where it could pay off; the
+    shadowed 4,096 bench gained 0.4-3.5%, within noise.
+  - OpenGL renders the 4,096-light parity scene 41 px different from Vulkan
+    and DX12 (max delta 48), with CPU and GPU binning alike; cause not
+    found.
   - Bloom has no lens dirt or anamorphic options.
   - The 1,024-per-type object stores crash on overflow instead of returning
     an error, so two renderers cannot share one GL device.
