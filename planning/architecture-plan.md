@@ -887,9 +887,8 @@ Completed delivery and acceptance gates:
   - Parity: a 4,096-light scene joined the GPU-binning parity test, and every
     scene also renders with overlap on: identical image and light buffer, the
     async queue used exactly when the device has one. VK and DX12 match
-    exactly at 4,096 lights; GL differs from them by 41 px (max delta 48) in
-    that scene with CPU and GPU binning alike, so it is not binning-related
-    and the GL/VK comparison is informational there.
+    exactly at 4,096 lights. GL differs from them by 41 fill-rule tie pixels
+    there (see the item below). Since then, that comparison is asserted.
   - Bench (`F4_POINT_LIGHT_BENCH=overlap`): one renderer, CPU / GPU /
     GPU+overlap alternating in blocks of 30 frames (6 settle frames, drained
     with `waitIdle` before and after each block), median of 21 blocks. This
@@ -935,6 +934,49 @@ Completed delivery and acceptance gates:
   | stress 4,096 | 7.73 / 7.42 / 7.55 | 6.67 / 6.77 / 6.78 | 0.102 | 6.67 / 6.67 / 6.66 |
   | scaled 1,024 | 1.37 / 1.07 / 0.99 | 0.67 / 0.76 / 0.78 | 0.053 | 0.67 / 0.71 / 0.69 |
   | scaled 4,096 | 2.44 / 1.85 / 1.85 | 1.34 / 1.47 / 1.53 | 0.056 | 1.34 / 1.41 / 1.47 |
+- ✅ OpenGL vs Vulkan/DX12 in the 4,096-light parity scene (2026-10-20).
+  The 41 differing pixels (max delta 48) are all in image row 44, one per
+  visible lamp cube of light-grid row 31 (z = -0.22). The bottom-back edge of
+  those cubes (y = 0.54, z = -0.16, view depth 12.9) projects to row 44.4986,
+  0.0014 px from the pixel centre and inside the 1/256 px subpixel snap, so
+  it lies exactly on the centres: a fill-rule tie. Vulkan and DX12 (top-left
+  rule) leave those pixels to the ground; OpenGL gives them to the cube.
+  - Cause: f4 runs OpenGL with `glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)`,
+    so OpenGL stores images bottom-up while Vulkan (negative viewport height)
+    and DX12 store them top-down. The tie rule follows the storage order, so
+    a horizontal edge exactly through pixel centres is owned by the opposite
+    side. GL leaves the tie rule to the implementation, and ARB_clip_control
+    issue 9 says the origin choice can change it.
+  - Evidence: Vulkan and DX12 agree exactly. CPU and GPU binning give the
+    same 41 pixels. The tie pixels are lamp-cube coverage, not lighting.
+    Re-rendering the scene on OpenGL with `GL_UPPER_LEFT` (the Vulkan/DX12
+    storage order) gives 0 mismatching pixels, max delta 0, against Vulkan.
+  - Ruled out:
+    - Depth convention: all backends use `perspectiveRH_ZO` with ZERO_TO_ONE.
+    - Cluster lookup: tiles come from the interpolated clip position, not
+      `gl_FragCoord`. The tie point sits at slice 18.2 and tile row 4.8, far
+      from any boundary.
+    - Index cap and truncation: 0 references are dropped.
+    - Precision and range-window edges: the shading of covered pixels matches.
+  - New test, "Rasterization: edges exactly on pixel centres (fill-rule
+    ties)". It uses a camera-facing cube on a 16x16 target whose edges land
+    exactly on rows and columns 4.5 and 11.5:
+    - Vulkan and DX12 cover rows 4-10. OpenGL covers rows 5-11, and rows
+      4-10 with `GL_UPPER_LEFT`.
+    - Columns agree (4-10).
+    - Nudged by 1/16 px, every backend covers rows 5-11.
+    - The test asserts Vulkan == DX12, upper-left OpenGL == Vulkan, and
+      default OpenGL == Vulkan off the tie.
+  - The 4,096-light comparison is now asserted. Vulkan == DX12 within the usual
+    tolerance. Upper-left OpenGL == Vulkan within that tolerance (0
+    mismatches). Default OpenGL may differ only in tie pixels: at most 64, one
+    per lamp cube in the row; 41 here.
+  - Not changed: the OpenGL backend keeps the lower-left origin. Switching
+    it to upper-left would make ties resolve like Vulkan/DX12 everywhere.
+    But it would also flip the GL shadow and atlas UVs, the viewport and
+    scissor y, window presentation (or need a flip at present), the bloom
+    composite to the window, and every GL readback. That is a
+    backend-wide convention change for its own PR.
 - Still open:
   - Metal has every shader and binding written but was not compiled or run
     (no Apple hardware). It bins on the CPU and has no timer queries.
@@ -947,9 +989,10 @@ Completed delivery and acceptance gates:
     but measured no real gain, so it is off by default. Larger shadow/atlas
     work (many uncached shadowed lights) is where it could pay off; the
     shadowed 4,096 bench gained 0.4-3.5%, within noise.
-  - OpenGL renders the 4,096-light parity scene 41 px different from Vulkan
-    and DX12 (max delta 48), with CPU and GPU binning alike; cause not
-    found.
+  - OpenGL resolves fill-rule ties (edges exactly through pixel centres)
+    on the other side from Vulkan/DX12 because it stores images bottom-up
+    (see the item below). A GL_UPPER_LEFT origin would remove this, but it is
+    a backend-wide change.
   - Bloom has no lens dirt or anamorphic options.
   - The 1,024-per-type object stores crash on overflow instead of returning
     an error, so two renderers cannot share one GL device.
