@@ -1013,15 +1013,6 @@ template <typename Reader>
         device.waitIdle();
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
                 gfx::GfxError::None);
-        if (device.backend() == gfx::Backend::OpenGL) {
-            const std::size_t row = static_cast<std::size_t>(width) * 4u;
-            for (std::uint32_t y = 0; y < height / 2; ++y) {
-                std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
-                                 pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
-                                 pixels.begin() +
-                                     static_cast<std::ptrdiff_t>((height - 1 - y) * row));
-            }
-        }
     }
     CHECK(device.destroyFramebuffer(framebuffer.value()) == gfx::GfxError::None);
     CHECK(device.destroyTexture(depth.value()) == gfx::GfxError::None);
@@ -1422,15 +1413,6 @@ template <typename Reader>
         device.waitIdle();
         REQUIRE(reader(color.value(), std::as_writable_bytes(std::span(pixels))) ==
                 gfx::GfxError::None);
-        if (device.backend() == gfx::Backend::OpenGL) {
-            const std::size_t row = static_cast<std::size_t>(size) * 4u;
-            for (std::uint32_t y = 0; y < size / 2; ++y) {
-                std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
-                                 pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
-                                 pixels.begin() +
-                                     static_cast<std::ptrdiff_t>((size - 1 - y) * row));
-            }
-        }
     };
 
     WebValidationFrames frames;
@@ -1588,15 +1570,6 @@ struct NightTarget {
         device.waitIdle();
         Capture pixels(static_cast<std::size_t>(width) * height * 4u, 0);
         REQUIRE(reader(color, std::as_writable_bytes(std::span(pixels))) == gfx::GfxError::None);
-        if (device.backend() == gfx::Backend::OpenGL) {
-            const std::size_t row = static_cast<std::size_t>(width) * 4u;
-            for (std::uint32_t y = 0; y < height / 2; ++y) {
-                std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
-                                 pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
-                                 pixels.begin() +
-                                     static_cast<std::ptrdiff_t>((height - 1 - y) * row));
-            }
-        }
         return pixels;
     }
 };
@@ -1868,22 +1841,6 @@ struct BinningFrame {
     return options;
 }
 
-// OpenGL keeps its lower-left framebuffer origin (glClipControl(GL_LOWER_LEFT,
-// ...)), so its images are stored bottom-up while Vulkan/DX12 store them
-// top-down. Which side of an edge that runs exactly through pixel centres owns
-// those pixels (the fill-rule tie) is implementation-defined and follows the
-// storage order, so such edges can land one row apart. Rendering OpenGL with
-// GL_UPPER_LEFT (same storage order as Vulkan/DX12) resolves them the same way;
-// the tests below use that to prove this is the only difference.
-void flipRows(Capture& pixels, std::uint32_t width, std::uint32_t height) {
-    const std::size_t row = static_cast<std::size_t>(width) * 4u;
-    for (std::uint32_t y = 0; y < height / 2; ++y) {
-        std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
-                         pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
-                         pixels.begin() + static_cast<std::ptrdiff_t>((height - 1 - y) * row));
-    }
-}
-
 template <typename Reader>
 [[nodiscard]] auto captureBinningScenes(gfx::IDevice& device, Reader&& reader)
     -> std::vector<BinningFrame> {
@@ -2106,9 +2063,12 @@ template <typename Reader>
 
 } // namespace
 
-// Isolates the OpenGL vs Vulkan/DX12 difference in the 4096-light parity
-// scene: there a row of lamp-cube edges lands on pixel centres, and which side
-// of such an edge owns the pixel is the rasterizer's fill rule.
+// Which side of an edge exactly through pixel centres owns those pixels is the
+// rasterizer's fill rule, and it follows the order rows are stored in. OpenGL
+// renders offscreen targets with an upper-left clip origin, storing rows
+// top-down like Vulkan and DX12, so all three resolve such ties alike (with
+// GL's default lower-left origin OpenGL covered rows 5-11 here instead of
+// 4-10, and 41 pixels of the 4096-light parity scene differed).
 TEST_CASE("Rasterization: edges exactly on pixel centres (fill-rule ties) on OpenGL, Vulkan, and DX12") {
     auto windowResult = platform::Window::create({"Fill rule", kTieExtent, kTieExtent, false});
     REQUIRE(windowResult.hasValue());
@@ -2125,14 +2085,6 @@ TEST_CASE("Rasterization: edges exactly on pixel centres (fill-rule ties) on Ope
     gfx::IDevice* openGl = gfx::createOpenGLDevice();
     REQUIRE(openGl != nullptr);
     for (int i = 0; i < 2; ++i) gl[i] = captureFillRuleTie(*openGl, glReader, nudges[i]);
-    // Same frames with OpenGL storing rows top-down like Vulkan/DX12.
-    Capture glUpperLeft[2];
-    glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
-    for (int i = 0; i < 2; ++i) {
-        glUpperLeft[i] = captureFillRuleTie(*openGl, glReader, nudges[i]);
-        flipRows(glUpperLeft[i], kTieExtent, kTieExtent);
-    }
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
     gfx::deleteDevice(openGl);
     delete window;
     gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
@@ -2160,25 +2112,19 @@ TEST_CASE("Rasterization: edges exactly on pixel centres (fill-rule ties) on Ope
     }
     gfx::deleteDevice(dx12Base);
     for (int i = 0; i < 2; ++i) {
-        const TieCoverage g = tieCoverage(gl[i]), u = tieCoverage(glUpperLeft[i]),
-                          v = tieCoverage(vk[i]), d = tieCoverage(dx[i]);
+        const TieCoverage g = tieCoverage(gl[i]), v = tieCoverage(vk[i]), d = tieCoverage(dx[i]);
         const auto span = [](int first, int last) {
             return std::to_string(first) + "-" + std::to_string(last);
         };
         MESSAGE(std::string(i == 0 ? "tie" : "nudged 1/16 px")
                 << ": covered rows/columns GL " << span(g.firstRow, g.lastRow) << "/"
-                << span(g.firstColumn, g.lastColumn) << ", GL upper-left "
-                << span(u.firstRow, u.lastRow) << "/" << span(u.firstColumn, u.lastColumn)
-                << ", VK " << span(v.firstRow, v.lastRow) << "/"
-                << span(v.firstColumn, v.lastColumn) << ", DX " << span(d.firstRow, d.lastRow)
-                << "/" << span(d.firstColumn, d.lastColumn));
+                << span(g.firstColumn, g.lastColumn) << ", VK " << span(v.firstRow, v.lastRow)
+                << "/" << span(v.firstColumn, v.lastColumn) << ", DX "
+                << span(d.firstRow, d.lastRow) << "/" << span(d.firstColumn, d.lastColumn));
         CHECK(v.firstRow == (i == 0 ? 4 : 5)); // top-left rule: top edge in, bottom out
         CHECK(v.firstColumn == 4);
         CHECK(engine::compareShaderImagesRgba8(vk[i], dx[i], 0).mismatchPixelCount == 0);
-        CHECK(engine::compareShaderImagesRgba8(glUpperLeft[i], vk[i], 2).mismatchPixelCount ==
-              0);
-        // Off the tie every backend agrees in the default orientation too.
-        if (i == 1) CHECK(engine::compareShaderImagesRgba8(gl[i], vk[i], 2).mismatchPixelCount == 0);
+        CHECK(engine::compareShaderImagesRgba8(gl[i], vk[i], 2).mismatchPixelCount == 0);
     }
 }
 
@@ -2197,19 +2143,6 @@ TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan
         return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
     };
     const auto gl = captureBinningScenes(*openGlBase, glRead);
-    // The 4096-light scene once more with OpenGL's origin set to upper-left
-    // (Vulkan/DX12 storage order; see flipRows). The stress scene samples no
-    // render target, so only the rasterization order changes.
-    Capture glUpperLeft;
-    {
-        glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
-        NightTarget target(*openGlBase, kEffectWidth, kEffectHeight);
-        auto world = std::make_unique<NightWorld>(*openGlBase, denseBinningOptions(64));
-        glUpperLeft = target.render(world->renderer, world->camera, glRead);
-        flipRows(glUpperLeft, kEffectWidth, kEffectHeight); // undo target's GL flip
-        world.reset();
-        glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
-    }
     gfx::deleteDevice(openGlBase);
     delete window;
     checkBinningFrames("OpenGL", gl);
@@ -2244,53 +2177,10 @@ TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan
     checkBinningFrames("DX12", dx);
 
     for (std::size_t i = 0; i < gl.size(); ++i) {
-        if (std::string(gl[i].scene) == "4096 lights") {
-            // One row of lamp-cube edges (grid row 31, image row 44) runs
-            // through pixel centres here: a fill-rule tie that OpenGL's
-            // bottom-up storage resolves on the other side (see flipRows and
-            // the "Rasterization: edges exactly on pixel centres" test). With
-            // GL_UPPER_LEFT, OpenGL matches Vulkan within the usual tolerance,
-            // which proves the tie is the whole difference; the default
-            // OpenGL image may differ in those tie pixels only (41 here, one
-            // per visible lamp cube in that row, so at most 64).
-            checkEffectParity("GPU binning 4096 lights VK/DX", vk[i].gpu, dx[i].gpu);
-            checkEffectParity("4096 lights GL (upper-left origin)/VK", glUpperLeft, vk[i].gpu);
-            const auto tie = engine::compareShaderImagesRgba8(gl[i].gpu, vk[i].gpu, 2);
-            MESSAGE("GPU binning 4096 lights GL/VK: fill-rule tie pixels="
-                    << tie.mismatchPixelCount
-                    << " max delta=" << static_cast<int>(tie.maxChannelDelta));
-            CHECK(tie.mismatchPixelCount <= 64);
-            CHECK(engine::compareShaderImagesRgba8(gl[i].gpu, gl[i].cpu, 0).mismatchPixelCount ==
-                  0);
-            if (std::getenv("F4_PARITY_DUMP") != nullptr) {
-                const auto cpuEdge = engine::compareShaderImagesRgba8(gl[i].cpu, vk[i].cpu, 2);
-                MESSAGE("CPU binning 4096 lights GL/VK: mismatches="
-                        << cpuEdge.mismatchPixelCount
-                        << " max delta=" << static_cast<int>(cpuEdge.maxChannelDelta));
-                maybeWriteCapture("binning4096_gl", gl[i].gpu, kEffectWidth, kEffectHeight);
-                maybeWriteCapture("binning4096_vk", vk[i].gpu, kEffectWidth, kEffectHeight);
-                maybeWriteCapture("binning4096_dx", dx[i].gpu, kEffectWidth, kEffectHeight);
-                for (std::uint32_t y = 0; y < kEffectHeight; ++y) {
-                    for (std::uint32_t x = 0; x < kEffectWidth; ++x) {
-                        const std::size_t o = (static_cast<std::size_t>(y) * kEffectWidth + x) * 4u;
-                        int delta = 0, vkDx = 0;
-                        for (int c = 0; c < 4; ++c) {
-                            delta = std::max(delta, std::abs(int(gl[i].gpu[o + c]) -
-                                                             int(vk[i].gpu[o + c])));
-                            vkDx = std::max(vkDx, std::abs(int(dx[i].gpu[o + c]) -
-                                                           int(vk[i].gpu[o + c])));
-                        }
-                        if (delta <= 2 && vkDx == 0) continue;
-                        std::printf("[parity dump] x=%u y=%u gl=%u,%u,%u vk=%u,%u,%u dx=%u,%u,%u "
-                                    "glvk=%d vkdx=%d\n",
-                                    x, y, gl[i].gpu[o], gl[i].gpu[o + 1], gl[i].gpu[o + 2],
-                                    vk[i].gpu[o], vk[i].gpu[o + 1], vk[i].gpu[o + 2],
-                                    dx[i].gpu[o], dx[i].gpu[o + 1], dx[i].gpu[o + 2], delta, vkDx);
-                    }
-                }
-            }
-            continue;
-        }
+        // Every scene, 4096 lights included, holds OpenGL to Vulkan and DX12.
+        // That scene has a row of lamp-cube edges exactly on pixel centres
+        // (a fill-rule tie); it matches because OpenGL now stores offscreen
+        // targets top-down like the others (upper-left clip origin).
         checkEffectParity(std::string("GPU binning ") + gl[i].scene + " GL/VK", gl[i].gpu,
                           vk[i].gpu);
         checkEffectParity(std::string("GPU binning ") + gl[i].scene + " GL/DX", gl[i].gpu,

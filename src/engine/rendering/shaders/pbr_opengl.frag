@@ -104,7 +104,9 @@ vec3 mappedNormal(vec3 geometricNormal) {
 float shadowVisibility(float nDotL) {
     if (renderParams.z < 0.5 || vLightClip.w <= 0.0) return 1.0;
     vec3 projected = vLightClip.xyz / vLightClip.w;
-    vec2 uv = projected.xy * 0.5 + 0.5;
+    // Render targets are stored top-down on every backend (OpenGL renders
+    // offscreen passes with an upper-left clip origin), so NDC +y is v = 0.
+    vec2 uv = vec2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
         projected.z < 0.0 || projected.z > 1.0) return 1.0;
     float bias = max(renderParams.y * (1.0 - nDotL), renderParams.y * 0.2);
@@ -156,7 +158,7 @@ float pointShadowVisibility(uint shadowSlot, vec3 worldPosition, vec3 toFragment
                              vec2(limit));
             vec2 atlas = vec2((tap.x + 1.0 + 2.0 * column) / 6.0 - 1.0,
                               (tap.y + 1.0 + 2.0 * row) / rows - 1.0);
-            vec2 uv = atlas * 0.5 + 0.5;
+            vec2 uv = vec2(atlas.x * 0.5 + 0.5, 0.5 - atlas.y * 0.5);
             float stored = textureLod(uTex8, uv, 0.0).r;
             visibility += normalizedDistance - bias <= stored ? 1.0 : 0.0;
         }

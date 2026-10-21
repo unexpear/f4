@@ -1363,12 +1363,10 @@ void Renderer::recordPointShadows(gfx::CommandBuffer& commandBuffer) {
     const auto rows = pointShadowRows_;
     const std::uint32_t tile = pointShadowTileSize_;
     // Stored rows of a slot's tiles: the PBR shader reads slot `s` at atlas
-    // NDC rows (see pointShadowTileTransform), which is stored row block `s`
-    // on OpenGL and `rows - 1 - s` elsewhere.
+    // NDC rows (see pointShadowTileTransform), which is stored row block
+    // `rows - 1 - s` (targets are stored top-down on every backend).
     const auto selectTile = [&](std::size_t slot, std::uint32_t face) {
-        const std::uint32_t rowBlock = device_.backend() == gfx::Backend::OpenGL
-                                           ? static_cast<std::uint32_t>(slot)
-                                           : rows - 1u - static_cast<std::uint32_t>(slot);
+        const std::uint32_t rowBlock = rows - 1u - static_cast<std::uint32_t>(slot);
         commandBuffer.setViewport(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
         commandBuffer.setScissor(gfx::Extent{tile, tile}, face * tile, rowBlock * tile);
     };
