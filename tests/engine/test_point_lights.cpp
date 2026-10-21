@@ -1859,6 +1859,31 @@ struct BinningFrame {
     return words;
 }
 
+// The 1024- and 4096-light binning scenes.
+[[nodiscard]] auto denseBinningOptions(std::uint32_t lightsPerSide) -> NightSceneOptions {
+    NightSceneOptions options;
+    options.lightsPerSide = lightsPerSide;
+    options.extent = 14.0f;
+    options.range = 2.5f;
+    return options;
+}
+
+// OpenGL keeps its lower-left framebuffer origin (glClipControl(GL_LOWER_LEFT,
+// ...)), so its images are stored bottom-up while Vulkan/DX12 store them
+// top-down. Which side of an edge that runs exactly through pixel centres owns
+// those pixels (the fill-rule tie) is implementation-defined and follows the
+// storage order, so such edges can land one row apart. Rendering OpenGL with
+// GL_UPPER_LEFT (same storage order as Vulkan/DX12) resolves them the same way;
+// the tests below use that to prove this is the only difference.
+void flipRows(Capture& pixels, std::uint32_t width, std::uint32_t height) {
+    const std::size_t row = static_cast<std::size_t>(width) * 4u;
+    for (std::uint32_t y = 0; y < height / 2; ++y) {
+        std::swap_ranges(pixels.begin() + static_cast<std::ptrdiff_t>(y * row),
+                         pixels.begin() + static_cast<std::ptrdiff_t>((y + 1) * row),
+                         pixels.begin() + static_cast<std::ptrdiff_t>((height - 1 - y) * row));
+    }
+}
+
 template <typename Reader>
 [[nodiscard]] auto captureBinningScenes(gfx::IDevice& device, Reader&& reader)
     -> std::vector<BinningFrame> {
@@ -1867,12 +1892,9 @@ template <typename Reader>
         NightSceneOptions options;
         std::uint32_t maxIndexCount;
     };
-    NightSceneOptions dense;
-    dense.lightsPerSide = 32; // 1024 lights
-    dense.extent = 14.0f;
-    dense.range = 2.5f;
-    NightSceneOptions stress = dense;
-    stress.lightsPerSide = 64; // 4096 lights: 100+ mask words per cluster
+    const NightSceneOptions dense = denseBinningOptions(32); // 1024 lights
+    // 4096 lights: 100+ mask words per cluster.
+    const NightSceneOptions stress = denseBinningOptions(64);
     const Scene scenes[] = {
         {"1024 lights", dense, engine::ClusterGridConfig{}.maxIndexCount},
         {"1024 lights, index cap 20000", dense, 20000u},
@@ -2017,6 +2039,149 @@ void checkBinningFrames(const char* backend, const std::vector<BinningFrame>& fr
 
 } // namespace
 
+namespace {
+
+// Fill-rule tie: a camera-facing cube whose top and bottom edges land exactly
+// on pixel-centre rows (and left/right edges on pixel-centre columns) of a
+// 16x16 target. 90 degree FOV, face 2 m away, half-size 0.875 m -> NDC +-0.4375
+// -> rows/columns 4.5 and 11.5 exactly. `nudge` raises the camera, which moves
+// the cube down by 4 * nudge pixels (1/64 m -> 1/16 px: no tie any more).
+constexpr std::uint32_t kTieExtent = 16;
+
+struct TieCoverage {
+    int firstRow = -1, lastRow = -1, firstColumn = -1, lastColumn = -1;
+};
+
+[[nodiscard]] auto tieCoverage(const Capture& pixels) -> TieCoverage {
+    TieCoverage c;
+    for (std::uint32_t y = 0; y < kTieExtent; ++y) {
+        for (std::uint32_t x = 0; x < kTieExtent; ++x) {
+            if (pixels[(static_cast<std::size_t>(y) * kTieExtent + x) * 4u] < 64) continue;
+            if (c.firstRow < 0) c.firstRow = static_cast<int>(y);
+            c.lastRow = static_cast<int>(y);
+            if (c.firstColumn < 0 || static_cast<int>(x) < c.firstColumn)
+                c.firstColumn = static_cast<int>(x);
+            c.lastColumn = std::max(c.lastColumn, static_cast<int>(x));
+        }
+    }
+    return c;
+}
+
+template <typename Reader>
+[[nodiscard]] auto captureFillRuleTie(gfx::IDevice& device, Reader&& reader, float nudge)
+    -> Capture {
+    NightTarget target(device, kTieExtent, kTieExtent);
+    auto registry = std::make_unique<ecs::Registry>(64);
+    engine::Renderer renderer(*registry, device);
+    REQUIRE(renderer.init() == gfx::GfxError::None);
+    renderer.pbrSettings().shadowsEnabled = false;
+    renderer.pbrSettings().pointLightsEnabled = false;
+    renderer.pbrSettings().bloomEnabled = false;
+    renderer.pbrSettings().ambientIntensity = 0.0f;
+    const auto emission = renderer.createTexture(makeWhiteTexture());
+    engine::StandardMaterialDesc desc;
+    desc.emissive = emission;
+    desc.tint = math::Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    desc.emissiveFactor = math::Vec3(1.0f, 1.0f, 1.0f);
+    const auto material = renderer.createMaterial(desc);
+    const auto mesh = renderer.createMesh(makeCube());
+    REQUIRE(material.isValid());
+    REQUIRE(mesh.isValid());
+    const ecs::Entity cube = registry->create();
+    auto& transform = registry->emplace<ecs::LocalTransform>(cube, ecs::LocalTransform{});
+    transform.scale = math::Vec3(1.75f);
+    registry->emplace<engine::MeshRenderer>(cube,
+                                            engine::MeshRenderer{mesh, material, 0, false, false});
+    const ecs::Entity cameraEntity = registry->create();
+    engine::Camera camera;
+    camera.eye = {0.0f, nudge, 2.875f};
+    camera.center = {0.0f, nudge, 0.0f};
+    camera.fovYRadians = 1.57079633f;
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 10.0f;
+    registry->emplace<engine::Camera>(cameraEntity, camera);
+    ecs::updateWorldTransforms(*registry);
+    return target.render(renderer, cameraEntity, reader);
+}
+
+} // namespace
+
+// Isolates the OpenGL vs Vulkan/DX12 difference in the 4096-light parity
+// scene: there a row of lamp-cube edges lands on pixel centres, and which side
+// of such an edge owns the pixel is the rasterizer's fill rule.
+TEST_CASE("Rasterization: edges exactly on pixel centres (fill-rule ties) on OpenGL, Vulkan, and DX12") {
+    auto windowResult = platform::Window::create({"Fill rule", kTieExtent, kTieExtent, false});
+    REQUIRE(windowResult.hasValue());
+    platform::Window* window = windowResult.value();
+    REQUIRE(window->makeCurrent());
+    REQUIRE(platform::initGl(4, 3).hasValue());
+    const auto glReader = [](gfx::TextureHandle, std::span<std::byte> out) {
+        glReadPixels(0, 0, static_cast<GLsizei>(kTieExtent), static_cast<GLsizei>(kTieExtent),
+                     GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+    };
+    Capture gl[2], vk[2], dx[2];
+    const float nudges[2] = {0.0f, 1.0f / 64.0f};
+    gfx::IDevice* openGl = gfx::createOpenGLDevice();
+    REQUIRE(openGl != nullptr);
+    for (int i = 0; i < 2; ++i) gl[i] = captureFillRuleTie(*openGl, glReader, nudges[i]);
+    // Same frames with OpenGL storing rows top-down like Vulkan/DX12.
+    Capture glUpperLeft[2];
+    glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
+    for (int i = 0; i < 2; ++i) {
+        glUpperLeft[i] = captureFillRuleTie(*openGl, glReader, nudges[i]);
+        flipRows(glUpperLeft[i], kTieExtent, kTieExtent);
+    }
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    gfx::deleteDevice(openGl);
+    delete window;
+    gfx::IDevice* vulkanBase = gfx::createVulkanDevice();
+    REQUIRE(vulkanBase != nullptr);
+    auto* vulkan = static_cast<gfx::VulkanDevice*>(vulkanBase);
+    for (int i = 0; i < 2; ++i) {
+        vk[i] = captureFillRuleTie(
+            *vulkan,
+            [vulkan](gfx::TextureHandle texture, std::span<std::byte> out) {
+                return vulkan->readTexture(texture, 0, out);
+            },
+            nudges[i]);
+    }
+    gfx::deleteDevice(vulkanBase);
+    gfx::IDevice* dx12Base = gfx::createDx12Device();
+    REQUIRE(dx12Base != nullptr);
+    auto* dx12 = static_cast<gfx::Dx12Device*>(dx12Base);
+    for (int i = 0; i < 2; ++i) {
+        dx[i] = captureFillRuleTie(
+            *dx12,
+            [dx12](gfx::TextureHandle texture, std::span<std::byte> out) {
+                return dx12->readTexture(texture, 0, out);
+            },
+            nudges[i]);
+    }
+    gfx::deleteDevice(dx12Base);
+    for (int i = 0; i < 2; ++i) {
+        const TieCoverage g = tieCoverage(gl[i]), u = tieCoverage(glUpperLeft[i]),
+                          v = tieCoverage(vk[i]), d = tieCoverage(dx[i]);
+        const auto span = [](int first, int last) {
+            return std::to_string(first) + "-" + std::to_string(last);
+        };
+        MESSAGE(std::string(i == 0 ? "tie" : "nudged 1/16 px")
+                << ": covered rows/columns GL " << span(g.firstRow, g.lastRow) << "/"
+                << span(g.firstColumn, g.lastColumn) << ", GL upper-left "
+                << span(u.firstRow, u.lastRow) << "/" << span(u.firstColumn, u.lastColumn)
+                << ", VK " << span(v.firstRow, v.lastRow) << "/"
+                << span(v.firstColumn, v.lastColumn) << ", DX " << span(d.firstRow, d.lastRow)
+                << "/" << span(d.firstColumn, d.lastColumn));
+        CHECK(v.firstRow == (i == 0 ? 4 : 5)); // top-left rule: top edge in, bottom out
+        CHECK(v.firstColumn == 4);
+        CHECK(engine::compareShaderImagesRgba8(vk[i], dx[i], 0).mismatchPixelCount == 0);
+        CHECK(engine::compareShaderImagesRgba8(glUpperLeft[i], vk[i], 2).mismatchPixelCount ==
+              0);
+        // Off the tie every backend agrees in the default orientation too.
+        if (i == 1) CHECK(engine::compareShaderImagesRgba8(gl[i], vk[i], 2).mismatchPixelCount == 0);
+    }
+}
+
 TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan, and DX12") {
     auto windowResult =
         platform::Window::create({"GPU light binning", kEffectWidth, kEffectHeight, false});
@@ -2026,13 +2191,25 @@ TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan
     REQUIRE(platform::initGl(4, 3).hasValue());
     gfx::IDevice* openGlBase = gfx::createOpenGLDevice();
     REQUIRE(openGlBase != nullptr);
-    const auto gl = captureBinningScenes(
-        *openGlBase, [](gfx::TextureHandle, std::span<std::byte> out) {
-            glReadPixels(0, 0, static_cast<GLsizei>(kEffectWidth),
-                         static_cast<GLsizei>(kEffectHeight), GL_RGBA, GL_UNSIGNED_BYTE,
-                         out.data());
-            return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
-        });
+    const auto glRead = [](gfx::TextureHandle, std::span<std::byte> out) {
+        glReadPixels(0, 0, static_cast<GLsizei>(kEffectWidth),
+                     static_cast<GLsizei>(kEffectHeight), GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        return glGetError() == GL_NO_ERROR ? gfx::GfxError::None : gfx::GfxError::DeviceLost;
+    };
+    const auto gl = captureBinningScenes(*openGlBase, glRead);
+    // The 4096-light scene once more with OpenGL's origin set to upper-left
+    // (Vulkan/DX12 storage order; see flipRows). The stress scene samples no
+    // render target, so only the rasterization order changes.
+    Capture glUpperLeft;
+    {
+        glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
+        NightTarget target(*openGlBase, kEffectWidth, kEffectHeight);
+        auto world = std::make_unique<NightWorld>(*openGlBase, denseBinningOptions(64));
+        glUpperLeft = target.render(world->renderer, world->camera, glRead);
+        flipRows(glUpperLeft, kEffectWidth, kEffectHeight); // undo target's GL flip
+        world.reset();
+        glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    }
     gfx::deleteDevice(openGlBase);
     delete window;
     checkBinningFrames("OpenGL", gl);
@@ -2068,16 +2245,50 @@ TEST_CASE("Point lights: GPU light binning matches CPU binning on OpenGL, Vulkan
 
     for (std::size_t i = 0; i < gl.size(); ++i) {
         if (std::string(gl[i].scene) == "4096 lights") {
-            // 41 of the pixels differ between OpenGL and Vulkan/DX12 here
-            // (up to 48/255; cause not tracked down, and not the binning:
-            // each backend's GPU binning matches its own CPU binning exactly,
-            // and Vulkan/DX12 agree exactly), so only Vulkan/DX12 are held to
-            // the cross-backend tolerance for this scene.
-            const auto edge = engine::compareShaderImagesRgba8(gl[i].gpu, vk[i].gpu, 2);
-            MESSAGE("GPU binning 4096 lights GL/VK (informational): mismatches="
-                    << edge.mismatchPixelCount
-                    << " max delta=" << static_cast<int>(edge.maxChannelDelta));
+            // One row of lamp-cube edges (grid row 31, image row 44) runs
+            // through pixel centres here: a fill-rule tie that OpenGL's
+            // bottom-up storage resolves on the other side (see flipRows and
+            // the "Rasterization: edges exactly on pixel centres" test). With
+            // GL_UPPER_LEFT, OpenGL matches Vulkan within the usual tolerance,
+            // which proves the tie is the whole difference; the default
+            // OpenGL image may differ in those tie pixels only (41 here, one
+            // per visible lamp cube in that row, so at most 64).
             checkEffectParity("GPU binning 4096 lights VK/DX", vk[i].gpu, dx[i].gpu);
+            checkEffectParity("4096 lights GL (upper-left origin)/VK", glUpperLeft, vk[i].gpu);
+            const auto tie = engine::compareShaderImagesRgba8(gl[i].gpu, vk[i].gpu, 2);
+            MESSAGE("GPU binning 4096 lights GL/VK: fill-rule tie pixels="
+                    << tie.mismatchPixelCount
+                    << " max delta=" << static_cast<int>(tie.maxChannelDelta));
+            CHECK(tie.mismatchPixelCount <= 64);
+            CHECK(engine::compareShaderImagesRgba8(gl[i].gpu, gl[i].cpu, 0).mismatchPixelCount ==
+                  0);
+            if (std::getenv("F4_PARITY_DUMP") != nullptr) {
+                const auto cpuEdge = engine::compareShaderImagesRgba8(gl[i].cpu, vk[i].cpu, 2);
+                MESSAGE("CPU binning 4096 lights GL/VK: mismatches="
+                        << cpuEdge.mismatchPixelCount
+                        << " max delta=" << static_cast<int>(cpuEdge.maxChannelDelta));
+                maybeWriteCapture("binning4096_gl", gl[i].gpu, kEffectWidth, kEffectHeight);
+                maybeWriteCapture("binning4096_vk", vk[i].gpu, kEffectWidth, kEffectHeight);
+                maybeWriteCapture("binning4096_dx", dx[i].gpu, kEffectWidth, kEffectHeight);
+                for (std::uint32_t y = 0; y < kEffectHeight; ++y) {
+                    for (std::uint32_t x = 0; x < kEffectWidth; ++x) {
+                        const std::size_t o = (static_cast<std::size_t>(y) * kEffectWidth + x) * 4u;
+                        int delta = 0, vkDx = 0;
+                        for (int c = 0; c < 4; ++c) {
+                            delta = std::max(delta, std::abs(int(gl[i].gpu[o + c]) -
+                                                             int(vk[i].gpu[o + c])));
+                            vkDx = std::max(vkDx, std::abs(int(dx[i].gpu[o + c]) -
+                                                           int(vk[i].gpu[o + c])));
+                        }
+                        if (delta <= 2 && vkDx == 0) continue;
+                        std::printf("[parity dump] x=%u y=%u gl=%u,%u,%u vk=%u,%u,%u dx=%u,%u,%u "
+                                    "glvk=%d vkdx=%d\n",
+                                    x, y, gl[i].gpu[o], gl[i].gpu[o + 1], gl[i].gpu[o + 2],
+                                    vk[i].gpu[o], vk[i].gpu[o + 1], vk[i].gpu[o + 2],
+                                    dx[i].gpu[o], dx[i].gpu[o + 1], dx[i].gpu[o + 2], delta, vkDx);
+                    }
+                }
+            }
             continue;
         }
         checkEffectParity(std::string("GPU binning ") + gl[i].scene + " GL/VK", gl[i].gpu,
