@@ -2162,13 +2162,22 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
     // uncached interleaved over several rounds, reporting the median.
     const std::string mode = enabled;
     // "binning": CPU vs GPU light binning at 1024/4096 lights, interleaved.
-    if (mode != "1" && mode != "cache" && mode != "binning") return;
+    // "overlap": CPU / GPU / GPU+overlap binning alternating in blocks of
+    // frames inside one renderer (A/B/C), so clock and thermal drift hit all
+    // three alike; reports the median block time per variant.
+    if (mode != "1" && mode != "cache" && mode != "binning" && mode != "overlap") return;
     bool verbose = true;
     bool benchGpuBinning = true;
     bool benchGpuTimers = false;
     // -1: the renderer's per-backend default; otherwise forced off/on.
     constexpr int defaultOverlap = -1;
     int benchOverlap = defaultOverlap;
+    // "overlap" mode: cycles of three blocks (one per variant) and the
+    // per-variant ms/frame of each block.
+    int abCycles = 0;
+    constexpr int abSettleFrames = 6;
+    constexpr int abBlockFrames = 30;
+    std::vector<double> abFrameMs[3];
     double lastCpuMs = 0.0; // CPU time inside render() per frame, last bench() call
     // With benchGpuTimers: mean GPU ms per frame of the last bench() call.
     double lastGpuFrameMs = 0.0, lastGpuBinningMs = 0.0, lastGpuMainMs = 0.0;
@@ -2252,13 +2261,42 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
                         gfx::GfxError::None);
             }
             device.waitIdle();
+            for (auto& values : abFrameMs) values.clear();
+            for (int cycle = 0; cycle < abCycles; ++cycle) {
+                for (int order = 0; order < 3; ++order) {
+                    const int variant = (cycle + order) % 3;
+                    renderer.pbrSettings().gpuLightBinning = variant != 0;
+                    renderer.pbrSettings().lightBinningOverlap = variant == 2;
+                    // Settle: the frames still queued belong to the last variant.
+                    for (int i = 0; i < abSettleFrames; ++i) {
+                        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect,
+                                                extent) == gfx::GfxError::None);
+                    }
+                    // Drain before and after the block so it times exactly its own
+                    // frames' GPU work (GL would otherwise queue many frames ahead
+                    // and the block would only time command submission).
+                    device.waitIdle();
+                    const auto blockStart = std::chrono::steady_clock::now();
+                    for (int i = 0; i < abBlockFrames; ++i) {
+                        REQUIRE(renderer.render(framebuffer.value(), cameraEntity, aspect,
+                                                extent) == gfx::GfxError::None);
+                    }
+                    device.waitIdle();
+                    abFrameMs[variant].push_back(
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - blockStart)
+                            .count() /
+                        abBlockFrames);
+                }
+            }
+            const int measuredFrames = abCycles > 0 ? 0 : frames;
             const auto start = std::chrono::steady_clock::now();
             double cpuMs = 0.0;
             double gpuFrame = 0.0, gpuBinning = 0.0, gpuMain = 0.0;
             std::vector<double> passSums;
             std::vector<std::string> passNames;
             int timed = 0;
-            for (int i = 0; i < frames; ++i) {
+            for (int i = 0; i < measuredFrames; ++i) {
                 const auto frameStart = std::chrono::steady_clock::now();
                 const gfx::GfxError error =
                     renderer.render(framebuffer.value(), cameraEntity, aspect, extent);
@@ -2385,6 +2423,41 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
         benchOverlap = defaultOverlap;
         verbose = true;
     };
+    // A/B/C blocks inside one renderer per scene (see "overlap" above).
+    const auto overlapRows = [&](gfx::IDevice& device, const char* backend) {
+        const char* cyclesEnv = std::getenv("F4_BENCH_ROUNDS");
+        abCycles = cyclesEnv != nullptr ? std::max(1, std::atoi(cyclesEnv)) : 15;
+        verbose = false;
+        static constexpr const char* kVariants[] = {"CPU binning", "GPU binning",
+                                                    "GPU binning + overlap"};
+        struct Row {
+            bool scaled;
+            std::uint32_t side;
+            int shadows;
+        };
+        for (const Row row : {Row{false, 32u, -1}, Row{false, 64u, -1}, Row{true, 32u, -1},
+                              Row{true, 64u, -1}, Row{false, 64u, 8}}) {
+            (void)bench(device, backend, row.side, row.scaled, false, row.shadows, false);
+            double medians[3] = {};
+            for (int variant = 0; variant < 3; ++variant) {
+                std::vector<double> values = abFrameMs[variant];
+                std::sort(values.begin(), values.end());
+                medians[variant] = values[values.size() / 2];
+            }
+            std::printf("[point-light bench] %s overlap A/B %s%s lights=%u: %s %.3f, %s %.3f, "
+                        "%s%s %.3f ms/frame (median of %d blocks of %d frames); overlap vs "
+                        "GPU binning %+.2f%%\n",
+                        backend, row.scaled ? "scaled" : "stress",
+                        row.shadows > 0 ? "+pillars+8 shadowed (uncached)" : "",
+                        row.side * row.side, kVariants[0], medians[0], kVariants[1], medians[1],
+                        kVariants[2],
+                        device.supportsAsyncCompute() ? " (async queue)" : "", medians[2],
+                        abCycles, abBlockFrames,
+                        100.0 * (medians[2] - medians[1]) / medians[1]);
+        }
+        abCycles = 0;
+        verbose = true;
+    };
     // Static night scene with 32x32 pillars: cached vs uncached point shadows,
     // interleaved so clock drift hits both alike; median of the rounds.
     const auto cacheRows = [&](gfx::IDevice& device, const char* backend) {
@@ -2427,6 +2500,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             cacheRows(*device, "OpenGL");
         } else if (mode == "binning") {
             binningRows(*device, "OpenGL");
+        } else if (mode == "overlap") {
+            overlapRows(*device, "OpenGL");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "OpenGL", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "OpenGL", side, true);
@@ -2446,6 +2521,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             cacheRows(*device, "Vulkan");
         } else if (mode == "binning") {
             binningRows(*device, "Vulkan");
+        } else if (mode == "overlap") {
+            overlapRows(*device, "Vulkan");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "Vulkan", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "Vulkan", side, true);
@@ -2466,6 +2543,8 @@ TEST_CASE("Point lights: night scene frame-time benchmark (set F4_POINT_LIGHT_BE
             cacheRows(*device, "DX12");
         } else if (mode == "binning") {
             binningRows(*device, "DX12");
+        } else if (mode == "overlap") {
+            overlapRows(*device, "DX12");
         } else {
             for (std::uint32_t side : {0u, 16u, 32u, 64u}) bench(*device, "DX12", side, false);
             for (std::uint32_t side : {32u, 64u}) bench(*device, "DX12", side, true);

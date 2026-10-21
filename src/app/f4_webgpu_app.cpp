@@ -1167,6 +1167,8 @@ auto makePbrMesh(std::span<const PbrVertex> vertices, std::span<const std::uint1
     return mesh;
 }
 
+int abCyclesForBench = 9; // TimersAB cycles (runPointLightBench sets it)
+
 struct BenchRun {
     double frameMs = 0.0;
     double cpuMs = 0.0; // render() CPU time per frame
@@ -1177,6 +1179,8 @@ struct BenchRun {
     std::uint32_t visible = 0;
     std::uint32_t maxPerCluster = 0;
     std::uint32_t dispatches = 0;
+    // TimersAB runs: per variant (CPU, GPU, GPU+overlap), one mean per block.
+    std::vector<double> abGpuFrame[3], abBinning[3], abMain[3];
     std::size_t verifyDifferences = 0; // verify runs: GPU vs CPU light buffer
     std::uint32_t indexWords = 0;
     bool ok = false;
@@ -1213,11 +1217,13 @@ auto compareLightWords(const std::vector<std::uint32_t>& a, const std::vector<st
     return differences;
 }
 
-enum class BenchMode { Timed, GpuTimers, Verify };
+// TimersAB: GPU timers on, CPU / GPU / GPU+overlap binning alternating in
+// blocks of frames inside one renderer, so GPU clock drift hits all alike.
+enum class BenchMode { Timed, GpuTimers, Verify, TimersAB };
 
 auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, BenchMode mode,
                      bool overlap = false) -> BenchRun {
-    const bool timers = mode == BenchMode::GpuTimers;
+    const bool timers = mode == BenchMode::GpuTimers || mode == BenchMode::TimersAB;
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 20;
@@ -1369,7 +1375,50 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, BenchMode
                 run.visible = renderer.stats().pointLightsVisible;
                 run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
             }
-            const int frames = mode == BenchMode::Verify ? 0 : timers ? 240 : 120;
+            if (mode == BenchMode::TimersAB) {
+                constexpr int settleFrames = 6;
+                constexpr int blockFrames = 30;
+                const int cycles = abCyclesForBench;
+                int frameNumber = 0;
+                int lastTimedFrame = -1000;
+                for (int cycle = 0; cycle < cycles && ok; ++cycle) {
+                    for (int order = 0; order < 3 && ok; ++order) {
+                        const int variant = (cycle + order) % 3;
+                        settings.gpuLightBinning = variant != 0;
+                        settings.lightBinningOverlap = variant == 2;
+                        double gpuFrame = 0.0, binning = 0.0, mainPass = 0.0;
+                        int timed = 0;
+                        for (int i = 0; i < settleFrames + blockFrames && ok; ++i, ++frameNumber) {
+                            ok = renderer.render(framebuffer, cameraEntity, aspect, frameExtent) ==
+                                 GfxError::None;
+                            if (frameNumber % 3 == 2) gApp.device->waitIdle();
+                            const f4::engine::FrameStats& stats = renderer.stats();
+                            const int timedFrame =
+                                frameNumber - static_cast<int>(stats.gpuTimingLag);
+                            // Count frames of this block only (past the settle frames).
+                            if (i >= settleFrames && stats.gpuTimingValid &&
+                                timedFrame != lastTimedFrame &&
+                                timedFrame >= frameNumber - i + settleFrames) {
+                                lastTimedFrame = timedFrame;
+                                ++timed;
+                                gpuFrame += stats.gpuFrameMs;
+                                binning += stats.gpuLightBinningMs;
+                                mainPass += stats.gpuMainPassMs;
+                            }
+                        }
+                        if (timed > 0) {
+                            run.abGpuFrame[variant].push_back(gpuFrame / timed);
+                            run.abBinning[variant].push_back(binning / timed);
+                            run.abMain[variant].push_back(mainPass / timed);
+                        }
+                    }
+                }
+                gApp.device->waitIdle();
+                run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
+            }
+            const int frames = mode == BenchMode::Verify || mode == BenchMode::TimersAB ? 0
+                               : timers                                             ? 240
+                                                                                    : 120;
             int lastTimedFrame = -1000;
             const double start = emscripten_get_now();
             for (int i = 0; i < frames && ok; ++i) {
@@ -1396,7 +1445,7 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, BenchMode
                 }
             }
             gApp.device->waitIdle();
-            if (mode != BenchMode::Verify) { // verify runs report only the comparison
+            if (mode != BenchMode::Verify && mode != BenchMode::TimersAB) {
                 run.frameMs = (emscripten_get_now() - start) / frames;
                 run.cpuMs /= frames;
                 if (run.timedFrames > 0) {
@@ -1453,32 +1502,31 @@ auto runPointLightBench(int rounds) -> bool {
                     frame[variant].push_back(last[variant].frameMs);
                     cpu[variant].push_back(last[variant].cpuMs);
                 }
-                for (int order = 0; order < 3 && ok; ++order) {
-                    const int variant = (round + 2 * order + 1) % 3;
-                    const BenchRun timed = benchNightScene(side, scaled, variant != 0,
-                                                           BenchMode::GpuTimers, variant == 2);
-                    ok = timed.ok;
-                    if (timed.timedFrames > 0) {
-                        timedFrames[variant] += timed.timedFrames;
-                        gpuFrame[variant].push_back(timed.gpuFrameMs);
-                        gpuBinning[variant].push_back(timed.gpuBinningMs);
-                        gpuMain[variant].push_back(timed.gpuMainMs);
-                    }
-                }
+            }
+            // GPU pass times: one renderer, the three variants alternating in
+            // blocks (TimersAB), medians of the block means.
+            abCyclesForBench = std::max(3, 2 * rounds + 1);
+            const BenchRun ab = benchNightScene(side, scaled, true, BenchMode::TimersAB);
+            ok = ok && ab.ok;
+            for (int variant = 0; variant < 3; ++variant) {
+                timedFrames[variant] = static_cast<int>(ab.abMain[variant].size());
+                gpuFrame[variant] = ab.abGpuFrame[variant];
+                gpuBinning[variant] = ab.abBinning[variant];
+                gpuMain[variant] = ab.abMain[variant];
             }
             if (!ok) break;
             for (int variant = 0; variant < 3; ++variant) {
                 std::snprintf(line, sizeof(line),
                               "[webgpu bench] %s lights=%u visible=%u max/cluster=%u %s: "
-                              "%.3f ms/frame (render() CPU %.3f, min %.3f); GPU timers (%d "
-                              "frames): GPU frame %.3f ms, binning pass %.3f ms, main pass "
-                              "%.3f ms (medians of %d)\n",
+                              "%.3f ms/frame (render() CPU %.3f, min %.3f; median of %d "
+                              "runs); GPU timers (A/B, median of %d blocks): GPU frame %.3f "
+                              "ms, binning pass %.3f ms, main pass %.3f ms\n",
                               sceneName, side * side, last[variant].visible,
                               last[variant].maxPerCluster, kVariantNames[variant],
                               median(frame[variant]), median(cpu[variant]),
                               *std::min_element(frame[variant].begin(), frame[variant].end()),
-                              timedFrames[variant], median(gpuFrame[variant]),
-                              median(gpuBinning[variant]), median(gpuMain[variant]), rounds);
+                              rounds, timedFrames[variant], median(gpuFrame[variant]),
+                              median(gpuBinning[variant]), median(gpuMain[variant]));
                 report += line;
             }
         }
