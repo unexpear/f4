@@ -136,8 +136,10 @@ struct PbrRenderSettings {
     // separate compute queue the dispatch runs on that queue and the wait is
     // a cross-queue semaphore / fence wait; elsewhere (no such queue, OpenGL,
     // WebGPU) it stays on the one queue and only the barrier moves. Same
-    // image either way. The default comes from the backend (see the
-    // Renderer constructor); no effect when the CPU bins.
+    // image either way; no effect when the CPU bins. Off by default on every
+    // backend: the in-renderer A/B benches (planning/architecture-plan.md)
+    // showed no gain anywhere (the binning pass is ~0.1 ms) and a small loss
+    // from the extra submit + cross-queue wait on Vulkan/DX12 in light scenes.
     bool lightBinningOverlap = false;
     // Time every render-graph pass with GPU timestamp queries and report the
     // results in FrameStats::gpu*. Off by default (each pass boundary then

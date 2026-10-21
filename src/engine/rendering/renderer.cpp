@@ -68,13 +68,6 @@ static_assert(sizeof(BloomUbo) == 32, "BloomUbo must match std140/HLSL layout");
 
 constexpr std::uint32_t kBloomMaxLevels = 8;
 
-// PbrRenderSettings::lightBinningOverlap default per backend, from the
-// on/off benches in planning/architecture-plan.md.
-[[nodiscard]] auto defaultLightBinningOverlap(gfx::Backend backend, bool asyncCompute) -> bool {
-    (void)backend;
-    return asyncCompute;
-}
-
 [[nodiscard]] auto floatWord(float value) -> std::uint32_t {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -401,10 +394,7 @@ void drawMesh(gfx::CommandBuffer& commandBuffer, const resources::Mesh& mesh,
 } // namespace
 
 Renderer::Renderer(ecs::Registry& registry, gfx::IDevice& device)
-    : registry_(registry), device_(device), meshArena_(64), textureArena_(128) {
-    pbrSettings_.lightBinningOverlap = defaultLightBinningOverlap(device.backend(),
-                                                                  device.supportsAsyncCompute());
-}
+    : registry_(registry), device_(device), meshArena_(64), textureArena_(128) {}
 
 void Renderer::releaseInitializationResources() {
     if (shadowFramebuffer_.isValid()) (void)device_.destroyFramebuffer(shadowFramebuffer_);
