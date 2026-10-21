@@ -1177,14 +1177,50 @@ struct BenchRun {
     std::uint32_t visible = 0;
     std::uint32_t maxPerCluster = 0;
     std::uint32_t dispatches = 0;
+    std::size_t verifyDifferences = 0; // verify runs: GPU vs CPU light buffer
+    std::uint32_t indexWords = 0;
     bool ok = false;
 };
 
-auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool timers) -> BenchRun {
+// Compares two clustered-light buffers by meaning (header values, light
+// records, per-cluster lists), wherever each buffer places its sections.
+auto compareLightWords(const std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b)
+    -> std::size_t {
+    using f4::engine::kPointLightClusterWords;
+    using f4::engine::kPointLightHeaderWords;
+    using f4::engine::kPointLightRecordWords;
+    if (a.size() < kPointLightHeaderWords || b.size() < kPointLightHeaderWords) return 1;
+    std::size_t differences = 0;
+    for (std::size_t word : {0, 1, 2, 3, 7, 8, 9, 11}) {
+        if (a[word] != b[word]) ++differences;
+    }
+    if (differences != 0) return differences;
+    for (std::uint32_t i = 0; i < a[0] * kPointLightRecordWords; ++i) {
+        if (a[a[4] + i] != b[b[4] + i]) ++differences;
+    }
+    const std::uint32_t clusters = a[1] * a[2] * a[3];
+    for (std::uint32_t cluster = 0; cluster < clusters; ++cluster) {
+        const std::uint32_t* ra = a.data() + a[5] + cluster * kPointLightClusterWords;
+        const std::uint32_t* rb = b.data() + b[5] + cluster * kPointLightClusterWords;
+        if (ra[1] != rb[1] || ra[0] - a[6] != rb[0] - b[6]) {
+            ++differences;
+            continue;
+        }
+        for (std::uint32_t k = 0; k < ra[1]; ++k) {
+            if (a[ra[0] + k] != b[rb[0] + k]) ++differences;
+        }
+    }
+    return differences;
+}
+
+enum class BenchMode { Timed, GpuTimers, Verify };
+
+auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, BenchMode mode,
+                     bool overlap = false) -> BenchRun {
+    const bool timers = mode == BenchMode::GpuTimers;
     constexpr std::uint32_t width = 1280;
     constexpr std::uint32_t height = 720;
     constexpr int warmup = 20;
-    const int frames = timers ? 240 : 120;
     BenchRun run;
     TextureHandle color;
     TextureHandle depth;
@@ -1225,6 +1261,7 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
             settings.pointLightsEnabled = true;
             settings.gpuLightBinning = gpuBinning;
             settings.gpuTimers = timers;
+            settings.lightBinningOverlap = overlap;
             const float extent = 14.0f;
             float range = 2.5f;
             if (scaled) range = std::max(0.75f, 2.0f * (2.0f * extent / static_cast<float>(side - 1u)));
@@ -1303,6 +1340,36 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
                      GfxError::None;
             }
             gApp.device->waitIdle();
+            if (mode == BenchMode::Verify) {
+                // One CPU-binned and one GPU-binned frame of the same scene:
+                // the GPU-written buffer must mean exactly what the CPU wrote.
+                settings.gpuLightBinning = false;
+                ok = ok && renderer.render(framebuffer, cameraEntity, aspect, frameExtent) ==
+                               GfxError::None;
+                gApp.device->waitIdle();
+                const auto cpuSpan = renderer.pointLightWords();
+                const std::vector<std::uint32_t> cpuWords(cpuSpan.begin(), cpuSpan.end());
+                settings.gpuLightBinning = true;
+                ok = ok && renderer.render(framebuffer, cameraEntity, aspect, frameExtent) ==
+                               GfxError::None;
+                gApp.device->waitIdle();
+                std::vector<std::uint32_t> gpuWords(f4::engine::kPointLightHeaderWords);
+                ok = ok && gApp.device->readBuffer(renderer.pointLightBuffer(), 0,
+                                                   std::as_writable_bytes(std::span(gpuWords))) ==
+                               GfxError::None;
+                if (ok) {
+                    gpuWords.resize(static_cast<std::size_t>(gpuWords[6]) + gpuWords[7]);
+                    ok = gApp.device->readBuffer(renderer.pointLightBuffer(), 0,
+                                                 std::as_writable_bytes(std::span(gpuWords))) ==
+                         GfxError::None;
+                }
+                run.verifyDifferences = ok ? compareLightWords(cpuWords, gpuWords) : 1;
+                run.indexWords = cpuWords.size() > 7 ? cpuWords[7] : 0;
+                run.dispatches = renderer.stats().pointLightBinningDispatches;
+                run.visible = renderer.stats().pointLightsVisible;
+                run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
+            }
+            const int frames = mode == BenchMode::Verify ? 0 : timers ? 240 : 120;
             int lastTimedFrame = -1000;
             const double start = emscripten_get_now();
             for (int i = 0; i < frames && ok; ++i) {
@@ -1329,18 +1396,20 @@ auto benchNightScene(std::uint32_t side, bool scaled, bool gpuBinning, bool time
                 }
             }
             gApp.device->waitIdle();
-            run.frameMs = (emscripten_get_now() - start) / frames;
-            run.cpuMs /= frames;
-            if (run.timedFrames > 0) {
-                run.gpuFrameMs /= run.timedFrames;
-                run.gpuBinningMs /= run.timedFrames;
-                run.gpuMainMs /= run.timedFrames;
+            if (mode != BenchMode::Verify) { // verify runs report only the comparison
+                run.frameMs = (emscripten_get_now() - start) / frames;
+                run.cpuMs /= frames;
+                if (run.timedFrames > 0) {
+                    run.gpuFrameMs /= run.timedFrames;
+                    run.gpuBinningMs /= run.timedFrames;
+                    run.gpuMainMs /= run.timedFrames;
+                }
+                const f4::engine::FrameStats& stats = renderer.stats();
+                run.visible = stats.pointLightsVisible;
+                run.maxPerCluster = stats.maxPointLightsPerCluster;
+                run.dispatches = stats.pointLightBinningDispatches;
+                run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
             }
-            const f4::engine::FrameStats& stats = renderer.stats();
-            run.visible = stats.pointLightsVisible;
-            run.maxPerCluster = stats.maxPointLightsPerCluster;
-            run.dispatches = stats.pointLightBinningDispatches;
-            run.ok = ok && gApp.webGpu->validationErrorCount() == 0;
         }
     }
     gApp.device->destroyFramebuffer(framebuffer);
@@ -1353,42 +1422,63 @@ auto runPointLightBench(int rounds) -> bool {
     std::string report;
     char line[512];
     bool ok = true;
+    auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values.empty() ? 0.0 : values[values.size() / 2];
+    };
+    // Variants: CPU binning, GPU binning, GPU binning with the overlap order.
+    static constexpr const char* kVariantNames[] = {"CPU binning", "GPU binning",
+                                                    "GPU binning + overlap"};
     for (const bool scaled : {false, true}) {
         for (const std::uint32_t side : {32u, 64u}) {
-            std::vector<double> frame[2];
-            std::vector<double> cpu[2];
-            BenchRun last[2];
+            const char* sceneName = scaled ? "scaled" : "stress";
+            const BenchRun verify = benchNightScene(side, scaled, true, BenchMode::Verify);
+            ok = ok && verify.ok && verify.dispatches == 1 && verify.verifyDifferences == 0;
+            std::snprintf(line, sizeof(line),
+                          "[webgpu bench] %s lights=%u verify: GPU vs CPU light buffer "
+                          "differences=%zu (visible=%u, index words=%u)\n",
+                          sceneName, side * side, verify.verifyDifferences, verify.visible,
+                          verify.indexWords);
+            report += line;
+            std::vector<double> frame[3], cpu[3], gpuFrame[3], gpuBinning[3], gpuMain[3];
+            BenchRun last[3];
+            int timedFrames[3] = {};
             for (int round = 0; round < rounds && ok; ++round) {
-                for (int order = 0; order < 2 && ok; ++order) {
-                    const int gpu = (round + order) % 2;
-                    last[gpu] = benchNightScene(side, scaled, gpu == 1, false);
-                    ok = last[gpu].ok && (last[gpu].dispatches == 1) == (gpu == 1);
-                    frame[gpu].push_back(last[gpu].frameMs);
-                    cpu[gpu].push_back(last[gpu].cpuMs);
+                for (int order = 0; order < 3 && ok; ++order) {
+                    const int variant = (round + order) % 3;
+                    const bool gpu = variant != 0;
+                    last[variant] =
+                        benchNightScene(side, scaled, gpu, BenchMode::Timed, variant == 2);
+                    ok = last[variant].ok && (last[variant].dispatches == 1) == gpu;
+                    frame[variant].push_back(last[variant].frameMs);
+                    cpu[variant].push_back(last[variant].cpuMs);
+                }
+                for (int order = 0; order < 3 && ok; ++order) {
+                    const int variant = (round + 2 * order + 1) % 3;
+                    const BenchRun timed = benchNightScene(side, scaled, variant != 0,
+                                                           BenchMode::GpuTimers, variant == 2);
+                    ok = timed.ok;
+                    if (timed.timedFrames > 0) {
+                        timedFrames[variant] += timed.timedFrames;
+                        gpuFrame[variant].push_back(timed.gpuFrameMs);
+                        gpuBinning[variant].push_back(timed.gpuBinningMs);
+                        gpuMain[variant].push_back(timed.gpuMainMs);
+                    }
                 }
             }
             if (!ok) break;
-            for (auto* values : {&frame[0], &frame[1], &cpu[0], &cpu[1]}) {
-                std::sort(values->begin(), values->end());
-            }
-            std::snprintf(line, sizeof(line),
-                          "[webgpu bench] %s lights=%u visible=%u max/cluster=%u/%u: CPU binning "
-                          "%.3f ms/frame (render() CPU %.3f), GPU binning %.3f ms/frame "
-                          "(render() CPU %.3f) (median of %d; min %.3f / %.3f)\n",
-                          scaled ? "scaled" : "stress", side * side, last[1].visible,
-                          last[0].maxPerCluster, last[1].maxPerCluster, frame[0][rounds / 2],
-                          cpu[0][rounds / 2], frame[1][rounds / 2], cpu[1][rounds / 2], rounds,
-                          frame[0].front(), frame[1].front());
-            report += line;
-            for (const bool gpu : {false, true}) {
-                const BenchRun timed = benchNightScene(side, scaled, gpu, true);
-                ok = ok && timed.ok;
+            for (int variant = 0; variant < 3; ++variant) {
                 std::snprintf(line, sizeof(line),
-                              "[webgpu bench] %s lights=%u %s binning, GPU timers (%d frames): "
-                              "GPU frame %.3f ms, binning pass %.3f ms, main pass %.3f ms\n",
-                              scaled ? "scaled" : "stress", side * side, gpu ? "GPU" : "CPU",
-                              timed.timedFrames, timed.gpuFrameMs, timed.gpuBinningMs,
-                              timed.gpuMainMs);
+                              "[webgpu bench] %s lights=%u visible=%u max/cluster=%u %s: "
+                              "%.3f ms/frame (render() CPU %.3f, min %.3f); GPU timers (%d "
+                              "frames): GPU frame %.3f ms, binning pass %.3f ms, main pass "
+                              "%.3f ms (medians of %d)\n",
+                              sceneName, side * side, last[variant].visible,
+                              last[variant].maxPerCluster, kVariantNames[variant],
+                              median(frame[variant]), median(cpu[variant]),
+                              *std::min_element(frame[variant].begin(), frame[variant].end()),
+                              timedFrames[variant], median(gpuFrame[variant]),
+                              median(gpuBinning[variant]), median(gpuMain[variant]), rounds);
                 report += line;
             }
         }
