@@ -7,8 +7,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <vector>
 
 #include "core/logging/logger.h"
@@ -429,6 +431,13 @@ struct VkSwapchainRecord {
 
 struct VkFrameSlot {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    // Async compute: the graphics commands after waitAsyncCompute() go into
+    // splitCommandBuffer (a second batch that waits on computeDone).
+    VkCommandBuffer splitCommandBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer computeCommandBuffer = VK_NULL_HANDLE;
+    VkSemaphore computeDone = VK_NULL_HANDLE;
+    VkDescriptorPool computeDescriptorPool = VK_NULL_HANDLE;
+    bool computeSignaled = false; // computeDone signaled and not yet waited
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore imageAvailable = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -453,6 +462,11 @@ struct VulkanDevice::Impl {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     VkQueue presentQueue = VK_NULL_HANDLE;
     VkCommandPool commandPool = VK_NULL_HANDLE;
+    // Async compute: a queue family with COMPUTE but not GRAPHICS (none:
+    // kInvalidQueueFamily, and supportsAsyncCompute() is false).
+    VkQueue computeQueue = VK_NULL_HANDLE;
+    VkCommandPool computeCommandPool = VK_NULL_HANDLE;
+    std::uint32_t computeQueueFamily = kInvalidQueueFamily;
     std::array<VkFrameSlot, kFramesInFlight> frames;
     std::size_t frameIndex = 0;
     std::uint64_t lastSubmittedSerial = 0;
@@ -537,12 +551,19 @@ void destroyDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messeng
 [[nodiscard]] auto createBufferAllocation(VkPhysicalDevice physicalDevice, VkDevice device,
                                           VkDeviceSize size, VkBufferUsageFlags usage,
                                           VkMemoryPropertyFlags memoryProperties,
-                                          VkBuffer* buffer, VkDeviceMemory* memory) -> GfxError {
+                                          VkBuffer* buffer, VkDeviceMemory* memory,
+                                          std::span<const std::uint32_t> sharedFamilies = {})
+    -> GfxError {
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (sharedFamilies.size() > 1) {
+        bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bufferInfo.queueFamilyIndexCount = static_cast<std::uint32_t>(sharedFamilies.size());
+        bufferInfo.pQueueFamilyIndices = sharedFamilies.data();
+    }
     VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, buffer);
     if (result != VK_SUCCESS) return toGfxError(result);
 
@@ -862,6 +883,9 @@ VulkanDevice::~VulkanDevice() {
             if (frame.descriptorPool != VK_NULL_HANDLE) {
                 vkDestroyDescriptorPool(impl_->device, frame.descriptorPool, nullptr);
             }
+            if (frame.computeDescriptorPool != VK_NULL_HANDLE) {
+                vkDestroyDescriptorPool(impl_->device, frame.computeDescriptorPool, nullptr);
+            }
         }
         impl_->pipelines.forEach([&](VkPipelineRecord* pipeline) {
             if (pipeline->pipeline != VK_NULL_HANDLE) {
@@ -895,6 +919,9 @@ VulkanDevice::~VulkanDevice() {
         if (impl_->commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(impl_->device, impl_->commandPool, nullptr);
         }
+        if (impl_->computeCommandPool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(impl_->device, impl_->computeCommandPool, nullptr);
+        }
         if (impl_->timestampPool != VK_NULL_HANDLE) {
             vkDestroyQueryPool(impl_->device, impl_->timestampPool, nullptr);
         }
@@ -904,6 +931,9 @@ VulkanDevice::~VulkanDevice() {
             }
             if (frame.imageAvailable != VK_NULL_HANDLE) {
                 vkDestroySemaphore(impl_->device, frame.imageAvailable, nullptr);
+            }
+            if (frame.computeDone != VK_NULL_HANDLE) {
+                vkDestroySemaphore(impl_->device, frame.computeDone, nullptr);
             }
         }
         vkDestroyDevice(impl_->device, nullptr);
@@ -1120,6 +1150,19 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
             selectedProperties.limits.timestampPeriod > 0.0f &&
             impl_->graphicsQueueFamily < familyCount &&
             families[impl_->graphicsQueueFamily].timestampValidBits != 0;
+        // Async compute: the first compute-only family (F4_NO_ASYNC_COMPUTE=1
+        // forces the single-queue fallback).
+        const char* noAsync = std::getenv("F4_NO_ASYNC_COMPUTE");
+        if (noAsync == nullptr || std::strcmp(noAsync, "1") != 0) {
+            for (std::uint32_t family = 0; family < familyCount; ++family) {
+                const VkQueueFlags flags = families[family].queueFlags;
+                if (families[family].queueCount != 0 && (flags & VK_QUEUE_COMPUTE_BIT) != 0 &&
+                    (flags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+                    impl_->computeQueueFamily = family;
+                    break;
+                }
+            }
+        }
     }
 
     const float queuePriority = 1.0f;
@@ -1134,6 +1177,12 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
         VkDeviceQueueCreateInfo presentQueueInfo = graphicsQueueInfo;
         presentQueueInfo.queueFamilyIndex = impl_->presentQueueFamily;
         queueInfos.push_back(presentQueueInfo);
+    }
+    if (impl_->computeQueueFamily != kInvalidQueueFamily &&
+        impl_->computeQueueFamily != impl_->presentQueueFamily) {
+        VkDeviceQueueCreateInfo computeQueueInfo = graphicsQueueInfo;
+        computeQueueInfo.queueFamilyIndex = impl_->computeQueueFamily;
+        queueInfos.push_back(computeQueueInfo);
     }
 
     VkPhysicalDeviceFeatures enabledFeatures{};
@@ -1158,6 +1207,9 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
     }
     vkGetDeviceQueue(impl_->device, impl_->graphicsQueueFamily, 0, &impl_->graphicsQueue);
     vkGetDeviceQueue(impl_->device, impl_->presentQueueFamily, 0, &impl_->presentQueue);
+    if (impl_->computeQueueFamily != kInvalidQueueFamily) {
+        vkGetDeviceQueue(impl_->device, impl_->computeQueueFamily, 0, &impl_->computeQueue);
+    }
 
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1171,10 +1223,26 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
     commandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     commandInfo.commandPool = impl_->commandPool;
     commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandInfo.commandBufferCount = static_cast<std::uint32_t>(kFramesInFlight);
-    std::array<VkCommandBuffer, kFramesInFlight> commandBuffers{};
+    commandInfo.commandBufferCount = static_cast<std::uint32_t>(2 * kFramesInFlight);
+    std::array<VkCommandBuffer, 2 * kFramesInFlight> commandBuffers{};
     if (vkAllocateCommandBuffers(impl_->device, &commandInfo, commandBuffers.data()) != VK_SUCCESS) {
         return false;
+    }
+    std::array<VkCommandBuffer, kFramesInFlight> computeCommandBuffers{};
+    if (impl_->computeQueue != VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo computePoolInfo = poolInfo;
+        computePoolInfo.queueFamilyIndex = impl_->computeQueueFamily;
+        if (vkCreateCommandPool(impl_->device, &computePoolInfo, nullptr,
+                                &impl_->computeCommandPool) != VK_SUCCESS) {
+            return false;
+        }
+        VkCommandBufferAllocateInfo computeInfo = commandInfo;
+        computeInfo.commandPool = impl_->computeCommandPool;
+        computeInfo.commandBufferCount = static_cast<std::uint32_t>(kFramesInFlight);
+        if (vkAllocateCommandBuffers(impl_->device, &computeInfo,
+                                     computeCommandBuffers.data()) != VK_SUCCESS) {
+            return false;
+        }
     }
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -1183,7 +1251,14 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
     for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
         VkFrameSlot& frame = impl_->frames[frameIndex];
         frame.commandBuffer = commandBuffers[frameIndex];
+        frame.splitCommandBuffer = commandBuffers[kFramesInFlight + frameIndex];
+        frame.computeCommandBuffer = computeCommandBuffers[frameIndex];
         if (vkCreateFence(impl_->device, &fenceInfo, nullptr, &frame.fence) != VK_SUCCESS) {
+            return false;
+        }
+        if (impl_->computeQueue != VK_NULL_HANDLE &&
+            vkCreateSemaphore(impl_->device, &semaphoreInfo, nullptr, &frame.computeDone) !=
+                VK_SUCCESS) {
             return false;
         }
         if (impl_->surface != VK_NULL_HANDLE &&
@@ -1196,6 +1271,9 @@ auto VulkanDevice::initialize(platform::Window* window) -> bool {
     F4_LOG_INFO() << "Vulkan device: " << impl_->deviceName << " (API "
                   << VK_API_VERSION_MAJOR(impl_->apiVersion) << '.'
                   << VK_API_VERSION_MINOR(impl_->apiVersion) << ')';
+    if (impl_->computeQueue != VK_NULL_HANDLE) {
+        F4_LOG_INFO() << "Vulkan async compute queue family " << impl_->computeQueueFamily;
+    }
     return true;
 }
 
@@ -1217,6 +1295,15 @@ auto VulkanDevice::createBuffer(const BufferDesc& desc, std::span<const std::byt
     // Storage buffers the CPU does not rewrite (compute output) live in
     // device-local memory: GPU writes and shader reads then stay off the bus.
     // Everything else stays host-visible and is written by mapping.
+    // With an async compute queue, buffers are shared by both queue families
+    // (CONCURRENT), so the compute queue can write a buffer the graphics queue
+    // then reads without queue-family ownership transfers; the semaphore wait
+    // in submit() carries the memory dependency.
+    const std::array<std::uint32_t, 2> sharedFamilies{impl_->graphicsQueueFamily,
+                                                      impl_->computeQueueFamily};
+    const std::span<const std::uint32_t> sharing =
+        impl_->computeQueue != VK_NULL_HANDLE ? std::span<const std::uint32_t>(sharedFamilies)
+                                              : std::span<const std::uint32_t>();
     const bool gpuOwned = hasUsage(desc.usage, BufferUsage::Storage) &&
                           !hasUsage(desc.usage, BufferUsage::HostWrite) &&
                           !hasUsage(desc.usage, BufferUsage::Vertex) &&
@@ -1227,14 +1314,14 @@ auto VulkanDevice::createBuffer(const BufferDesc& desc, std::span<const std::byt
         allocationError = createBufferAllocation(
             impl_->physicalDevice, impl_->device, desc.sizeBytes,
             usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &record.buffer, &record.memory);
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &record.buffer, &record.memory, sharing);
         record.deviceLocal = allocationError == GfxError::None;
     }
     if (!record.deviceLocal) {
         allocationError = createBufferAllocation(
             impl_->physicalDevice, impl_->device, desc.sizeBytes, usage,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            &record.buffer, &record.memory);
+            &record.buffer, &record.memory, sharing);
     }
     if (allocationError != GfxError::None) return allocationError;
     if (record.deviceLocal) {
@@ -2143,8 +2230,28 @@ auto VulkanDevice::writeTexture(TextureHandle handle, std::uint32_t mipLevel,
     return error;
 }
 auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
+    return submitCommands(commands, false);
+}
+
+auto VulkanDevice::supportsAsyncCompute() const -> bool {
+    return impl_ != nullptr && impl_->computeQueue != VK_NULL_HANDLE;
+}
+
+auto VulkanDevice::submitAsyncCompute(CommandBuffer& commands) -> GfxError {
+    if (!supportsAsyncCompute()) return GfxError::BackendUnavailable;
+    return submitCommands(commands, true);
+}
+
+// Async compute (asyncCompute == true) records into the frame slot's compute
+// command buffer and submits it to the compute queue, signaling computeDone;
+// the frame slot's next graphics submit waits on that semaphore, splitting
+// its commands at CommandBuffer::waitAsyncCompute() into two batches so the
+// first batch (e.g. shadow passes) runs alongside the compute work.
+auto VulkanDevice::submitCommands(CommandBuffer& commands, bool asyncCompute) -> GfxError {
     if (!ready() || commands.isRecording()) return GfxError::BadDescriptor;
     VkFrameSlot& frame = impl_->frames[impl_->frameIndex];
+    // One async batch per graphics submit.
+    if (asyncCompute && frame.computeSignaled) return GfxError::BadDescriptor;
     if (frame.pending) {
         const VkResult waitResult = vkWaitForFences(
             impl_->device, 1, &frame.fence, VK_TRUE, UINT64_MAX);
@@ -2152,9 +2259,13 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         frame.pending = false;
         impl_->completedSerial = std::max(impl_->completedSerial, frame.serial);
     }
-    if (frame.descriptorPool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(impl_->device, frame.descriptorPool, nullptr);
-        frame.descriptorPool = VK_NULL_HANDLE;
+    // The slot's fence covers its compute batch too (the graphics batch
+    // waited on it), so either pool is free to go.
+    VkDescriptorPool& descriptorPool =
+        asyncCompute ? frame.computeDescriptorPool : frame.descriptorPool;
+    if (descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(impl_->device, descriptorPool, nullptr);
+        descriptorPool = VK_NULL_HANDLE;
     }
     collectRetired();
 
@@ -2199,13 +2310,16 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
         const VkResult poolResult =
-            vkCreateDescriptorPool(impl_->device, &poolInfo, nullptr, &frame.descriptorPool);
+            vkCreateDescriptorPool(impl_->device, &poolInfo, nullptr, &descriptorPool);
         if (poolResult != VK_SUCCESS) return toGfxError(poolResult);
     }
 
     VkSwapchainRecord* submissionSwapchain = nullptr;
-    for (const Command& command : commands.commands()) {
+    std::size_t swapchainPassIndex = 0;
+    for (std::size_t commandIndex = 0; commandIndex < commands.commands().size(); ++commandIndex) {
+        const Command& command = commands.commands()[commandIndex];
         if (command.kind != CommandKind::BeginRenderPass) continue;
+        if (asyncCompute) return GfxError::BadDescriptor; // compute-only queue
         VkFramebufferRecord* framebuffer = impl_->framebuffers.get(command.framebuffer);
         if (framebuffer == nullptr) return GfxError::InvalidHandle;
         if (!framebuffer->swapchain.isValid()) continue;
@@ -2214,6 +2328,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         if (submissionSwapchain != nullptr && submissionSwapchain != swapchain) {
             return GfxError::BadDescriptor;
         }
+        if (submissionSwapchain == nullptr) swapchainPassIndex = commandIndex;
         submissionSwapchain = swapchain;
     }
     if (submissionSwapchain != nullptr) {
@@ -2225,7 +2340,8 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         }
     }
 
-    const VkCommandBuffer vkCommands = frame.commandBuffer;
+    // Reassigned to splitCommandBuffer at the async compute wait point.
+    VkCommandBuffer vkCommands = asyncCompute ? frame.computeCommandBuffer : frame.commandBuffer;
     VkResult result = vkResetCommandBuffer(vkCommands, 0);
     if (result != VK_SUCCESS) return toGfxError(result);
     VkCommandBufferBeginInfo beginInfo{};
@@ -2239,7 +2355,7 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         std::uint32_t timestampCount = 0;
         std::uint32_t timestampMask = 0;
         commands.timestampUsage(timestampCount, timestampMask);
-        if (timestampCount != 0 && impl_->timestampsSupported) {
+        if (timestampCount != 0 && impl_->timestampsSupported && !asyncCompute) {
             if (impl_->timestampPool == VK_NULL_HANDLE) {
                 VkQueryPoolCreateInfo poolInfo{};
                 poolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -2267,6 +2383,10 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
              ++resourceIndex) {
             const BoundResource& resource = command.resources[resourceIndex];
             if (resource.type != BindingType::Texture) continue;
+            if (asyncCompute) { // buffers only on the compute queue
+                error = GfxError::BadDescriptor;
+                break;
+            }
             TextureHandle handle;
             handle.index = resource.handleIndex;
             handle.generation = resource.handleGeneration;
@@ -2298,11 +2418,11 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     };
     auto bindDescriptorSets = [&](VkPipelineRecord& pipeline) -> GfxError {
         if (pipeline.setLayouts.empty()) return GfxError::None;
-        if (frame.descriptorPool == VK_NULL_HANDLE) return GfxError::BackendUnavailable;
+        if (descriptorPool == VK_NULL_HANDLE) return GfxError::BackendUnavailable;
         std::vector<VkDescriptorSet> sets(pipeline.setLayouts.size(), VK_NULL_HANDLE);
         VkDescriptorSetAllocateInfo allocationInfo{};
         allocationInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocationInfo.descriptorPool = frame.descriptorPool;
+        allocationInfo.descriptorPool = descriptorPool;
         allocationInfo.descriptorSetCount = static_cast<std::uint32_t>(pipeline.setLayouts.size());
         allocationInfo.pSetLayouts = pipeline.setLayouts.data();
         const VkResult allocationResult =
@@ -2379,11 +2499,43 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
         return GfxError::None;
     };
     DeviceStats delta;
-    if (error == GfxError::None) for (const Command& command : commands.commands()) {
+    // Graphics submit after an async compute submit: commands from the wait
+    // point on go into a second batch that waits on computeDone.
+    const std::size_t splitAt = !asyncCompute && frame.computeSignaled
+                                    ? commands.asyncComputeWaitIndex()
+                                    : CommandBuffer::kNoAsyncComputeWait;
+    bool split = false;
+    const auto& commandList = commands.commands();
+    if (error == GfxError::None) for (std::size_t commandIndex = 0;
+                                      commandIndex < commandList.size(); ++commandIndex) {
+        const Command& command = commandList[commandIndex];
+        if (commandIndex == splitAt) {
+            if (rendering) {
+                error = GfxError::BadDescriptor;
+                break;
+            }
+            result = vkEndCommandBuffer(vkCommands);
+            if (result == VK_SUCCESS) {
+                vkCommands = frame.splitCommandBuffer;
+                result = vkResetCommandBuffer(vkCommands, 0);
+                if (result == VK_SUCCESS) result = vkBeginCommandBuffer(vkCommands, &beginInfo);
+                split = true;
+            }
+            if (result != VK_SUCCESS) {
+                error = toGfxError(result);
+                break;
+            }
+        }
         switch (command.kind) {
         case CommandKind::ResourceBarrier:
             if (rendering || command.after.stages == PipelineStageMask::None) {
                 error = GfxError::BadDescriptor;
+                break;
+            }
+            if (asyncCompute &&
+                ((command.before.stages | command.after.stages) &
+                 ~(PipelineStageMask::ComputeShader | PipelineStageMask::Transfer)) != 0) {
+                error = GfxError::BadDescriptor; // graphics stages on the compute queue
                 break;
             }
             if (command.barrierType == BarrierResourceType::Texture) {
@@ -2739,25 +2891,65 @@ auto VulkanDevice::submit(CommandBuffer& commands) -> GfxError {
     if (error != GfxError::None) return error;
     if (result != VK_SUCCESS) return toGfxError(result);
 
+    if (asyncCompute) {
+        VkSubmitInfo computeSubmit{};
+        computeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        computeSubmit.commandBufferCount = 1;
+        computeSubmit.pCommandBuffers = &vkCommands;
+        computeSubmit.signalSemaphoreCount = 1;
+        computeSubmit.pSignalSemaphores = &frame.computeDone;
+        result = vkQueueSubmit(impl_->computeQueue, 1, &computeSubmit, VK_NULL_HANDLE);
+        if (result != VK_SUCCESS) return toGfxError(result);
+        frame.computeSignaled = true;
+        impl_->stats.dispatchCalls += delta.dispatchCalls;
+        return GfxError::None;
+    }
+
     result = vkResetFences(impl_->device, 1, &frame.fence);
     if (result != VK_SUCCESS) return toGfxError(result);
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &vkCommands;
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // One batch, or two when split at the async compute wait point. The
+    // compute wait goes on the last batch (the whole submit when the buffer
+    // never called waitAsyncCompute()); the swapchain-image wait on the
+    // batch that first renders to it.
+    struct Batch {
+        std::array<VkSemaphore, 2> waits{};
+        std::array<VkPipelineStageFlags, 2> stages{};
+        std::uint32_t waitCount = 0;
+    };
+    std::array<Batch, 2> batches{};
+    std::array<VkSubmitInfo, 2> submitInfos{};
+    const std::uint32_t batchCount = split ? 2u : 1u;
+    const std::array<VkCommandBuffer, 2> batchCommands{frame.commandBuffer,
+                                                       frame.splitCommandBuffer};
+    Batch& lastBatch = batches[batchCount - 1u];
+    if (frame.computeSignaled) {
+        lastBatch.waits[lastBatch.waitCount] = frame.computeDone;
+        lastBatch.stages[lastBatch.waitCount++] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
     VkSemaphore renderCompleteSignal = VK_NULL_HANDLE;
     if (submissionSwapchain != nullptr) {
         renderCompleteSignal =
             submissionSwapchain->renderComplete[submissionSwapchain->imageIndex];
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &frame.imageAvailable;
-        submitInfo.pWaitDstStageMask = &waitStage;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &renderCompleteSignal;
+        Batch& imageBatch = split && swapchainPassIndex < splitAt ? batches[0] : lastBatch;
+        imageBatch.waits[imageBatch.waitCount] = frame.imageAvailable;
+        imageBatch.stages[imageBatch.waitCount++] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
-    result = vkQueueSubmit(impl_->graphicsQueue, 1, &submitInfo, frame.fence);
+    for (std::uint32_t batch = 0; batch < batchCount; ++batch) {
+        VkSubmitInfo& info = submitInfos[batch];
+        info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &batchCommands[batch];
+        info.waitSemaphoreCount = batches[batch].waitCount;
+        info.pWaitSemaphores = batches[batch].waits.data();
+        info.pWaitDstStageMask = batches[batch].stages.data();
+    }
+    if (renderCompleteSignal != VK_NULL_HANDLE) {
+        submitInfos[batchCount - 1u].signalSemaphoreCount = 1;
+        submitInfos[batchCount - 1u].pSignalSemaphores = &renderCompleteSignal;
+    }
+    result = vkQueueSubmit(impl_->graphicsQueue, batchCount, submitInfos.data(), frame.fence);
     if (result != VK_SUCCESS) return toGfxError(result);
+    frame.computeSignaled = false;
     frame.pending = true;
     frame.serial = ++impl_->lastSubmittedSerial;
     if (timestampsActive) impl_->timestamps.sets[timestampSet].fenceValue = frame.serial;
